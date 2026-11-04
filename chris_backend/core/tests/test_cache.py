@@ -2,30 +2,29 @@
 Tests for the shared cache's helpers (core/cache.py) against the stack's cache server.
 
 They share it with a running dev stack so every test uses names of its own, every key
-expires and nothing calls cache.clear() which is FLUSHDB of the whole database.
+expires and nothing calls cache.clear(), which is FLUSHDB of the whole database, or SCRIPT
+FLUSH, which can wedge a Dragonfly that is running scripts at the time.
 """
 
-import datetime
+import json
 import logging
 import math
 import os
 import selectors
+import signal
 import socket
-import ssl
 import struct
+import subprocess  # nosec B404 - runs this interpreter on a literal program
+import sys
 import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
 import redis
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from redis.commands.core import Script
 from django.conf import settings
 from django.core.cache import caches
 from django.core.exceptions import ImproperlyConfigured
@@ -120,151 +119,6 @@ class CacheProxy:
             s.close()
 
 
-class FakeServer:
-    """
-    A server that speaks the Redis protocol and finishes no TLS handshake: a connection
-    that opens with one gets no reply at all (as from Redis, which speaks plain text and
-    waits for a line end that never comes, where Dragonfly closes the connection), any
-    other one ``+PONG`` to a PING and ``+OK`` to anything else. With ``answers=False`` it
-    replies to nothing, as a hung server does; with ``tls_only=True`` it meets plain text
-    as Dragonfly started with ``--tls`` does, with an error about TLS before it closes the
-    connection, and stands for a TLS server too busy to finish a handshake; with
-    ``password=True`` it answers every command ``-NOAUTH``, as a server with a password
-    answers a client that sent none; with ``closes=True`` it closes every connection it
-    accepts, as a proxy whose server is down does.
-    """
-
-    BAD_TLS = b'-ERR Bad TLS header, double check if you enabled TLS for your client.\r\n'
-    NOAUTH = b'-NOAUTH Authentication required.\r\n'
-
-    def __init__(self, answers=True, tls_only=False, password=False, closes=False):
-        self.answers = answers
-        self.tls_only = tls_only
-        self.password = password
-        self.closes = closes
-        self._listener = socket.create_server(('127.0.0.1', 0))
-        self.port = self._listener.getsockname()[1]
-        self._running = True
-        self._thread = threading.Thread(target=self._serve, name='plain-text-server',
-                                        daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        self._thread.join(5)
-
-    def _serve(self):
-        buffers = {}
-        with selectors.DefaultSelector() as selector:
-            selector.register(self._listener, selectors.EVENT_READ)
-            while self._running:
-                for key, _ in selector.select(0.01):
-                    sock = key.fileobj
-                    if sock is self._listener:
-                        conn, _ = sock.accept()
-                        if self.closes:
-                            conn.close()
-                            continue
-                        buffers[conn] = b''
-                        selector.register(conn, selectors.EVENT_READ)
-                        continue
-                    data = sock.recv(65536)
-                    if not data:
-                        self._drop(selector, buffers, sock)
-                        continue
-                    buffers[sock] += data
-                    # 0x16 starts a TLS handshake record
-                    if not self.answers or buffers[sock].startswith(b'\x16'):
-                        continue
-                    if self.tls_only:
-                        sock.sendall(self.BAD_TLS)
-                        self._drop(selector, buffers, sock)
-                    else:
-                        buffers[sock] = self._reply(sock, buffers[sock])
-        for sock in buffers:
-            sock.close()
-        self._listener.close()
-
-    @staticmethod
-    def _drop(selector, buffers, sock):
-        selector.unregister(sock)
-        buffers.pop(sock)
-        sock.close()
-
-    def _reply(self, sock, buffer):
-        """
-        Reply to each complete command (a RESP array of bulk strings) at the head of
-        ``buffer``; returns what is left of it.
-        """
-        while buffer.startswith(b'*') and b'\r\n' in buffer:
-            head, rest = buffer.split(b'\r\n', 1)
-            args = []
-            for _ in range(int(head[1:])):
-                size, _, after = rest.partition(b'\r\n')
-                if not after or len(after) < int(size[1:]) + 2:
-                    return buffer  # incomplete: wait for more
-                args.append(after[:int(size[1:])])
-                rest = after[int(size[1:]) + 2:]
-            sock.sendall(self.NOAUTH if self.password else
-                         b'+PONG\r\n' if args[:1] == [b'PING'] else b'+OK\r\n')
-            buffer = rest
-        return buffer
-
-
-class TlsServer:
-    """
-    A server that speaks only TLS with a certificate nothing trusts: as Redis started with
-    ``--port 0 --tls-port`` it closes a connection that opens in plain text without a
-    word, and it finishes a TLS handshake with a client that trusts its certificate.
-    """
-
-    def __init__(self):
-        key = ec.generate_private_key(ec.SECP256R1())
-        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'cube-test-cache')])
-        now = datetime.datetime.now(datetime.timezone.utc)
-        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
-                .public_key(key.public_key()).serial_number(x509.random_serial_number())
-                .not_valid_before(now).not_valid_after(now + datetime.timedelta(hours=1))
-                .sign(key, hashes.SHA256()))
-
-        with tempfile.TemporaryDirectory() as directory:
-            pem = Path(directory) / 'server.pem'
-            pem.write_bytes(
-                key.private_bytes(serialization.Encoding.PEM,
-                                  serialization.PrivateFormat.PKCS8,
-                                  serialization.NoEncryption())
-                + cert.public_bytes(serialization.Encoding.PEM))
-            self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            self._context.load_cert_chain(pem)
-
-        self._listener = socket.create_server(('127.0.0.1', 0))
-        self._listener.settimeout(0.05)
-        self.port = self._listener.getsockname()[1]
-        self._running = True
-        self._thread = threading.Thread(target=self._serve, name='tls-server', daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        self._thread.join(5)
-
-    def _serve(self):
-        while self._running:
-            try:
-                conn, _ = self._listener.accept()
-            except TimeoutError:
-                continue
-            conn.settimeout(2)
-            try:
-                with self._context.wrap_socket(conn, server_side=True) as tls:
-                    tls.recv(1024)
-            except OSError:  # a handshake in plain text, or one the client gave up
-                pass
-            finally:
-                conn.close()
-        self._listener.close()
-
-
 def _name():
     return f'test-{uuid.uuid4().hex}'
 
@@ -278,6 +132,13 @@ def _raw():
 
 def _key(namespace, name):
     return caches['default'].make_key(f'{namespace}:{name}')
+
+
+def _unseen(script):
+    """
+    ``script`` under a SHA of its own, which the server does not hold, as after its restart.
+    """
+    return Script(None, script.script + f'\n-- {uuid.uuid4().hex}'.encode())
 
 
 def _run_threads(count, target):
@@ -363,6 +224,24 @@ class CacheTestCase(SimpleTestCase):
 
     def wait_for_retry(self):
         time.sleep(self.RETRY_AFTER + 0.05)
+
+    def acl_user(self, keys, commands=()):
+        """
+        The cache's URL for a user of its own whom its ACL limits to the keys ``keys``
+        (and denies the ``commands`` given as ``-name``).
+        """
+        user, password = _name(), _name()
+        _raw().acl_setuser(user, enabled=True, passwords=[f'+{password}'], keys=[keys],
+                           categories=['+@all'], commands=list(commands))
+        self.addCleanup(_raw().acl_deluser, user)
+        url = urlsplit(settings.CACHES['default']['LOCATION'])
+        return url._replace(
+            netloc=f'{user}:{password}@{url.hostname}:{url.port or 6379}').geturl()
+
+    @staticmethod
+    def cache_at(location):
+        return override_settings(CACHES={'default': {**settings.CACHES['default'],
+                                                     'LOCATION': location}})
 
     def assertOncePerTtl(self, successes, ttl, duration):
         """
@@ -579,15 +458,26 @@ class SlotTests(CacheTestCase):
         release_slot(shorter)
         release_slot(longer)
 
-    def test_the_scripts_work_after_the_script_cache_is_flushed(self):
-        _raw().script_flush()
+    def test_the_scripts_work_on_a_server_that_does_not_hold_them(self):
+        slot_script = _unseen(core_cache._ACQUIRE_SLOT)
+        lock_script = _unseen(core_cache._RELEASE_LOCK)
 
-        slot = acquire_slot(_name(), 1, 5)
-        lock = acquire_lock(_name(), 5)
+        with mock.patch.object(core_cache, '_ACQUIRE_SLOT', slot_script), \
+                mock.patch.object(core_cache, '_RELEASE_LOCK', lock_script):
+            self.assertEqual(_raw().script_exists(slot_script.sha, lock_script.sha),
+                             [False, False])
+            slot = acquire_slot(_name(), 1, 5)
+            lock = acquire_lock(_name(), 5)
 
-        self.assertFalse(slot.degraded)
-        self.assertTrue(release_slot(slot))
-        self.assertTrue(release_lock(lock))
+            self.assertFalse(slot.degraded)
+            self.assertTrue(release_slot(slot))
+            self.assertTrue(release_lock(lock))
+
+    def test_a_late_release_of_a_slot_says_it_freed_nothing(self):
+        lease = acquire_slot(_name(), 1, 30)
+        _raw().delete(lease.key)  # as if it had expired
+
+        self.assertFalse(release_slot(lease))
 
 
 class ValidationTests(CacheTestCase):
@@ -713,15 +603,47 @@ class RefusalTests(CacheTestCase):
         self.assertEqual([r.levelname for r in logs.records], ['WARNING', 'ERROR', 'INFO'])
         self.assertEqual([core_cache._health.available() for _ in range(2)], [True, True])
 
-    def test_a_refused_replayed_clear_is_named_as_the_live_call_names_it(self):
-        client = mock.Mock()
-        client.delete.side_effect = redis.exceptions.ResponseError('MISCONF')
-        core_cache._health.defer(('mark', _key('mark', _name()), None))
+    def test_a_key_the_acl_refuses_does_not_stop_the_rest_of_its_batch(self):
+        # refused when queued, so a transaction would abort the whole batch
+        location = self.acl_user(caches['default'].make_key('lock:*'))
+        lock = acquire_lock(_name(), 30)
+        mark = _key('mark', _name())
+        _raw().set(mark, 1, px=30000)
 
-        with self.assertLogs('core.cache', 'ERROR') as logs:
-            core_cache._health.replay(client)
+        with self.cache_at(location):
+            core_cache._health.defer(('mark', mark, None))
+            core_cache._health.defer(('lock', lock.key, lock.token))
 
+            with self.assertLogs('core.cache', 'ERROR') as logs:
+                self.assertFalse(acquire_lock(_name(), 5).degraded)
+
+        self.assertEqual(len(logs.records), 1)
         self.assertIn('refused clear_mark', logs.output[0])
+        self.assertEqual(_raw().exists(lock.key), 0)
+        _raw().delete(mark)
+
+    def test_a_refused_script_exists_logs_its_whole_batch_and_leaves_it_to_the_ttls(self):
+        # SCRIPT EXISTS goes ahead of the pipeline and raises, rather than returning
+        location = self.acl_user(caches['default'].make_key('*'), commands=['-script'])
+        lock = acquire_lock(_name(), 30)
+        mark = _key('mark', _name())
+        _raw().set(mark, 1, px=30000)
+
+        with self.cache_at(location):
+            core_cache._health.defer(('lock', lock.key, lock.token))
+            core_cache._health.defer(('mark', mark, None))
+
+            with self.assertLogs('core.cache', 'ERROR') as logs:
+                self.assertTrue(mark_once(_name(), 5))
+
+            self.assertFalse(core_cache._health._pending)
+            pool = caches['default']._cache.get_client(write=True).connection_pool
+            self.assertEqual(len(pool._in_use_connections), 0)
+
+        self.assertIn('refused release_lock', logs.output[0])
+        self.assertIn('refused clear_mark', logs.output[1])
+        self.assertEqual(_raw().exists(lock.key, mark), 2)
+        _raw().delete(lock.key, mark)
 
 
 class CacheHealthTests(CacheTestCase):
@@ -749,6 +671,7 @@ class CacheHealthTests(CacheTestCase):
         with health._lock:
             pid = os.fork()
             if pid == 0:  # the child
+                signal.alarm(5)  # stuck on the lock it inherited, it dies and the test fails
                 state = (health.available(), not health._pending,
                          health._lock.acquire(blocking=False))
                 os.write(write, bytes(b'01'[flag] for flag in state))
@@ -1075,6 +998,275 @@ class DegradedModeTests(ProxiedCacheTestCase):
             self.assertTrue(core_cache._health.available())
 
 
+class ReplayTests(ProxiedCacheTestCase):
+
+    def kept_releases(self, count, acquire=acquire_lock, release=release_lock):
+        """
+        ``count`` leases, of locks by default, whose releases could not reach the cache,
+        which is back and past its pause.
+        """
+        leases = [acquire(_name(), 30) for _ in range(count)]
+        self.proxy.stop()
+
+        with self.assertLogs('core.cache', 'WARNING'):
+            for lease in leases:
+                self.assertFalse(release(lease))
+
+        self.proxy.start()
+        self.wait_for_retry()
+        return leases
+
+    @staticmethod
+    def held(leases):
+        return [_raw().exists(lease.key) for lease in leases]
+
+    @staticmethod
+    def pipelines_sent():
+        """
+        A patch of ``Pipeline.execute`` and the list it adds each pipeline's size to.
+        """
+        sizes, execute = [], redis.client.Pipeline.execute
+
+        def counted(pipeline, raise_on_error=True):
+            sizes.append(len(pipeline.command_stack))
+            return execute(pipeline, raise_on_error)
+
+        return mock.patch.object(redis.client.Pipeline, 'execute', counted), sizes
+
+    def test_a_backlog_of_every_kind_goes_out_in_one_pipeline(self):
+        name, key = _name(), _name()
+        lock, slot = acquire_lock(_name(), 30), acquire_slot(name, 1, 30)
+        self.assertTrue(mark_once(key, 30))
+        self.proxy.stop()
+        with self.assertLogs('core.cache', 'WARNING'):
+            release_lock(lock)
+            release_slot(slot)
+            clear_mark(key)
+        self.proxy.start()
+        self.wait_for_retry()
+        patch, sizes = self.pipelines_sent()
+
+        with patch, self.assertLogs('core.cache', 'INFO') as logs:
+            self.assertTrue(mark_once(_name(), 5))
+
+        self.assertEqual(sizes, [3])
+        self.assertEqual([r.levelname for r in logs.records], ['INFO'])
+        self.assertEqual(_raw().exists(lock.key, slot.key, _key('mark', key)), 0)
+
+    def test_one_call_replays_one_batch_and_the_next_calls_the_rest_oldest_first(self):
+        leases = self.kept_releases(5)
+        patch, sizes = self.pipelines_sent()
+
+        with patch, mock.patch.object(core_cache._CacheHealth, 'REPLAY_BATCH', 2), \
+                self.assertLogs('core.cache', 'INFO'):
+            mark_once(_name(), 5)
+            self.assertEqual(self.held(leases), [0, 0, 1, 1, 1])
+            mark_once(_name(), 5)
+            self.assertEqual(self.held(leases), [0, 0, 0, 0, 1])
+            mark_once(_name(), 5)
+            self.assertEqual(self.held(leases), [0, 0, 0, 0, 0])
+            mark_once(_name(), 5)
+
+        self.assertEqual(sizes, [2, 2, 1])
+
+    def test_a_failed_replay_keeps_its_batch_in_order_ahead_of_the_rest(self):
+        leases = self.kept_releases(3)
+        kept = list(core_cache._health._pending)
+        self.proxy.stop()
+
+        with mock.patch.object(core_cache._CacheHealth, 'REPLAY_BATCH', 2):
+            self.assertTrue(acquire_lock(_name(), 5).degraded)
+
+        self.assertEqual(list(core_cache._health._pending), kept)
+        self.proxy.start()
+        self.wait_for_retry()
+        with self.assertLogs('core.cache', 'INFO'):
+            mark_once(_name(), 5)
+        self.assertEqual(self.held(leases), [0, 0, 0])
+
+    def test_a_replay_the_server_applied_after_it_timed_out_is_safe_to_send_again(self):
+        # slots: for a lock, SCRIPT EXISTS would time out with the pipeline still unsent
+        leases = self.kept_releases(2, lambda name, ttl: acquire_slot(name, 1, ttl),
+                                    release_slot)
+        kept = list(core_cache._health._pending)
+        _raw().ping()  # a pooled connection for the pipeline to wait on
+        self.proxy.pause()
+
+        self.assertTrue(acquire_lock(_name(), 5).degraded)  # the replay times out
+
+        self.assertEqual(list(core_cache._health._pending), kept)
+        self.proxy.resume()  # the pipeline sent meanwhile now reaches the server
+        deadline = time.monotonic() + 3
+        while any(self.held(leases)):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        self.wait_for_retry()
+
+        with self.assertLogs('core.cache', 'INFO') as logs:
+            lock = acquire_lock(_name(), 5)  # sends them again
+
+        self.assertFalse(lock.degraded)
+        self.assertEqual([r.levelname for r in logs.records], ['INFO'])
+        self.assertFalse(core_cache._health._pending)
+        release_lock(lock)
+
+    def test_a_refused_entry_does_not_stop_the_rest_of_its_batch(self):
+        first, slot, last = (acquire_lock(_name(), 30), acquire_slot(_name(), 1, 30),
+                             acquire_lock(_name(), 30))
+        self.proxy.stop()
+        with self.assertLogs('core.cache', 'WARNING'):
+            release_lock(first)
+            release_slot(slot)
+            release_lock(last)
+        self.proxy.start()
+        _raw().set(slot.key, 'not a sorted set', px=30000)
+        self.wait_for_retry()
+
+        with self.assertLogs('core.cache', 'INFO') as logs:
+            self.assertTrue(mark_once(_name(), 5))
+
+        self.assertEqual([r.levelname for r in logs.records], ['ERROR', 'INFO'])
+        self.assertIn('refused release_slot', logs.output[0])
+        self.assertEqual(self.held([first, last]), [0, 0])
+
+    def test_a_replay_loads_the_script_a_restarted_server_lost(self):
+        leases = self.kept_releases(2)
+        script = _unseen(core_cache._RELEASE_LOCK)
+
+        with mock.patch.object(core_cache, '_RELEASE_LOCK', script), \
+                self.assertLogs('core.cache', 'INFO') as logs:
+            self.assertEqual(_raw().script_exists(script.sha), [False])
+            self.assertTrue(mark_once(_name(), 5))
+
+        self.assertEqual([r.levelname for r in logs.records], ['INFO'])
+        self.assertEqual(self.held(leases), [0, 0])
+
+    def test_a_replay_that_cannot_reach_the_cache_sends_nothing_else(self):
+        self.kept_releases(1)
+        self.proxy.stop()
+        command = mock.Mock()
+
+        self.assertIs(core_cache._call('acquire_lock', command), core_cache._FAILED)
+
+        command.assert_not_called()
+
+    def test_refused_entries_of_two_kinds_each_log_their_own_error(self):
+        lock, slot = acquire_lock(_name(), 30), acquire_slot(_name(), 1, 30)
+        self.proxy.stop()
+        with self.assertLogs('core.cache', 'WARNING'):
+            release_lock(lock)
+            release_slot(slot)
+        self.proxy.start()
+        _raw().set(slot.key, 'not a sorted set', px=30000)
+        _raw().delete(lock.key)
+        _raw().sadd(lock.key, 'x')  # the release script's GET now meets a set
+        _raw().pexpire(lock.key, 30000)
+        self.wait_for_retry()
+
+        with self.assertLogs('core.cache', 'INFO') as logs:
+            self.assertTrue(mark_once(_name(), 5))
+
+        self.assertEqual([r.levelname for r in logs.records], ['ERROR', 'ERROR', 'INFO'])
+        self.assertIn('refused release_lock', logs.output[0])
+        self.assertIn('refused release_slot', logs.output[1])
+
+    def test_the_real_batch_goes_out_in_one_pipeline_and_the_rest_stays(self):
+        for _ in range(core_cache._CacheHealth.REPLAY_BATCH + 1):
+            core_cache._health.defer(('lock', _key('lock', _name()), 1))
+        patch, sizes = self.pipelines_sent()
+
+        with patch, self.assertNoLogs('core.cache', 'WARNING'):
+            self.assertTrue(mark_once(_name(), 5))
+
+        self.assertEqual(sizes, [256])
+        self.assertEqual(len(core_cache._health._pending), 1)
+
+    def test_a_call_with_nothing_to_replay_opens_no_pipeline(self):
+        with mock.patch.object(redis.Redis, 'pipeline') as pipeline:
+            release_lock(acquire_lock(_name(), 5))
+            mark_once(_name(), 5)
+
+        pipeline.assert_not_called()
+
+
+@override_settings(CACHES={'default': {
+    'BACKEND': 'django.core.cache.backends.dummy.DummyCache', 'KEY_PREFIX': 'cube'}})
+class NoCacheServerTests(CacheTestCase):
+    """
+    A production deployment without ``CACHE_URL``: its ``CACHES['default']`` is a
+    ``DummyCache``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # whatever these tests call, nothing may ask for a client
+        patcher = mock.patch.object(core_cache, '_client',
+                                    side_effect=AssertionError('asked for a client'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_helpers_go_ahead_without_their_guarantees(self):
+        name = _name()
+
+        with self.assertLogs('core.cache', 'WARNING'):
+            locks = [acquire_lock(name, 5), acquire_lock(name, 5)]
+            slots = [acquire_slot(name, 1, 5), acquire_slot(name, 1, 5)]
+            marks = [mark_once(name, 5), mark_once(name, 5)]
+
+        for lease in locks + slots:
+            self.assertTrue(lease.degraded)
+            self.assertIsNone(lease.token)
+        self.assertEqual(marks, [True, True])
+
+    def test_the_releases_do_nothing_and_keep_nothing(self):
+        with self.assertLogs('core.cache', 'WARNING'):
+            lock, slot = acquire_lock(_name(), 5), acquire_slot(_name(), 1, 5)
+            self.assertFalse(release_lock(lock))
+            self.assertFalse(release_slot(slot))
+            clear_mark(_name())
+
+        self.assertFalse(core_cache._health._pending)
+
+    def test_a_process_says_so_once_when_something_first_asks_for_the_cache(self):
+        with self.assertLogs('core.cache', 'DEBUG') as logs:
+            for _ in range(3):
+                acquire_lock(_name(), 5)
+                mark_once(_name(), 5)
+                acquire_slot(_name(), 1, 5)
+                clear_mark(_name())
+
+        self.assertEqual([r.levelname for r in logs.records], ['WARNING'])
+        self.assertIn('no CACHE_URL', logs.output[0])
+        self.assertIn('acquire_lock', logs.output[0])
+
+    def test_the_reset_a_fork_runs_lets_a_child_say_so_once_too(self):
+        for _ in range(2):
+            with self.assertLogs('core.cache', 'WARNING') as logs:
+                mark_once(_name(), 5)
+                mark_once(_name(), 5)
+
+            self.assertEqual(len(logs.records), 1)
+            core_cache._health.reset()
+
+    def test_no_server_is_no_outage(self):
+        with self.assertLogs('core.cache', 'WARNING'):
+            acquire_lock(_name(), 5)
+
+        self.assertIsNone(core_cache._health._down_since)
+        self.assertEqual(core_cache._health._failed_open, 0)
+        self.assertTrue(core_cache._health.available())
+
+    def test_a_callers_mistake_still_raises(self):
+        for helper in (lambda: acquire_lock(_name(), 0), lambda: mark_once(_name(), 0),
+                       lambda: acquire_slot(_name(), 1, 0),
+                       lambda: acquire_slot(_name(), 0, 5)):
+            with self.assertRaises(ValueError):
+                helper()
+
+        with self.assertRaises(TypeError):
+            release_lock(None)
+
+
 class StartupCheckTests(CacheTestCase):
 
     def conf(self, location):
@@ -1083,19 +1275,6 @@ class StartupCheckTests(CacheTestCase):
     @property
     def host(self):
         return urlsplit(settings.CACHES['default']['LOCATION']).hostname
-
-    def acl_user(self, keys, commands=()):
-        """
-        The cache's URL for a user of its own whom its ACL limits to the keys ``keys``
-        (and denies the ``commands`` given as ``-name``).
-        """
-        user, password = _name(), _name()
-        _raw().acl_setuser(user, enabled=True, passwords=[f'+{password}'], keys=[keys],
-                           categories=['+@all'], commands=list(commands))
-        self.addCleanup(_raw().acl_deluser, user)
-        url = urlsplit(settings.CACHES['default']['LOCATION'])
-        return url._replace(
-            netloc=f'{user}:{password}@{url.hostname}:{url.port or 6379}').geturl()
 
     def test_a_cache_that_answers_passes_silently(self):
         with self.assertNoLogs('core.cache', 'DEBUG'):
@@ -1126,10 +1305,13 @@ class StartupCheckTests(CacheTestCase):
         b = urlsplit(broker)
         for location, reason in (
                 ('http://somewhere:6379/2', 'LOCATION'),
-                (f'redis://{host}:6379', f'\\({host}:6379\\) names no logical database'),
+                (f'redis://{host}:6379', 'names no logical database'),
                 (f'redis://{host}:6379/abc', 'names no logical database'),
-                (f'redis://{host}:6379/0?retry_on_timeout=true', 'turns on retries'),
-                (f'redis://{host}:6379/0?retry_on_error=TimeoutError', 'turns on retries'),
+                (f'redis://{host}:6379/0?retry_on_timeout=true', 'asks for retries'),
+                (f'redis://{host}:6379/0?retry_on_error=TimeoutError', 'asks for retries'),
+                (f'redis://{host}:6379/0?retry=3', 'asks for retries'),
+                (f'redis://{host}:6379/0?nonsense=1', 'nonsense'),
+                (f'rediss://{host}:6379/0?ssl_cert_reqs=bad', 'Certificate Requirements'),
                 (f'redis://{host}:6379/0?socket_timeout=0', 'socket_timeout=0.0'),
                 (f'redis://{host}:6379/0?socket_connect_timeout=3600',
                  'socket_connect_timeout=3600.0'),
@@ -1140,9 +1322,7 @@ class StartupCheckTests(CacheTestCase):
                 # another database of the broker's server
                 (f'redis://{b.hostname}:{b.port or 6379}/7', "the Celery broker's server"),
                 (f'redis://{host}:6379/99', 'DB index'),
-                (f'redis://nobody:wrong@{host}:6379/0', ''),
-                # TLS against the cache, which speaks plain text
-                (f'rediss://{host}:6379/0', '')):
+                (f'redis://nobody:wrong@{host}:6379/0', '')):
             with self.subTest(location=location), \
                     self.assertRaisesRegex(ImproperlyConfigured, reason):
                 verify_cache_connection(self.conf(location), broker)
@@ -1161,65 +1341,73 @@ class StartupCheckTests(CacheTestCase):
                     self.assertRaisesRegex(ImproperlyConfigured, 'BACKEND'):
                 verify_cache_connection(conf, settings.CELERY_BROKER_URL)
 
-    def test_no_server_stops_start_up(self):
-        for location in ([], ()):
+    def test_no_server_or_an_empty_one_stops_start_up(self):
+        url = settings.CACHES['default']['LOCATION']
+
+        for location in ([], (), '', ',', [''], f'{url},', [url, ''], ['', url]):
             with self.subTest(location=location), \
                     self.assertRaisesRegex(ImproperlyConfigured, 'names no server'):
                 verify_cache_connection(self.conf(location), settings.CELERY_BROKER_URL)
 
-    def test_a_tls_url_for_a_server_that_answers_in_plain_text_stops_start_up(self):
-        # the handshake waits until it times out, as with Redis, rather than failing; an
-        # authentication error is an answer in plain text too
-        for server in (FakeServer(), FakeServer(password=True)):
-            self.addCleanup(server.stop)
-            with self.subTest(password=server.password), \
-                    self.assertRaisesRegex(ImproperlyConfigured, 'answers in plain text'):
-                verify_cache_connection(self.conf(f'rediss://127.0.0.1:{server.port}/0'))
-
-    def test_a_tls_url_for_a_hung_server_only_warns_within_its_timeouts(self):
-        timeouts = 'socket_timeout=0.2&socket_connect_timeout=0.2'
-        for server in (FakeServer(answers=False), FakeServer(tls_only=True)):
-            self.addCleanup(server.stop)
-            location = f'rediss://127.0.0.1:{server.port}/0?{timeouts}'
-            with self.subTest(tls_only=server.tls_only):
+    def test_a_server_that_is_down_only_warns_quickly(self):
+        for scheme in ('redis', 'rediss'):
+            with self.subTest(scheme=scheme):
                 started = time.monotonic()
                 with self.assertLogs('core.cache', 'WARNING') as logs:
-                    verify_cache_connection(self.conf(location))
+                    verify_cache_connection(self.conf(f'{scheme}://127.0.0.1:6390/0'))
 
-                # the handshake and the probe each wait one timeout, and neither retries
                 self.assertLess(time.monotonic() - started, 1.0)
                 self.assertIn('does not answer', logs.output[0])
 
-    def test_a_tls_url_for_a_proxy_whose_server_is_down_only_warns(self):
-        # the proxy accepts and closes each connection, a handshake included
-        server = FakeServer(closes=True)
-        self.addCleanup(server.stop)
+    def test_a_server_that_closes_each_connection_only_warns(self):
+        listener = socket.create_server(('127.0.0.1', 0))
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
 
+        def serve():
+            try:
+                while True:
+                    listener.accept()[0].close()
+            except OSError:  # the listener closed
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+
+        for scheme in ('redis', 'rediss'):
+            with self.subTest(scheme=scheme), \
+                    self.assertLogs('core.cache', 'WARNING') as logs:
+                verify_cache_connection(self.conf(f'{scheme}://127.0.0.1:{port}/0'))
+
+            self.assertIn('does not answer', logs.output[0])
+
+    def test_a_tls_url_for_the_cache_which_speaks_plain_text_only_warns(self):
         with self.assertLogs('core.cache', 'WARNING') as logs:
-            verify_cache_connection(self.conf(f'rediss://127.0.0.1:{server.port}/0'))
+            verify_cache_connection(self.conf(f'rediss://{self.host}:6379/0'),
+                                    settings.CELERY_BROKER_URL)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn('does not answer', logs.output[0])
+        self.assertIn('check redis:// against rediss://', logs.output[0])
+
+    def test_a_refused_certificate_only_warns_and_names_the_reason(self):
+        client = mock.Mock()
+        client.get_client.return_value.ping.side_effect = redis.ConnectionError(
+            'Error 1 connecting to cache:6379. [SSL: CERTIFICATE_VERIFY_FAILED]')
+
+        with mock.patch.object(core_cache, 'RedisCacheClient', return_value=client), \
+                self.assertLogs('core.cache', 'WARNING') as logs:
+            verify_cache_connection(self.conf('rediss://cache:6379/0'))
+
+        self.assertIn('CERTIFICATE_VERIFY_FAILED', logs.output[0])
+
+    def test_a_timeout_after_the_ping_answered_only_warns(self):
+        late = redis.exceptions.TimeoutError('Timeout reading from socket')
+
+        with mock.patch.object(core_cache, '_ACQUIRE_SLOT', side_effect=late), \
+                self.assertLogs('core.cache', 'WARNING') as logs:
+            verify_cache_connection(settings.CACHES['default'], settings.CELERY_BROKER_URL)
 
         self.assertIn('does not answer', logs.output[0])
-
-    def test_a_plain_text_url_for_a_server_that_speaks_only_tls_stops_start_up(self):
-        server = TlsServer()
-        self.addCleanup(server.stop)
-
-        with self.assertRaisesRegex(ImproperlyConfigured, 'speaks only TLS'):
-            verify_cache_connection(self.conf(f'redis://127.0.0.1:{server.port}/0'))
-
-    def test_a_plain_text_url_for_a_server_that_is_down_only_warns_quickly(self):
-        # nothing listens on that port, and a server that closes plain text closes TLS too
-        closing = FakeServer(closes=True)
-        self.addCleanup(closing.stop)
-
-        for port in (6390, closing.port):
-            with self.subTest(port=port):
-                started = time.monotonic()
-                with self.assertLogs('core.cache', 'WARNING') as logs:
-                    verify_cache_connection(self.conf(f'redis://127.0.0.1:{port}/0'))
-
-                self.assertLess(time.monotonic() - started, 1.0)
-                self.assertIn('does not answer', logs.output[0])
 
     def test_a_url_redis_py_cannot_parse_keeps_its_password_out_of_the_error(self):
         # an unescaped / ends the netloc: redis-py's own error quotes what came before it
@@ -1231,6 +1419,17 @@ class StartupCheckTests(CacheTestCase):
         self.assertNotIn('Pa55', str(raised.exception))
         self.assertIsNone(raised.exception.__cause__)
         self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_a_password_that_cuts_the_url_short_stays_out_of_the_error(self):
+        for location, secret in (('redis://:12345/secret@host:6379/0', '12345'),
+                                 ('redis://me:12345#secret@host:6379/0', '12345'),
+                                 ('redis://:12345,secret@host:6379/0', '12345'),
+                                 ('redis://hunter2#x@host:6379/0', 'hunter2')):
+            with self.subTest(location=location), self.assertRaisesRegex(
+                    ImproperlyConfigured, 'percent-encoded') as raised:
+                verify_cache_connection(self.conf(location))
+
+            self.assertNotIn(secret, str(raised.exception))
 
     def test_a_socket_path_is_named_and_compared_with_the_brokers(self):
         path = 'unix:///run/cube-test-cache.sock'
@@ -1252,29 +1451,6 @@ class StartupCheckTests(CacheTestCase):
         with self.assertLogs('core.cache', 'WARNING'):
             verify_cache_connection(self.conf('redis://localhost:6390/0'),
                                     'redis://127.0.0.1:6390/1')
-
-    def test_a_plain_text_url_that_timed_out_sends_no_plain_text_probe(self):
-        # the server answers now, which says nothing about TLS
-        server = FakeServer()
-        self.addCleanup(server.stop)
-        client = mock.Mock()
-        client.get_client.return_value.ping.side_effect = redis.TimeoutError('Timeout')
-
-        with mock.patch.object(core_cache, 'RedisCacheClient', return_value=client), \
-                self.assertLogs('core.cache', 'WARNING') as logs:
-            verify_cache_connection(self.conf(f'redis://127.0.0.1:{server.port}/0'))
-
-        self.assertIn('does not answer', logs.output[0])
-
-    def test_a_timeout_after_the_ping_answered_sends_no_plain_text_probe(self):
-        late = redis.exceptions.TimeoutError('Timeout reading from socket')
-
-        with mock.patch.object(core_cache, '_ACQUIRE_SLOT', side_effect=late), \
-                mock.patch.object(core_cache, '_answers_without_tls') as probe, \
-                self.assertLogs('core.cache', 'WARNING'):
-            verify_cache_connection(settings.CACHES['default'], settings.CELERY_BROKER_URL)
-
-        probe.assert_not_called()
 
     def test_the_check_runs_both_scripts_and_leaves_no_key_behind(self):
         conf, broker = settings.CACHES['default'], settings.CELERY_BROKER_URL
@@ -1322,6 +1498,26 @@ class StartupCheckTests(CacheTestCase):
                 self.assertRaisesRegex(ImproperlyConfigured, 'refuses the scripts'):
             verify_cache_connection(settings.CACHES['default'], settings.CELERY_BROKER_URL)
 
+    def test_a_server_that_refuses_script_exists_stops_start_up(self):
+        # what a replay's pipeline asks before it runs a script
+        refusal = redis.exceptions.NoPermissionError(
+            "this user has no permissions to run the 'script|exists' command")
+
+        with mock.patch.object(redis.Redis, 'script_exists', side_effect=refusal), \
+                self.assertRaisesRegex(ImproperlyConfigured, 'refuses the scripts'):
+            verify_cache_connection(settings.CACHES['default'], settings.CELERY_BROKER_URL)
+
+    def test_a_script_refused_halfway_leaves_no_key_that_never_expires(self):
+        # its ZADD runs and its PEXPIREAT does not
+        location = self.acl_user(caches['default'].make_key('*'), commands=['-pexpireat'])
+        token = core_cache._new_token()
+
+        with mock.patch.object(core_cache, '_new_token', return_value=token), \
+                self.assertRaisesRegex(ImproperlyConfigured, 'refuses the scripts'):
+            verify_cache_connection(self.conf(location))
+
+        self.assertEqual(_raw().exists(_key('core.cache', f'start-up-check:{token}')), 0)
+
     def test_a_cache_full_at_start_up_only_warns(self):
         # Dragonfly's -ERR inside the script's error, and the -OOM that redis-py raises as
         # OutOfMemoryError (Redis and Valkey run these scripts even when full)
@@ -1338,30 +1534,22 @@ class StartupCheckTests(CacheTestCase):
 
                 self.assertIn('is full', logs.output[0])
 
-    def test_a_refused_certificate_stops_start_up(self):
-        def ping():
-            try:
-                raise ssl.SSLCertVerificationError(1, 'certificate verify failed')
-            except ssl.SSLError:
-                raise redis.ConnectionError('Error 1 connecting to cache:6379.')
-
-        client = mock.Mock()
-        client.get_client.return_value.ping.side_effect = ping
-        with mock.patch.object(core_cache, 'RedisCacheClient', return_value=client), \
-                self.assertRaises(ImproperlyConfigured):
-            verify_cache_connection(self.conf('rediss://cache:6379/0'))
 
 
 class ProxiedStartupCheckTests(ProxiedCacheTestCase):
 
     def test_a_hung_cache_only_warns_within_the_timeout(self):
+        conf = settings.CACHES['default']
         self.proxy.pause()
-        started = time.monotonic()
 
-        with self.assertLogs('core.cache', 'WARNING'):
-            verify_cache_connection(settings.CACHES['default'])
+        for location in (conf['LOCATION'], conf['LOCATION'].replace('redis:', 'rediss:')):
+            with self.subTest(location=location):
+                started = time.monotonic()
 
-        self.assertLess(time.monotonic() - started, 1.0)
+                with self.assertLogs('core.cache', 'WARNING'):
+                    verify_cache_connection({**conf, 'LOCATION': location})
+
+                self.assertLess(time.monotonic() - started, 1.0)
 
     def test_the_check_disconnects_the_connection_it_opened(self):
         # the client stays referenced here, so only the explicit disconnect closes its socket
@@ -1402,11 +1590,131 @@ class CacheSettingsTests(SimpleTestCase):
         self.assertEqual(kwargs['socket_timeout'], 0.5)
 
     def test_the_helpers_connections_never_retry(self):
-        # a SET NX retried after its reply was lost finds its own key; the start-up check
-        # reads only the URL, so this pins what the settings' OPTIONS make of it
+        # a SET NX retried after its reply was lost finds its own key; the settings say so
+        # rather than count on redis-py's default
+        self.assertEqual(settings.CACHES['default']['OPTIONS']['retry'].get_retries(), 0)
         pool = caches['default']._cache.get_client(write=True).connection_pool
         connection = pool.make_connection()
 
         self.assertEqual(connection.retry.get_retries(), 0)
         self.assertFalse(connection.retry_on_timeout)
         self.assertFalse(connection.retry_on_error)
+
+    def test_a_url_that_asks_for_retries_gets_none(self):
+        conf = settings.CACHES['default']
+        client = core_cache.RedisCacheClient([f"{conf['LOCATION']}?retry_on_timeout=true"],
+                                             **conf['OPTIONS'])
+
+        connection = client.get_client(write=True).connection_pool.make_connection()
+
+        self.assertEqual(connection.retry.get_retries(), 0)
+
+
+    def test_timeouts_in_the_url_take_the_place_of_the_settings(self):
+        conf = settings.CACHES['default']
+        client = core_cache.RedisCacheClient([f"{conf['LOCATION']}?socket_timeout=0.1"],
+                                             **conf['OPTIONS'])
+
+        kwargs = client.get_client().connection_pool.connection_kwargs
+
+        self.assertEqual(kwargs['socket_timeout'], 0.1)
+        self.assertEqual(kwargs['socket_connect_timeout'], 0.5)
+
+
+class ProductionSettingsTests(SimpleTestCase):
+    """
+    ``config.settings.production`` in a process of its own: importing it here would change
+    the ``CACHES`` of ``common.py`` that these tests run with.
+    """
+
+    # reports what the settings made of the cache, what a helper does with it and every
+    # attempt either of them made to reach a server
+    PROGRAM = """
+import json
+import sys
+import uuid
+
+connects = []
+
+
+def audit(event, args):
+    if event in ('socket.connect', 'socket.getaddrinfo'):
+        connects.append(event)
+
+
+sys.addaudithook(audit)
+
+import django
+
+django.setup()
+
+from django.core.cache import caches
+from core.cache import acquire_lock, release_lock
+
+lease = acquire_lock(f'core.tests.test_cache:production-settings:{uuid.uuid4().hex}', 1)
+release_lock(lease)
+print(json.dumps({'backend': type(caches['default']).__name__, 'degraded': lease.degraded,
+                  'connected': bool(connects)}))
+"""
+
+    def start(self, program=PROGRAM, **cache_env):
+        """
+        Run ``program`` under the settings with their required variables, none of which they
+        connect to at import, and ``cache_env``.
+        """
+        with tempfile.TemporaryDirectory() as media_root:
+            env = {'PATH': os.environ['PATH'], 'HOME': media_root,
+                   'DJANGO_SETTINGS_MODULE': 'config.settings.production',
+                   'DJANGO_SECRET_KEY': _name(), 'CHRIS_SUPERUSER_PASSWORD': _name(),
+                   'DJANGO_ALLOWED_HOSTS': '*', 'POSTGRES_DB': 'x', 'POSTGRES_USER': 'x',
+                   'POSTGRES_PASSWORD': _name(), 'DATABASE_HOST': 'x',
+                   'DATABASE_PORT': '5432', 'DATABASE_CONN_POOL': 'false',
+                   'STORAGE_ENV': 'fslink', 'MEDIA_ROOT': media_root,
+                   'CHRIS_STORE_URL': 'http://x/', 'NATS_ADDRESS': 'nats://x:4222',
+                   'PFDCM_ADDRESS': 'http://x:4005', 'CELERY_BROKER_URL': 'amqp://x:5672//',
+                   'DJANGO_SECURE_PROXY_SSL_HEADER': '',
+                   'DJANGO_USE_X_FORWARDED_HOST': 'false', 'AUTH_LDAP': 'false',
+                   'DISABLE_USER_ACCOUNT_CREATION': 'false', **cache_env}
+            return subprocess.run(  # nosec B603 nosemgrep - a literal program
+                [sys.executable, '-c', program], env=env, text=True,
+                capture_output=True, cwd=settings.BASE_DIR, timeout=60, check=False)
+
+    def assertStarted(self, process, backend, degraded, connected):
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(json.loads(process.stdout.splitlines()[-1]),
+                         {'backend': backend, 'degraded': degraded, 'connected': connected})
+
+    def test_no_cache_url_starts_with_no_cache_and_connects_to_nothing(self):
+        for cache_env in ({}, {'CACHE_URL': ''}):
+            with self.subTest(cache_env=cache_env):
+                process = self.start(**cache_env)
+
+                self.assertStarted(process, 'DummyCache', True, False)
+                self.assertIn('no CACHE_URL', process.stderr)
+                self.assertNotIn('does not answer', process.stderr)
+
+    def test_no_cache_url_says_nothing_until_a_helper_is_called(self):
+        process = self.start('import django; django.setup(); print("started")')
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn('CACHE_URL', process.stderr)
+
+    def test_a_cache_url_starts_with_that_cache(self):
+        process = self.start(CACHE_URL=settings.CACHES['default']['LOCATION'])
+
+        self.assertStarted(process, 'RedisCache', False, True)
+        self.assertNotIn('core.cache', process.stderr)
+        self.assertNotIn('no CACHE_URL', process.stderr)
+
+    def test_a_cache_url_for_a_server_that_is_down_only_warns(self):
+        process = self.start(CACHE_URL='redis://127.0.0.1:6390/0')
+
+        self.assertStarted(process, 'RedisCache', True, True)
+        self.assertIn('starting without it', process.stderr)
+
+    def test_a_cache_url_for_the_brokers_server_stops_start_up(self):
+        process = self.start(CACHE_URL='redis://broker:6379/0',
+                             CELERY_BROKER_URL='redis://broker:6379/1')
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("the Celery broker's server", process.stderr)

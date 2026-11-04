@@ -109,12 +109,8 @@ well (Redis and Valkey take no memory limit from the container, so they need `--
 **The broker's rename:** runs archived before the shared cache name the broker `dragonflydb`,
 which `bench-compare` reads as `chris-broker` in their limits and in a trend's `--metric`
 (`peak_cpu_pct.chris-broker`). A later run that records the old name ran beside a container left
-over from before, and `bench-compare` shows it as it is. A box that ran the stack under the old
-name keeps that container after the checkout, and `just bench-down` leaves it: stop the stack
-before the checkout, or after it run
-`just bench-compose '--profile cube --profile bench down --remove-orphans'` (`just bench-nuke`
-removes it too, with every volume). The broker's volume, `dragonflydata`, is now
-`chris_broker_data`; no recipe removes the old one, which `docker volume rm` does by hand.
+over from before, and `bench-compare` shows it as it is. The broker's volume, `dragonflydata`,
+is now `chris_broker_data`.
 
 **Why the 2.0 s floor for the Celery poll interval:** the periodic tasks are guarded by `skip_if_running`
 (`plugininstances/tasks.py`), which spends ~1 s in a broker-wide `inspect().active()`

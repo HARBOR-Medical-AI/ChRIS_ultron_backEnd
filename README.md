@@ -189,7 +189,8 @@ just lint-fix --unsafe    # ... and unused variables
 just lint-test            # the tests of scripts/lint.py
 ```
 
-It finds nearly all of Codacy's issues but not those of Opengrep (unpinned GitHub
+An image built before these tools were added says so and needs `just build` first. `just lint`
+finds nearly all of Codacy's issues but not those of Opengrep (unpinned GitHub
 Actions, a Dockerfile without `USER`), ESLint, ShellCheck, Hadolint, markdownlint, PMD,
 Agentlinter (which reads `CLAUDE.md`), Jackson Linter or Lizard. An advisory of a changed
 lockfile that the merge-base has too is listed with a `?`: Codacy compares with its stored
@@ -286,16 +287,23 @@ just openapi-split > /dev/null
 
 See https://chrisproject.org/docs/run/helm
 
-### Shared cache: `CACHE_URL` is required
+### Shared cache: `CACHE_URL` is optional for now
 
-CUBE needs a Redis-protocol server of its own for its shared cache (`core/cache.py`), and
-`config.settings.production` refuses to start without its URL in `CACHE_URL`: the API server,
-the Celery workers and beat all read it. A deployment whose stack has no such server, e.g. one
-with RabbitMQ as the Celery broker, must add one before it runs this version.
+CUBE's shared cache (`core/cache.py`) runs on a Redis-protocol server of its own, whose URL the
+API server, the Celery workers and beat all read from `CACHE_URL`. Nothing uses the cache yet,
+so a deployment can leave `CACHE_URL` unset or empty: nothing is cached, no process connects to
+a cache server, and the helpers would go ahead without their locks, markers and bounded
+counters, logging one warning per process the first time something calls them. It will become
+required with the first feature that uses the cache, so a deployment whose stack has no such
+server, e.g. one with RabbitMQ as the Celery broker, should plan to add one.
+
+When `CACHE_URL` is set, the server needs to be:
 
 - **Its own server.** Not the Celery broker's, whatever the database: one server has one
   memory limit and one eviction policy, so a full cache would refuse the broker's writes and
-  evicting would drop its queues. CUBE refuses to start on the broker's server.
+  evicting would drop its queues. CUBE refuses to start on a URL with the broker's host and
+  port; it compares them as written, so an IP address or an alias for the same server gets
+  past this check.
 - **Evicting and keeping nothing.** Anything in it may vanish. Dragonfly with
   `--cache_mode=true --dbfilename=` (as `chris-cache` in `docker-compose.yml`), or Redis 7+ or
   Valkey 8 with a `--maxmemory`, an `allkeys-*` eviction policy and no persistence
@@ -305,16 +313,18 @@ with RabbitMQ as the Celery broker, must add one before it runs this version.
   (above 0, at most 5 s; 0.5 s by default) can go in its query string, retry options cannot.
   Percent-encode a `/`, `#`, `?` or `@` in the credentials.
 - **Its permissions.** A user the server's ACL limits needs the commands the helpers send
-  (`PING`, `SET`, `DEL`, `ZREM`, `SCRIPT LOAD` and `EVALSHA`) and those their scripts run
-  (`GET`, `DEL`, `TIME`, `PEXPIREAT` and the sorted-set commands), on the keys under CUBE's
-  prefix (`cube:*`).
+  (`PING`, `SET`, `DEL`, `ZREM`, `SCRIPT LOAD`, `SCRIPT EXISTS` and `EVALSHA`, and `SELECT` when
+  the database is not 0) and those their scripts run (`GET`, `DEL`, `TIME`, `PEXPIREAT` and the
+  sorted-set commands), on the keys under CUBE's prefix (`cube:*`).
 
 At start-up CUBE checks the server and refuses to start on a wrong configuration: another
-cache backend, the broker's server, a URL it cannot parse or without a database, retries or a
-timeout out of bounds, a refused password or certificate, TLS against a plain-text server or
-plain text against a TLS-only one, or a server that refuses its scripts. A server that is down,
-or full, only gets a warning: CUBE starts without it, and the helpers go ahead without their
-locks, markers and bounded counters until it answers.
+cache backend, the broker's host and port, a URL it cannot parse or use or without a database,
+retries or a timeout out of bounds, a refused password, or a server that refuses its scripts. A
+server that does not answer, or a full Dragonfly, only gets a warning: CUBE starts without it,
+and the helpers go ahead without their locks, markers and bounded counters until it answers.
+Most TLS mistakes are in that case (a refused certificate, or `redis://` against `rediss://`), so
+read that warning if the server should be up; a TLS-only Dragonfly answers a plain-text URL's
+password with an error, which is refused.
 
 ## GitHub Actions
 

@@ -6,7 +6,9 @@ The shared cache and the coordination helpers built on it.
 evicts when it is full and starts empty after a restart so whatever it holds may go
 missing at any time. All coordination keys created by these helpers expire automatically.
 Do not call cache.clear(): it deletes every key in this cache's Redis logical database,
-not just keys with this application's prefix (Redis/Dragonfly FLUSHDB).
+not just keys with this application's prefix (Redis/Dragonfly FLUSHDB). A production
+deployment without ``CACHE_URL`` has a ``DummyCache`` instead: nothing is cached, and the
+helpers go ahead without a server.
 
 The helpers, all safe to call from any thread or process:
 
@@ -18,29 +20,27 @@ The helpers, all safe to call from any thread or process:
 They fail open. When the cache does not answer or refuses a command they go ahead as if
 it had granted it, so whatever a lock or marker guards must stay correct when it runs
 twice. When it does not answer they also log the degraded mode once and stop trying for a
-few seconds, after which one call tries it while the others wait for its outcome. A
-release or a clear that cannot reach the cache is kept and the process's next helper call
-after the cache answers again replays it; a process that makes no further call leaves it
-to its TTL.
+few seconds, after which one call tries it while the others go on skipping it. A
+release or a clear that cannot reach the cache is kept and the process's next helper calls
+after the cache answers again replay it, a bounded batch each; a process that makes no
+further call leaves it to its TTL.
 """
 
+import contextlib
 import logging
 import math
 import os
 import re
 import secrets
-import socket
-import ssl
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 
 import redis
-from redis.backoff import NoBackoff
 from redis.commands.core import Script
-from redis.retry import Retry
 from django.core.cache import caches
+from django.core.cache.backends.dummy import DummyCache
 from django.core.cache.backends.redis import RedisCache, RedisCacheClient
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import setting_changed
@@ -101,10 +101,11 @@ class Lease:
     """
     A lock or slot this process acquired.
 
-    ``degraded`` is true when the cache did not answer the acquire or refused it so the
-    caller goes ahead without the guarantee. ``token`` is None when the acquire sent nothing, the
-    helpers being in their pause after a failure; otherwise the release removes the lease
-    by its token which also covers a write the server applied after its reply timed out.
+    ``degraded`` is true when the cache did not answer the acquire or refused it so
+    the caller goes ahead without the guarantee. ``token`` is None when the acquire
+    sent nothing, the helpers being in their pause after a failure or no cache being
+    configured; otherwise the release removes the lease by its token which also covers
+    a write the server applied after its reply timed out.
     """
     kind: str  # 'lock' or 'slot'
     key: str
@@ -117,9 +118,9 @@ def acquire_lock(name, ttl):
     Take the lock ``name`` for ``ttl`` seconds (at most, ``release_lock`` frees it
     sooner).
 
-    Returns a ``Lease``, or None when another holder has the lock. When the cache does not
-    answer or refuses the command returns a degraded ``Lease``: the caller goes ahead as if
-    it held the lock.
+    Returns a ``Lease`` or None when another holder has the lock. When the cache does
+    not answer or refuses the command returns a degraded ``Lease``: the caller goes ahead
+    as if it held the lock.
     """
     px = _milliseconds(ttl)
     key = _cache().make_key(f'lock:{name}')
@@ -196,15 +197,16 @@ def verify_cache_connection(cache_settings, broker_url=None):
     storage.
 
     Raises ``ImproperlyConfigured`` when the configuration is wrong: another backend than
-    Django's ``RedisCache``, no server or a URL redis-py cannot parse, no logical
-    database in it, retries or a socket timeout outside (0, MAX_SOCKET_TIMEOUT] in its
-    query string, the Celery broker's server, a refused password or certificate, a TLS
-    URL for a server that speaks plain text or a plain-text URL for one that speaks only
-    TLS, a database the server does not have, or a server that refuses the helpers'
-    scripts. Only logs a warning when the server does not answer (a TLS handshake it
-    closes included, as a proxy whose server is down does) so that CUBE starts while it is
-    down and the helpers fail open, or when it refuses the scripts because it is full.
-    Says nothing otherwise.
+    Django's ``RedisCache``, no server or an empty one, a URL redis-py cannot parse or use,
+    no logical database in it, retries or a socket timeout outside (0, MAX_SOCKET_TIMEOUT]
+    in its query string, the Celery broker's host and port as written (names are not
+    resolved, so an IP address or an alias gets past this), a refused password, a database
+    the server does not have, or a server that refuses the helpers' scripts. Only logs a
+    warning when the server does not answer, so that CUBE starts while it is down and the
+    helpers fail open, or when it refuses the scripts because it is full. That warning
+    covers most TLS mistakes (a refused certificate, or a scheme the server does not
+    speak), but a TLS-only Dragonfly answers the password of a plain-text URL with an
+    error, which raises. Says nothing otherwise.
     """
     backend = cache_settings.get('BACKEND', '')
 
@@ -223,8 +225,9 @@ def verify_cache_connection(cache_settings, broker_url=None):
     servers = (location if isinstance(location, (list, tuple))
                else re.split('[;,]', location))
 
-    if not servers:
-        raise ImproperlyConfigured("CACHES['default'] LOCATION names no server")
+    if not servers or not all(servers):
+        raise ImproperlyConfigured(
+            "CACHES['default'] LOCATION names no server, or an empty one")
 
     try:
         params = redis.connection.parse_url(servers[0])
@@ -234,16 +237,23 @@ def verify_cache_connection(cache_settings, broker_url=None):
             "CACHES['default'] LOCATION is no Redis URL redis-py can parse (a / # ? or @ "
             "in its credentials must be percent-encoded)") from None
 
+    if 'db' not in params:
+        # names no server: a / # or , in the credentials ends the URL's host early, so
+        # what would be named here can be part of a password
+        raise ImproperlyConfigured(
+            "CACHES['default'] LOCATION names no logical database, e.g. "
+            "redis://chris-cache:6379/0 (a / # ? or @ in its credentials must be "
+            "percent-encoded)")
+
     where = _describe(params)
 
-    if 'db' not in params:
+    # the settings' OPTIONS hold the retries at 0 under retry_on_timeout, but a retry here
+    # replaces them, and redis-py parses retry_on_error into a list of characters with
+    # which a failed call raises TypeError
+    if ('retry' in params or params.get('retry_on_timeout')
+            or params.get('retry_on_error')):
         raise ImproperlyConfigured(
-            f"CACHES['default'] LOCATION ({where}) names no logical database, e.g. "
-            f"redis://chris-cache:6379/0")
-
-    if params.get('retry_on_timeout') or params.get('retry_on_error'):
-        raise ImproperlyConfigured(
-            f"CACHES['default'] LOCATION ({where}) turns on retries: a SET NX retried "
+            f"CACHES['default'] LOCATION ({where}) asks for retries: a SET NX retried "
             f"after its reply was lost finds its own key, and the helpers would wait out "
             f"a TTL")
 
@@ -274,39 +284,22 @@ def verify_cache_connection(cache_settings, broker_url=None):
     # KEY_PREFIX, VERSION and KEY_FUNCTION make the check's keys as they make the helpers'
     make_key = backend_class(location, cache_settings).make_key
 
-    answered = False
     try:
         connection.ping()
-        answered = True
         _check_scripts(connection, make_key, where)
     except (redis.exceptions.AuthenticationError, redis.exceptions.ResponseError) as e:
         # AuthenticationError is a ConnectionError, so it goes first
         raise ImproperlyConfigured(f"CACHES['default'] ({where}): {e}")
     except _UNREACHABLE as e:
-        if not answered:
-            # a refused certificate or TLS alert or a reply that is no TLS: no retry mends
-            # any of them
-            if _tls_refused(e):
-                raise ImproperlyConfigured(f"CACHES['default'] ({where}): {e}")
-
-            # Redis leaves a TLS handshake waiting and Dragonfly closes the connection,
-            # as a proxy whose server is down does too: a mistake only when the server
-            # answers plain text
-            if _answers_without_tls(params, options):
-                raise ImproperlyConfigured(
-                    f"CACHES['default'] LOCATION ({where}) asks for TLS (rediss://), but "
-                    f"the server answers in plain text")
-
-            # Redis started with TLS only closes a plain-text connection without a word
-            if _speaks_only_tls(params, options):
-                raise ImproperlyConfigured(
-                    f"CACHES['default'] LOCATION ({where}) asks for plain text "
-                    f"(redis://), but the server speaks only TLS (rediss://)")
-
         # logged before LOGGING is configured, so the message says what it is about
         logger.warning('CUBE shared cache: %s does not answer (%s); starting without it, '
-                       'and the helpers in core.cache go ahead without it until it does',
+                       'and the helpers in core.cache go ahead without it until it does. '
+                       'If it is up check redis:// against rediss:// and its TLS options',
                        where, e)
+    except (redis.exceptions.RedisError, TypeError) as e:
+        # what redis-py makes of a query string it cannot use (?nonsense=1 or
+        # ?ssl_cert_reqs=bad), or of a server that does not speak its protocol
+        raise ImproperlyConfigured(f"CACHES['default'] LOCATION ({where}): {e}")
     finally:
         # no socket for a forked worker to inherit
         connection.connection_pool.disconnect()
@@ -316,13 +309,14 @@ def _check_scripts(client, make_key, where):
     """
     Load both scripts and run them once, as the helpers would, on keys of the check's own
     that expire within a second and sit among the helpers' keys: a server that refuses
-    them (an ACL without SCRIPT LOAD, EVALSHA, TIME or the helpers' keys, a provider that
-    blocks scripts) stops start-up here rather than leaving every helper to fail open
-    later. The explicit load matters: a server that holds the scripts already runs them
-    without one, until its next restart empties its script cache. A Dragonfly that is full
-    refuses them too and only warns: it may evict, or empty, by the time the helpers need
-    it. Redis and Valkey run them even when full, since a script that has written may go
-    on writing and the first write here only deletes.
+    them (an ACL without SCRIPT LOAD, SCRIPT EXISTS, which a replay's pipeline asks,
+    EVALSHA, TIME or the helpers' keys, a provider that blocks scripts) stops start-up
+    here rather than leaving every helper to fail open later. The explicit load matters:
+    a server that holds the scripts already runs them without one, until its next restart
+    empties its script cache. A Dragonfly that is full refuses them too and only warns:
+    it may evict, or empty, by the time the helpers need it. Redis and Valkey run them
+    even when full, since a script that has written may go on writing and the first write
+    here only deletes.
     """
     key = make_key(f'core.cache:start-up-check:{_new_token()}')
     token = _new_token()
@@ -330,10 +324,15 @@ def _check_scripts(client, make_key, where):
     try:
         for script in _SCRIPTS:
             client.script_load(script.script)
+            client.script_exists(script.sha)
         _ACQUIRE_SLOT(keys=[key], args=[1, 1000, token], client=client)
         _RELEASE_LOCK(keys=[f'{key}:lock'], args=[token], client=client)
         client.zrem(key, token)
     except redis.exceptions.ResponseError as e:
+        # a script refused between its ZADD and PEXPIREAT leaves a key that never expires
+        with contextlib.suppress(redis.exceptions.RedisError):
+            client.zrem(key, token)
+
         if not _out_of_memory(e):
             raise ImproperlyConfigured(
                 f"CACHES['default'] ({where}) refuses the scripts the helpers in "
@@ -368,6 +367,8 @@ class _CacheHealth:
     RETRY_AFTER = 5.0
     #: releases and clears kept for replay; beyond that the oldest are left to their TTL
     MAX_PENDING = 4096
+    #: releases and clears one helper call replays, in one pipeline
+    REPLAY_BATCH = 256
     #: seconds between two ERROR lines for refusals of one operation
     REFUSAL_LOG_INTERVAL = 60.0
 
@@ -381,6 +382,7 @@ class _CacheHealth:
         self._tripped_at = 0.0
         self._failed_open = 0
         self._refusals_logged = {}
+        self._no_server_logged = False
 
     def available(self):
         """
@@ -460,31 +462,68 @@ class _CacheHealth:
         if started is not None:
             self.succeeded(started)
 
+    def no_server(self, op):
+        """
+        No cache is configured (no ``CACHE_URL``): no outage, and nothing will answer, so
+        this says so once per process and only when something first asks for the cache.
+        """
+        if self._no_server_logged:
+            return
+
+        with self._lock:
+            first = not self._no_server_logged
+            self._no_server_logged = True
+
+        if first:
+            logger.warning('No shared cache is configured (no CACHE_URL): %s and the '
+                           'calls after it go ahead without its locks, markers and slots',
+                           op)
+
     def defer(self, release):
         self._pending.append(release)
 
     def replay(self, client):
         """
-        Apply the releases and clears that could not reach the cache, oldest first,
-        before the call that found the cache answering again. Raises when the cache
-        stops answering again, keeping the rest for later.
+        Apply up to REPLAY_BATCH of the releases and clears that could not reach the
+        cache, oldest first and in one pipeline, before the call that found the cache
+        answering again; the next calls send the rest. Raises when the cache stops
+        answering again, keeping them all for later: a release sent twice finds its token
+        gone, and a clear sent twice at worst runs a caller's work twice (see
+        ``clear_mark``).
         """
-        while self._pending:
-            try:
-                release = self._pending.popleft()
-            except IndexError:  # another thread took the last one
-                return
+        batch = self._next_batch()
 
-            try:
-                _apply(client, *release)
-            except _UNREACHABLE:
-                # back at the front, so the order holds; were the queue full meanwhile
-                # this would drop its newest entry rather than its oldest, a release that
-                # the TTLs bound all the same
-                self._pending.appendleft(release)
-                raise
-            except redis.exceptions.RedisError as e:
-                self.refused(_RELEASE_OPS[release[0]], e)
+        if not batch:
+            return
+
+        try:
+            with client.pipeline(transaction=False) as pipeline:
+                for release in batch:
+                    _apply(pipeline, *release)
+                replies = pipeline.execute(raise_on_error=False)
+        except _UNREACHABLE:
+            # back at the front, so the order holds; were the queue full meanwhile this
+            # would drop its newest entries rather than its oldest, releases that the TTLs
+            # bound all the same
+            self._pending.extendleft(reversed(batch))
+            raise
+        except redis.exceptions.RedisError as e:  # SCRIPT EXISTS, sent ahead of them
+            replies = [e] * len(batch)
+
+        for release, reply in zip(batch, replies):
+            if isinstance(reply, redis.exceptions.RedisError):
+                self.refused(_RELEASE_OPS[release[0]], reply)
+
+    def _next_batch(self):
+        batch = []
+
+        try:
+            while len(batch) < self.REPLAY_BATCH:
+                batch.append(self._pending.popleft())
+        except IndexError:  # no more, or another thread took the last one
+            pass
+
+        return batch
 
 
 _health = _CacheHealth()
@@ -521,6 +560,11 @@ def _call(op, command, defer=None):
     the cache is not tried and ``_FAILED`` when it does not answer or refuses. ``defer``
     is a release to replay later when it cannot reach the cache now.
     """
+    # no CACHE_URL: nothing to try, and nothing to keep for later
+    if isinstance(_cache(), DummyCache):
+        _health.no_server(op)
+        return _SKIPPED
+
     if not _health.available():
         _health.skipped()
 
@@ -548,17 +592,17 @@ def _call(op, command, defer=None):
 
 def _apply(client, kind, key, token):
     """
-    Release a lock or slot by its token, or clear a mark. Returns whether it freed
-    anything.
+    Release a lock or slot by its token, or clear a mark, on a client or a pipeline. A
+    client returns how many it freed, 0 or 1.
     """
     if kind == 'lock':
-        return _RELEASE_LOCK(keys=[key], args=[token], client=client) == 1
+        return _RELEASE_LOCK(keys=[key], args=[token], client=client)
 
     if kind == 'slot':
-        return client.zrem(key, token) == 1
+        return client.zrem(key, token)
 
     if kind == 'mark':
-        return client.delete(key) == 1
+        return client.delete(key)
 
     raise ValueError(f'unknown release kind {kind!r}')
 
@@ -584,7 +628,7 @@ def _release(lease, kind):
     reply = _call(_RELEASE_OPS[kind], lambda client: _apply(client, *release),
                   defer=release)
 
-    return reply is True
+    return reply == 1
 
 
 def _milliseconds(ttl):
@@ -610,7 +654,7 @@ def _describe(params):
     """
     host, port = params.get('host', 'localhost'), params.get('port', 6379)
     server = params.get('path') or f'{host}:{port}'
-    return f"{server}/{params['db']}" if 'db' in params else server
+    return f"{server}/{params['db']}"
 
 
 def _server(params):
@@ -620,74 +664,3 @@ def _server(params):
     """
     return params.get('path') or (params.get('host', 'localhost').lower().rstrip('.'),
                                   int(params.get('port', 6379)))
-
-
-def _answers_without_tls(params, options):
-    """
-    Whether the server a ``rediss://`` URL names answers a bare PING in plain text: any
-    reply shows it speaks no TLS (an authentication error included), except one about
-    TLS which a server that speaks only TLS sends before it closes the connection.
-    """
-    if params.get('connection_class') is not redis.connection.SSLConnection:
-        return False
-
-    timeouts = {name: params.get(name, options.get(name, 0.5))
-                for name in ('socket_timeout', 'socket_connect_timeout')}
-    probe = redis.Redis(host=params.get('host', 'localhost'),
-                        port=int(params.get('port', 6379)),
-                        retry=Retry(NoBackoff(), 0), lib_name=None, lib_version=None,
-                        **timeouts)
-    try:
-        probe.ping()
-        return True
-    except redis.exceptions.AuthenticationError:
-        return True
-    except redis.exceptions.ResponseError as e:
-        return 'tls' not in str(e).lower()
-    except redis.exceptions.RedisError:
-        return False
-    finally:
-        probe.connection_pool.disconnect()
-
-
-def _speaks_only_tls(params, options):
-    """
-    Whether the server a plain-text ``redis://`` URL names meets a TLS handshake as a TLS
-    server: it completes it, sends a certificate this host refuses or a TLS alert. A
-    server that closes the connection or sends anything else is no TLS server here.
-    """
-    if 'connection_class' in params:  # rediss:// or unix://
-        return False
-
-    host, port = params.get('host', 'localhost'), int(params.get('port', 6379))
-    timeouts = [params.get(name, options.get(name, 0.5))
-                for name in ('socket_connect_timeout', 'socket_timeout')]
-    context = ssl.create_default_context()
-
-    try:
-        with socket.create_connection((host, port), timeout=timeouts[0]) as sock:
-            sock.settimeout(timeouts[1])
-            with context.wrap_socket(sock, server_hostname=host):
-                return True
-    except ssl.SSLCertVerificationError:
-        return True
-    except ssl.SSLError as e:
-        return 'ALERT' in (e.reason or '')
-    except OSError:
-        return False
-
-
-def _tls_refused(error):
-    """
-    Whether a TLS handshake was refused, anywhere in the chain of exceptions the error was
-    raised from: a certificate this host refuses, a TLS alert or a record that is no TLS.
-    A handshake the server closed is no refusal: a plain-text Dragonfly closes it, and so
-    does a proxy whose server is down.
-    """
-    while error is not None:
-        if isinstance(error, ssl.SSLError) and not isinstance(
-                error, (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError)):
-            return True
-
-        error = error.__cause__ or error.__context__
-    return False

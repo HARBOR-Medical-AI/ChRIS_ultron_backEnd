@@ -191,7 +191,8 @@ services:
   # --maxmemory 256mb --maxmemory-policy allkeys-lru --save '' --appendonly no
   chris-cache:
     image: ${CUBE_CACHE_IMAGE:-ghcr.io/dragonflydb/dragonfly:v2.0.2}
-    # --cache_mode: evict when full instead of refusing writes; --dbfilename=: no snapshot
+    # --cache_mode: evict when full, though writes that outrun the eviction are refused;
+    # --dbfilename=: no snapshot
     command: ["--version_check=false", "--cache_mode=true", "--dbfilename="]
     ulimits:
       memlock: -1

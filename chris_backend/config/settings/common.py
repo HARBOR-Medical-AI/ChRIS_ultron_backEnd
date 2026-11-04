@@ -14,6 +14,8 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 from pathlib import Path
 
 from environs import Env
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from __version__ import __version__
 from plugins.enums import PLUGIN_TYPE_CHOICES, TYPE_CHOICES
@@ -147,6 +149,7 @@ CACHES = {
             # connection when Redis closes the old one.
             'socket_connect_timeout': 0.5,
             'socket_timeout': 0.5,
+            'retry': Retry(NoBackoff(), 0),
         },
     }
 }

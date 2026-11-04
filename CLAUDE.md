@@ -75,8 +75,8 @@ Python tools are dev dependencies for `just lint`.
   connections so the test database can be dropped (only when the run set up a test database).
 - `core/tests/test_cache.py` runs against the stack's cache server (`chris-cache`, database
   0), which a running dev stack also uses: its tests use names of their own and short
-  TTLs, and never call `cache.clear()`. Its `CacheProxy` takes the server away mid-test (stopped
-  or hung).
+  TTLs, and never call `cache.clear()` or `SCRIPT FLUSH`, which can wedge a Dragonfly that is
+  running scripts. Its `CacheProxy` takes the server away mid-test (stopped or hung).
 - `core.storage.helpers.mock_storage(target_settings)` swaps the storage backend for a temp
   directory. `core/tests/test_swiftmanager.py` and `test_s3manager.py` need the matching
   `just set-storage` environment.
@@ -96,9 +96,9 @@ Python tools are dev dependencies for `just lint`.
   `pfcon.remote`, `nats`, `chris-broker`, `chris-cache`, `lldap`), `production.py`
   (everything via `get_secret` from env; missing vars raise `ImproperlyConfigured`),
   `benchmark.py` (local + env-driven DB pool). Both `local` and `production` verify the storage
-  connection at import time, and the cache's with `core.cache.verify_cache_connection`, which
-  raises only for a wrong configuration and only warns when the cache server does not answer
-  or is full, so CUBE starts without it.
+  connection at import time, and the cache's (`production` only with a `CACHE_URL`) with
+  `core.cache.verify_cache_connection`, which raises only for a wrong configuration and only
+  warns when the cache server does not answer or is a full Dragonfly, so CUBE starts without it.
 - `manage.py` and `core/celery.py` default to `config.settings.local`; `config/asgi.py`
   defaults to `production`. The ASGI app routes HTTP to Django and WebSockets through
   `core/websockets/` (token-in-query-string auth).
@@ -147,12 +147,14 @@ Python tools are dev dependencies for `just lint`.
   `KEY_PREFIX` `cube`, 0.5 s socket timeouts, no retries. It runs with `--cache_mode` (evicts
   when full) and no snapshot (starts empty), so anything in it may vanish. `LOCATION` comes from
   `CUBE_CACHE_URL` (local and benchmark, default `redis://chris-cache:6379/0`) or
-  `CACHE_URL` (production, required); the start-up check refuses, among the mistakes its
-  docstring lists, the broker's server (whatever the database), socket timeouts in the URL
-  outside (0, 5] s, a refused certificate, a TLS URL for a plain-text server or a plain-text
-  URL for a TLS-only one, and a server that refuses the helpers' two scripts (it loads and runs
-  each once on keys of the helpers' namespace). A server that does not answer, or closes the
-  TLS handshake as a proxy whose server is down does, only gets a warning.
+  `CACHE_URL` (production, optional until HARBOR-planning #152 needs it: without one the
+  backend is a `DummyCache`, nothing connects, and the helpers go ahead degraded, with one
+  WARNING per process at the first call). The start-up check refuses, among the mistakes its
+  docstring lists, the broker's host and port as written (whatever the database; an IP or an
+  alias gets past it), socket timeouts in the URL outside (0, 5] s, and a server that refuses
+  the helpers' two scripts (it loads and runs each once on keys of the helpers' namespace). A
+  server that does not answer only gets a warning, as do most TLS mistakes (a TLS-only
+  Dragonfly answers a plain-text URL's password with an error, which is refused).
   The code speaks only the Redis protocol: Redis 7+ and Valkey 8 pass
   `core.tests.test_cache` too; for them, the compose service needs `--maxmemory`, an
   `allkeys-*` policy and no persistence (see the comment on `chris-cache`).
@@ -165,7 +167,7 @@ Python tools are dev dependencies for `just lint`.
   run twice. When it does not answer each process skips it for 5 s, then lets one call try it
   while the others keep skipping until that call's outcome is known; it logs one WARNING per
   outage and one INFO when the cache answers again, and replays the releases and clears it
-  could not send. An error reply (out of memory, a key of the wrong type) is logged at ERROR
+  could not send, at most 256 per helper call in one pipeline. An error reply (out of memory, a key of the wrong type) is logged at ERROR
   and does not count as an outage (it ends one: the cache answered); the ones redis-py raises
   as connection errors (authentication, loading, too many clients) do.
 - Django's `RedisCache` builds a new connection pool, and so a new connection, for each request
@@ -240,15 +242,6 @@ Python tools are dev dependencies for `just lint`.
   replace their images; the command lines are Dragonfly's. `cache.clear()` flushes the cache's
   whole database whatever the key prefix. Dragonfly's Lua scripts may only touch the keys they
   declare.
-- The broker was the service `dragonflydb`, with the volume `dragonflydata`, before the shared
-  cache came. A container started under the old name keeps running after a checkout across the
-  rename, and `just down`/`just bench-down` leave it (and so the network) in place: stop the
-  stack before such a checkout, or after it run
-  `just docker-compose '--profile=cube --profile=tools down --remove-orphans'` (`just
-  bench-compose '--profile cube --profile bench down --remove-orphans'` for the benchmark
-  stack). The old volume, and the tasks queued in it, stay behind: no recipe removes it, as
-  `down -v` (`just nuke`) removes only the volumes the compose file declares, so remove
-  `<project>_dragonflydata` with `docker volume rm` (or `podman volume rm`) by hand.
 - `pyproject.toml` constraints are lower bounds; `uv.lock` is the source of truth. Django is
   capped `<6.1` because django-celery-beat 2.9 requires it. After any pyproject change run
   `just lock` and commit the lockfile, otherwise CI and the image build fail.

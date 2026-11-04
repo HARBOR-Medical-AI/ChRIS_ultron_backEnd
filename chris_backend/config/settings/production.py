@@ -203,12 +203,21 @@ CELERYD_PREFETCH_MULTIPLIER = 2
 
 # CACHE SETTINGS (see common.py)
 # ------------------------------------------------------------------------------
-# A Redis-protocol server of the cache's own, apart from the Celery broker's: the start-up
-# check refuses the broker's server, whatever the database. For example
+# Optional until a feature needs the cache: without a URL nothing is cached, no process
+# connects to a cache server and the helpers in core/cache.py go ahead without their locks,
+# markers and slots. Otherwise a Redis-protocol server of the cache's own, apart from the
+# Celery broker's: the start-up check refuses the broker's host and port as written,
+# whatever the database, so an IP address or an alias gets past it. For example
 # redis://chris-cache:6379/0. TLS options and socket timeouts (above 0, at most 5 s)
 # can go in its query string, retry options cannot.
-CACHES['default']['LOCATION'] = get_secret('CACHE_URL')  # noqa: F405
-verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
+_cache_url = get_secret('CACHE_URL', default='')
+
+if _cache_url:
+    CACHES['default']['LOCATION'] = _cache_url  # noqa: F405
+    verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
+else:
+    CACHES['default']['BACKEND'] = (  # noqa: F405
+        'django.core.cache.backends.dummy.DummyCache')
 
 
 # REVERSE PROXY
