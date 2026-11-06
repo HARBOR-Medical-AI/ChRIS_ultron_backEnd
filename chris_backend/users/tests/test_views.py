@@ -97,6 +97,55 @@ class UserCreateViewTests(ViewTests):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class UserListViewTests(ViewTests):
+    """
+    Test the user-create view's GET (users collection).
+    """
+
+    def setUp(self):
+        super(UserListViewTests, self).setUp()
+        self.read_url = reverse("user-create")
+        User.objects.create_user(username=self.username, email=self.email,
+                                 password=self.password)
+        User.objects.create_user(username='other_username', password='other_password')
+
+    def test_user_list_success_admin(self):
+        self.client.login(username=self.chris_username, password=self.chris_password)
+        response = self.client.get(self.read_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], User.objects.count())
+        usernames = [u['username'] for u in response.data['results']]
+        self.assertEqual(sorted(usernames),
+                         sorted(User.objects.values_list('username', flat=True)))
+        self.assertIn(self.chris_username, usernames)
+        self.assertIn(self.username, usernames)
+        self.assertIn('other_username', usernames)
+        for item in response.data['results']:
+            self.assertNotIn('password', item)
+        self.assertNotContains(response, self.password)
+
+    def test_user_list_success_admin_pagination(self):
+        self.client.login(username=self.chris_username, password=self.chris_password)
+        response = self.client.get(self.read_url, {'limit': 1, 'offset': 1})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], User.objects.count())
+        self.assertEqual(len(response.data['results']), 1)
+        second_user = User.objects.order_by('id')[1]
+        self.assertEqual(response.data['results'][0]['username'], second_user.username)
+        self.assertIsNotNone(response.data['next'])
+
+    def test_user_list_failure_access_denied(self):
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.get(self.read_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_user_list_unauthenticated_empty(self):
+        response = self.client.get(self.read_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 0)
+        self.assertNotContains(response, self.username)
+
+
 class UserGroupListViewTests(ViewTests):
     """
     Test the user-group-list view.
