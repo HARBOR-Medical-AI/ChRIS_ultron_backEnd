@@ -21,6 +21,7 @@ dependencies = [
     "django-storages[s3]>=1.14.6",
     "boto3>=1.43",
     "celery[redis]>=5.6.3",
+    "redis>=6.4",
     # 2.9.0 caps Django below 6.1 and cron-descriptor below 2.0, which is why the lock
     # moves cron-descriptor backwards. It is also the one dependency standing between
     # this project and Django 6.1: upstream has 6.1 in its test matrix but has not
@@ -47,8 +48,12 @@ dev = [
     "django-extensions>=4.1",
     "collection-json>=0.1.1",  # used directly by collectionjson.tests.test_renderers
     "coverage>=7.16",
-    "pylint>=4.0.8",
-    "flake8>=7.3",
+    "pylint>=4.0.8",  # used by `just lint`
+    "pylint-django>=2.8.0",  # used by `just lint` and Codacy's Pylint
+    "flake8>=7.3",  # used by `just lint` for the pyflakes Codacy's Prospector runs
+    "bandit>=1.9.4",  # used by `just lint`
+    "dodgy>=0.2.1",  # used by `just lint` and Codacy's Prospector
+    "ruff>=0.17.3",  # used by `just lint-fix`
     "daphne>=4.2.3",  # required by (django) channels.testing
 ]
 

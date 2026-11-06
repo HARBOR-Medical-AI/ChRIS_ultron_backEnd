@@ -9,6 +9,7 @@ from django_auth_ldap.config import LDAPSearch, GroupOfNamesType
 from .common import *  # noqa
 from environs import Env, EnvError
 from core.storage import verify_storage_connection
+from core.cache import verify_cache_connection
 
 # Normally you should not import ANYTHING from Django directly
 # into your settings, but ImproperlyConfigured is an exception.
@@ -198,6 +199,25 @@ CELERY_TASK_SERIALIZER = 'json'
 # messages to prefetch at a time multiplied by the number of concurrent processes
 # default is 4 (four messages for each process)
 CELERYD_PREFETCH_MULTIPLIER = 2
+
+
+# CACHE SETTINGS (see common.py)
+# ------------------------------------------------------------------------------
+# Optional until a feature needs the cache: without a URL nothing is cached, no process
+# connects to a cache server and the helpers in core/cache.py go ahead without their locks,
+# markers and slots. Otherwise a Redis-protocol server of the cache's own, apart from the
+# Celery broker's: the start-up check refuses the broker's host and port as written,
+# whatever the database, so an IP address or an alias gets past it. For example
+# redis://chris-cache:6379/0. TLS options and socket timeouts (above 0, at most 5 s)
+# can go in its query string, retry options cannot.
+_cache_url = get_secret('CACHE_URL', default='')
+
+if _cache_url:
+    CACHES['default']['LOCATION'] = _cache_url  # noqa: F405
+    verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
+else:
+    CACHES['default']['BACKEND'] = (  # noqa: F405
+        'django.core.cache.backends.dummy.DummyCache')
 
 
 # REVERSE PROXY

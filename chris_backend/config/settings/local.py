@@ -1,4 +1,4 @@
-1# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Local settings
 
@@ -13,6 +13,7 @@ import ldap
 from django_auth_ldap.config import LDAPSearch, GroupOfNamesType
 from .common import *  # noqa
 from core.storage import verify_storage_connection
+from core.cache import verify_cache_connection
 
 # Normally you should not import ANYTHING from Django directly
 # into your settings, but ImproperlyConfigured is an exception.
@@ -195,7 +196,7 @@ PFDCM_ADDRESS = 'http://pfdcm:4005'
 
 # Celery settings
 
-CELERY_BROKER_URL = 'redis://dragonflydb:6379/0'
+CELERY_BROKER_URL = 'redis://chris-broker:6379/0'
 
 #: Only add pickle to this list if your broker is secured
 #: from unwanted access (see userguide/security.html)
@@ -206,6 +207,13 @@ CELERY_TASK_SERIALIZER = 'json'
 # messages to prefetch at a time multiplied by the number of concurrent processes
 # default is 4 (four messages for each process)
 CELERYD_PREFETCH_MULTIPLIER = 2
+
+
+# Cache settings (see common.py)
+# The benchmark stack records CUBE_CACHE_URL in each run's environment manifest.
+CACHES['default']['LOCATION'] = os.getenv('CUBE_CACHE_URL',  # noqa: F405
+                                          'redis://chris-cache:6379/0')
+verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
 
 
 # LDAP auth configuration

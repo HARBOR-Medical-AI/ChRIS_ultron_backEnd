@@ -34,7 +34,7 @@ from locust.runners import WorkerRunner
 
 from benchmarks.chris_api import CJ, _items, _template
 from benchmarks.docker_client import DockerClient
-from benchmarks.environment import ENVELOPE_KEYS, postgres_settings
+from benchmarks.environment import envelope, postgres_settings
 from benchmarks.recovery import all_ok, api_recovery, probe_api
 
 
@@ -202,7 +202,7 @@ def _record_recovery(environment, **_kwargs) -> None:
         logging.exception("could not check whether the API recovered")
         result.update({"recovered": False, "seconds": None, "error": repr(exc)})
 
-    result["envelope"] = {k: os.environ.get(k) for k in ENVELOPE_KEYS}
+    result["envelope"] = envelope(os.environ)
     result["postgres"] = _postgres_settings(docker)
     prefix = getattr(environment.parsed_options, "csv_prefix", None)
 

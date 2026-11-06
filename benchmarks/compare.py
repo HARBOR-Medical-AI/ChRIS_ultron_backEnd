@@ -3,9 +3,10 @@ Compare benchmark runs over time (pure logic + rendering + CLI).
 
 Answers two questions about a *baseline* and a *candidate* run:
 
-1. **Are they comparable at all?** Mismatched workload fingerprint, storage mode or
-   auth mode are *blockers*; envelope, container-limit, Postgres-settings, host and
-   threshold differences are *cautions*; commit and image differences are the point of
+1. **Are they comparable at all?** Mismatched workload fingerprint, workload plugin
+   versions, storage mode or auth mode are *blockers*; envelope, container-limit,
+   Postgres-settings, resource-sampler, host, threshold and workload-plugin image
+   differences are *cautions*; commit and service image differences are the point of
    comparing. The comparison never refuses — a loudly-labelled report beats an error.
 2. **What changed?** Per (topology, axis, level): makespan and worst-p95 deltas
    flagged REGRESSED/IMPROVED only when they exceed BOTH a relative threshold and the
@@ -23,12 +24,12 @@ Run via ``just bench-compare <run> <run> [...]``; run ids resolve against both
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
-from .models import RunData
-from .report import csv_cell, markdown_table
+from .models import RunData, describe_sampler
+from .report import csv_cell, markdown_table, record_digests
 from .results import default_results_root, load_run, resolve_run
 
 
@@ -148,9 +149,49 @@ _SCALAR_FIELDS = (
     ("images.chris", ("images", "chris", "image_id"), INFO),
     ("images.pfcon", ("images", "pfcon", "image_id"), INFO),
     ("images.db", ("images", "db", "image_id"), INFO),
+    # the Celery broker and the shared cache
+    ("images.chris-broker", ("images", "chris-broker", "image_id"), INFO),
+    ("images.chris-cache", ("images", "chris-cache", "image_id"), INFO),
 )
 
+#: compose services renamed since runs were archived: in a run from before, their limits and
+#: peaks read under the current names, so a rename is no difference
+RENAMED_SERVICES = {"dragonflydb": "chris-broker"}
+
+#: the level-row metrics the resource sampler produces: a trend of one across runs sampled
+#: differently says so
+SAMPLED_METRICS = ("peak_cpu_pct", "peak_job_cpu_pct", "peak_write_bytes", "peak_mem_bytes",
+                   "peak_mem_anon_bytes", "cpu_throttled_s", "peak_queue_depth")
+
 _NOISE_FLOOR_RATIO = 3.0
+
+
+def _predates_rename(env: dict) -> bool:
+    """
+    Whether a run was recorded before the services were renamed: its images and limits
+    name none of them by its current name. A later run that records an old name too ran
+    beside containers left over from before, and shows them as they are.
+    """
+    current = set(RENAMED_SERVICES.values())
+    return not any(service in current
+                   for key in ("images", "limits") if isinstance(env.get(key), dict)
+                   for service in env[key])
+
+
+def _current_names(env: dict) -> dict:
+    """
+    A run from before the rename with its services under their current names in the
+    images and limits recorded per service; a later run as it is.
+    """
+    if not _predates_rename(env):
+        return env
+
+    def renamed(block):
+        return {RENAMED_SERVICES.get(service, service): value
+                for service, value in block.items()}
+
+    return {**env, **{key: renamed(env[key]) for key in ("images", "limits")
+                      if isinstance(env.get(key), dict)}}
 
 
 def _dig(env: dict, path: tuple) -> object:
@@ -162,6 +203,7 @@ def _dig(env: dict, path: tuple) -> object:
 
 
 def check_comparability(base_env: dict, cand_env: dict) -> Comparability:
+    base_env, cand_env = _current_names(base_env), _current_names(cand_env)
     diffs: list[FieldDiff] = []
 
     # workload identity: unknown (pre-fingerprint run) is a warning, mismatch a blocker
@@ -175,6 +217,11 @@ def check_comparability(base_env: dict, cand_env: dict) -> Comparability:
     elif a != b:
         diffs.append(FieldDiff("matrix.workload_sha256", a, b, BLOCKER))
 
+    diffs += _workload_plugin_diffs(base_env.get("workload_plugins") or {},
+                                    cand_env.get("workload_plugins") or {})
+    diffs += _block_diffs("workload_plugins_pin", base_env.get("workload_plugins_pin") or {},
+                          cand_env.get("workload_plugins_pin") or {}, INFO)
+
     for label, path, severity in _SCALAR_FIELDS:
         a, b = _dig(base_env, path), _dig(cand_env, path)
         if a != b:
@@ -185,6 +232,7 @@ def check_comparability(base_env: dict, cand_env: dict) -> Comparability:
                           cand_env.get("envelope") or {}, WARNING, skip=("STORAGE_ENV",))
 
     diffs += _limits_diffs(base_env.get("limits") or {}, cand_env.get("limits") or {})
+    diffs += _sampler_diffs(base_env.get("sampler") or {}, cand_env.get("sampler") or {})
     diffs += _postgres_diffs(base_env.get("postgres") or {}, cand_env.get("postgres") or {})
 
     a = _dig(base_env, ("noise_floor", "health_p50_ms"))
@@ -227,6 +275,50 @@ def _unrecorded(label: str, base: dict, cand: dict) -> Optional[list[FieldDiff]]
     return None
 
 
+def _workload_plugin_diffs(base: dict, cand: dict) -> list[FieldDiff]:
+    """
+    Differences in the workload plugins, per role: another name or version is another
+    workload (a blocker, like the matrix fingerprint); another image reference is
+    information, unless both name digests that differ, and other image digests a caution
+    (the same version rebuilt, or a local build).
+    """
+    unrecorded = _unrecorded("workload_plugins", base, cand)
+    if unrecorded is not None:
+        return unrecorded
+
+    def flat(plugins: dict, *fields: str) -> dict:
+        return {f"{role}.{name}": (p or {}).get(name)
+                for role, p in plugins.items() for name in fields}
+
+    def digests(plugins: dict) -> dict:
+        # on overlay2 a local build has none
+        return {f"{role}.digests": " ".join(record_digests(p["image"])) or "none"
+                for role, p in plugins.items() if (p or {}).get("image")}
+
+    diffs = _block_diffs("workload_plugins", flat(base, "name", "version"),
+                         flat(cand, "name", "version"), BLOCKER)
+    diffs += [replace(d, severity=WARNING) if _other_digests(d.baseline, d.candidate) else d
+              for d in _block_diffs("workload_plugins", flat(base, "dock_image"),
+                                    flat(cand, "dock_image"), INFO)]
+
+    base_digests, cand_digests = digests(base), digests(cand)
+    unrecorded = _unrecorded("workload_plugins.image", base_digests, cand_digests)
+
+    if unrecorded is not None:
+        return diffs + unrecorded
+    return diffs + _block_diffs("workload_plugins", base_digests, cand_digests, WARNING)
+
+
+def _other_digests(a, b) -> bool:
+    """
+    Return ``True`` when both image references include SHA-256 digests and those digests
+    differ; otherwise return ``False``.
+    """
+    a, b = (ref.rpartition("@")[2] if isinstance(ref, str) and "@sha256:" in ref else None
+            for ref in (a, b))
+    return a is not None and b is not None and a != b
+
+
 def _limits_diffs(base: dict, cand: dict) -> list[FieldDiff]:
     """
     Cautions for differing container resource limits (``limits.<service>.<limit>``).
@@ -241,6 +333,18 @@ def _limits_diffs(base: dict, cand: dict) -> list[FieldDiff]:
                 for name, value in (values or {}).items()}
 
     return _block_diffs("limits", flat(base), flat(cand), WARNING)
+
+
+def _sampler_diffs(base: dict, cand: dict) -> list[FieldDiff]:
+    """
+    Cautions for runs whose resources and queues were sampled differently, the peaks of one
+    taken more sparsely or over other windows than the other's.
+    """
+    unrecorded = _unrecorded("sampler", base, cand)
+
+    if unrecorded is not None:
+        return unrecorded
+    return _block_diffs("sampler", base, cand, WARNING)
 
 
 def _postgres_diffs(base: dict, cand: dict) -> list[FieldDiff]:
@@ -405,13 +509,56 @@ def _metric_path(metric: str) -> tuple:
     return tuple(metric.split("."))
 
 
+def _recorded_path(run: RunData, path: tuple) -> tuple:
+    """
+    ``path`` as ``run`` recorded it: a run from before the rename keeps its per-service
+    peaks under the old names (``peak_cpu_pct.dragonflydb``).
+    """
+    if not _predates_rename(run.environment or {}):
+        return path
+
+    old_names = {current: old for old, current in RENAMED_SERVICES.items()}
+    return tuple(old_names.get(key, key) for key in path)
+
+
+def _sampler_note(runs: list[RunData], metric: str) -> list[str]:
+    """
+    A note when a sampled metric is trended across runs that were sampled differently:
+    a run that records no sampler predates the 1 s sampler and read each container only
+    every ~2 s times the number of containers, so its peaks are lower bounds.
+    """
+    if _metric_path(metric)[0] not in SAMPLED_METRICS:
+        return []
+
+    groups: dict[str, list[str]] = {}
+    for run in runs:
+        groups.setdefault(_sampler_label((run.environment or {}).get("sampler")),
+                          []).append(run.run_id)
+
+    if len(groups) < 2:
+        return []
+
+    parts = "; ".join(f"{', '.join(ids)}: {label}" for label, ids in groups.items())
+    return [f"_The runs were sampled differently — {parts}._", ""]
+
+
+def _sampler_label(sampler: dict | None) -> str:
+    """
+    Every setting of a run's sampler record, so that runs sampled alike share a label.
+    """
+    if not sampler:
+        return "not recorded (the sparse sampler: lower bounds)"
+
+    return describe_sampler(sampler)
+
+
 def trend_tables(runs: list[RunData], metric: str) -> list[tuple[tuple, list, list]]:
     """
     Per (topology, axis): ((topology, axis), headers, rows) tracking ``metric`` (a
     dotted path for nested values) across all runs (chronological = argument order);
     last row is the breaking point.
     """
-    path = _metric_path(metric)
+    paths = [_recorded_path(run, _metric_path(metric)) for run in runs]
     indexes = [_index(r.levels) for r in runs]
 
     axes = sorted({(r.get("topology"), r.get("axis"))
@@ -429,7 +576,8 @@ def trend_tables(runs: list[RunData], metric: str) -> list[tuple[tuple, list, li
         
         headers = ["Level"] + [run.run_id for run in runs]
 
-        rows = [[lvl] + [_dig(idx.get((*axis_key, lvl), {}), path) for idx in indexes]
+        rows = [[lvl] + [_dig(idx.get((*axis_key, lvl), {}), path)
+                         for idx, path in zip(indexes, paths)]
                 for lvl in levels]
         
         rows.append(["breaking point"] + [bps.get(axis_key) for bps in bp_maps])
@@ -523,10 +671,12 @@ def render_markdown(comparison: RunComparison, trend_runs: "list[RunData] | None
     if trend_runs:
         lines += [f"## Trend — {metric} across {len(trend_runs)} runs", ""]
         
-        if not any(_dig(row, _metric_path(metric)) is not None
+        if not any(_dig(row, _recorded_path(run, _metric_path(metric))) is not None
                    for run in trend_runs for row in run.levels):
             lines += [f"_metric {metric!r} not found in any run's level rows — "
                       f"check --metric_", ""]
+
+        lines += _sampler_note(trend_runs, metric)
         
         for axis_key, headers, rows in trend_tables(trend_runs, metric):
             lines += [f"### {axis_key[0]} — {axis_key[1]}", ""]

@@ -19,12 +19,9 @@ cube:
       password: pfcon1234
       description: host Description
 
-  # dbg-bigfiles, pl-simpledsapp and pl-topologicalcopy are the workload plugins required by the
-  # CUBE benchmark harness (benchmarks/). Versions used for the recorded runs:
-  #   dbg-bigfiles 1.0.0  ·  pl-simpledsapp 2.1.5  ·  pl-topologicalcopy 1.0.13
-  # Adjust versions here as needed, but keep EXACTLY ONE version of each installed: the harness
-  # resolves each plugin by name and runs CUBE's first match (plugins are ordered by -version),
-  # so a second version of the same plugin changes which one runs (the harness warns if it finds more than one).
+  # The benchmark harness (benchmarks/) does not use this file: `just bench-start` registers
+  # its workload plugins at pinned versions from benchmarks/chrisomatic/benchmark.yml (see
+  # benchmarks/envelope.md § "Pinned workload plugin versions").
   plugins:
     - name: pl-simplefsapp
     - name: pl-dircopy

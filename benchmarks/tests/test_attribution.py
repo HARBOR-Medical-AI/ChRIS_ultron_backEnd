@@ -8,6 +8,8 @@ manifest that records the settings.
 import json
 import os
 import re
+import socket
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +17,8 @@ import pytest
 from benchmarks.broker import BrokerClient, encode_command, parse_reply
 from benchmarks.docker_client import (CGROUP_COUNTERS_CMD, CONTAINER_START_KEY, DockerClient,
                                       parse_cgroup_counters)
-from benchmarks.environment import ENVELOPE_KEYS, POSTGRES_SETTINGS, collect_environment
+from benchmarks.environment import (ENVELOPE_KEYS, POSTGRES_SETTINGS, collect_environment,
+                                    envelope)
 from benchmarks.metrics import MetricSink, queue_rollup
 from benchmarks.models import QueueSample
 from benchmarks.pg_stats import (COUNTERS_SQL, SETTINGS_SQL, STATEMENT_COLUMNS,
@@ -49,6 +52,64 @@ def test_broker_unreachable_degrades_to_empty():
     assert client.depths() == {}
 
 
+def test_depths_send_the_llens_together_on_one_connection():
+    """
+    A one-connection-at-a-time RESP server: the PING of the constructor, then one
+    connection carrying the three LLENs.
+    """
+    server = socket.create_server(("127.0.0.1", 0))
+    received = []
+
+    def serve():
+        for reply in (b"+PONG\r\n", b":1\r\n:22\r\n:333\r\n"):
+            conn, _ = server.accept()
+            with conn:
+                data = b""
+                # a PING is 3 lines of RESP, each LLEN 5
+                while data.count(b"\r\n") < (3 if reply == b"+PONG\r\n" else 15):
+                    data += conn.recv(4096)
+                received.append(data)
+                conn.sendall(reply)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    client = BrokerClient("127.0.0.1", server.getsockname()[1], timeout=2.0)
+    depths = client.depths()
+    thread.join(2)
+    server.close()
+
+    assert depths == {"main1": 1, "main2": 22, "periodic": 333}  # nosec B101 - pytest assertion
+    assert received[1] == b"".join(  # nosec B101 - pytest assertion
+        encode_command("LLEN", q) for q in ("main1", "main2", "periodic"))
+
+
+def _one_reply_server(reply):
+    """
+    A RESP server that answers the constructor's PING, then sends ``reply`` to whatever
+    comes next and closes.
+    """
+    server = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        for answer in (b"+PONG\r\n", reply):
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(4096)
+                conn.sendall(answer)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return server
+
+
+def test_depths_of_a_short_or_garbled_reply_are_empty():
+    for reply in (b":1\r\n:22\r\n", b"-ERR unknown command\r\n:1\r\n:2\r\n"):
+        server = _one_reply_server(reply)
+        client = BrokerClient("127.0.0.1", server.getsockname()[1], timeout=2.0)
+
+        assert client.depths() == {}, reply  # nosec B101 - pytest assertion
+        server.close()
+
+
 class FakeBroker:
     available = True
 
@@ -69,7 +130,7 @@ def test_sampler_records_queue_depths():
 
     sink = MetricSink()
     sampler = StatsSampler(NoDocker(), sink, broker=FakeBroker({"main2": 7}))
-    sampler._sample_once()
+    sampler._sample_queues()
     samples = sink.queues()
 
     assert len(samples) == 1
@@ -497,15 +558,49 @@ class ManifestDocker(JsonDocker):
                        "shm_size": 1073741824}}
 
 
-def test_collect_environment_records_postgres_settings_limits_and_db_image():
+def test_collect_environment_records_postgres_settings_limits_and_images():
+    cache_url = "redis://chris-cache:6379/0"
     env = collect_environment(ManifestDocker(SETTINGS_DOC),
-                              env={"CUBE_DB_SYNCHRONOUS_COMMIT": "on"})
+                              env={"CUBE_DB_SYNCHRONOUS_COMMIT": "on",
+                                   "CUBE_CACHE_URL": cache_url})
+    ids = {service: image["image_id"] for service, image in env["images"].items()}
+    knobs = env["envelope"]
 
     assert env["postgres"]["settings"]["max_wal_size"] == "8GB"  # nosec B101 - pytest assertion
-    assert env["images"]["db"]["image_id"] == "sha256:db"  # nosec B101 - pytest assertion
+    assert ids["db"] == "sha256:db"  # nosec B101 - pytest assertion
+    assert ids["chris-broker"] == "sha256:chris-broker"  # nosec B101 - pytest assertion
+    assert ids["chris-cache"] == "sha256:chris-cache"  # nosec B101 - pytest assertion
     assert env["limits"]["db"]["shm_size"] == 1073741824  # nosec B101 - pytest assertion
-    assert env["envelope"]["CUBE_DB_SYNCHRONOUS_COMMIT"] == "on"  # nosec B101 - pytest assertion
-    assert set(env["envelope"]) == set(ENVELOPE_KEYS)  # nosec B101 - pytest assertion
+    assert knobs["CUBE_DB_SYNCHRONOUS_COMMIT"] == "on"  # nosec B101 - pytest assertion
+    assert knobs["CUBE_CACHE_URL"] == cache_url  # nosec B101 - pytest assertion
+    assert set(knobs) == set(ENVELOPE_KEYS)  # nosec B101 - pytest assertion
+
+
+def test_the_envelope_masks_a_password_in_a_url():
+    knobs = envelope({"CUBE_CACHE_URL": "redis://user:s3cret@cache:6379/0",
+                      "CUBE_DEBUG": "false"})
+    masked = knobs["CUBE_CACHE_URL"]
+
+    assert masked == "redis://user:***@cache:6379/0"  # nosec B101 - pytest assertion
+    assert knobs["CUBE_DEBUG"] == "false"  # nosec B101 - pytest assertion
+    assert knobs["CUBE_UVICORN_WORKERS"] is None  # nosec B101 - pytest assertion
+
+
+def test_the_envelope_masks_the_passwords_redis_py_reads_from_the_url():
+    for url, expected in (
+            ("redis://:s3cret@cache:6379/0", "redis://:***@cache:6379/0"),
+            ("redis://cache:6379/0?password=s3cret&socket_timeout=1",
+             "redis://cache:6379/0?password=***&socket_timeout=1"),
+            ("rediss://cache:6379/0?ssl_password=k3y", "rediss://cache:6379/0?ssl_password=***"),
+            ("redis://cache:6379/0?db=0", "redis://cache:6379/0?db=0"),
+            # several servers, as RedisCache splits them
+            ("redis://:pw1@cache:6379/0,redis://:pw2@replica:6379/0",
+             "redis://:***@cache:6379/0,redis://:***@replica:6379/0"),
+            ("redis://cache:6379/0?password=a;redis://replica:6379/0?password=b",
+             "redis://cache:6379/0?password=***;redis://replica:6379/0?password=***")):
+        masked = envelope({"CUBE_CACHE_URL": url})["CUBE_CACHE_URL"]
+
+        assert masked == expected  # nosec B101 - pytest assertion
 
 
 # -- against the stack's own Postgres --------------------------------------------------------

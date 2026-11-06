@@ -14,6 +14,8 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 from pathlib import Path
 
 from environs import Env
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from __version__ import __version__
 from plugins.enums import PLUGIN_TYPE_CHOICES, TYPE_CHOICES
@@ -127,6 +129,31 @@ DATABASES = {
     }
 }
 
+# Cache
+# https://docs.djangoproject.com/en/6.0/topics/cache/
+# Django's RedisCache on a Redis-protocol server of its own (chris-cache in the compose
+# stacks, a Dragonfly), apart from the Celery broker's; the environment-specific settings
+# set LOCATION and run the start-up check. core/cache.py
+# has the coordination helpers built on it.
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'KEY_PREFIX': 'cube',
+        'OPTIONS': {
+            # redis-py waits forever by default (without a timeout) so a hung server
+            # would hang every cache call.
+            # Automatic Redis-command retries are disabled. If a lock request
+            # succeeds but its reply is lost, a retry would find the lock it already
+            # created and appear to fail. The connection pool automatically opens a new
+            # connection when Redis closes the old one.
+            'socket_connect_timeout': 0.5,
+            'socket_timeout': 0.5,
+            'retry': Retry(NoBackoff(), 0),
+        },
+    }
+}
+
 # Seconds between the log lines that report each ASGI worker's database connection pool
 # counters (core.utils.start_db_pool_stats_logger, started by config/asgi.py); 0 is off.
 DB_POOL_STATS_INTERVAL = 0
@@ -210,7 +237,7 @@ SPECTACULAR_SETTINGS = {
     'VERSION': __version__,
     'LICENSE': {
         'name': 'MIT',
-        'url': 'https://github.com/FNNDSC/ChRIS_ultron_backEnd/blob/master/LICENSE'
+        'url': 'https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/blob/master/LICENSE'
     },
     'EXTERNAL_DOCS': {
         'url': 'https://chrisproject.org/docs'

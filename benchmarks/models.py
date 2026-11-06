@@ -138,15 +138,73 @@ class StatusTimeline:
 
 @dataclass(frozen=True)
 class ResourceSample:
+    """
+    One reading of a container at time ``t``. ``cpu_pct`` is the CPU it used over the
+    ``cpu_window_s`` before ``t`` (100 = one core), ``None`` when the reading has no
+    window of its own (``docker_client.resource_sample`` says when: a service's first
+    reading in a scenario, among others). The blkio counters and ``cpu_total_ns`` count
+    from the container's start, ``started_at``, which the sampler inspects again after a
+    restart (a restart keeps the container's id and starts its counters from zero).
+    """
     t: float
     container: str
     kind: str  # "service" | "job"
-    cpu_pct: float
+    cpu_pct: Optional[float]
     mem_bytes: float
     mem_limit_bytes: float
     blkio_read_bytes: float = 0.0
     blkio_write_bytes: float = 0.0
     pids: int = 0
+    cpu_window_s: Optional[float] = None
+    cpu_total_ns: Optional[int] = None
+    cpu_throttled_s: Optional[float] = None    # held back by its CPU limit in the window
+    mem_anon_bytes: Optional[float] = None     # memory without the page cache
+    started_at: Optional[float] = None
+
+
+def _count(trouble: bool = False):
+    """
+    A count that a level's repeats add up; with ``trouble``, any above 0 means the
+    sampling fell behind or failed.
+    """
+    return field(default=0, metadata={"rollup": "sum", "trouble": trouble})
+
+
+@dataclass(frozen=True)
+class SamplerSummary:
+    """
+    How a scenario's resource and queue sampling went, so that a sampler that fell behind
+    or failed shows in the report rather than in thinner numbers. A late tick is a slot
+    skipped (never run) because the tick before it overran; a vanished container was
+    removed or had exited between the listing and its read, which job churn does all the
+    time; a busy skip is a container left out of a tick because its read from an earlier
+    tick was still running. A failed listing includes a tick that raised.
+    """
+    interval_s: float = field(metadata={"rollup": "first"})
+    queue_interval_s: Optional[float] = field(metadata={"rollup": "first"})
+    ticks: int = _count()
+    late_ticks: int = _count(trouble=True)
+    max_tick_s: float = field(default=0.0, metadata={"rollup": "max"})
+    reads: int = _count()
+    failed_reads: int = _count(trouble=True)
+    vanished: int = _count()
+    list_failures: int = _count(trouble=True)
+    jobs_seen: int = _count()
+    queue_ticks: int = _count()
+    queue_late_ticks: int = _count(trouble=True)
+    queue_failures: int = _count(trouble=True)
+    busy_skips: int = _count(trouble=True)
+
+
+def describe_sampler(record: dict) -> str:
+    """
+    A run's sampler record (``environment.json``'s ``sampler``) in one line, as the report
+    and bench-compare show it.
+    """
+    queues = (f"queues every {record['queue_interval_s']} s"
+              if record.get("queue_interval_s") else "no queue timer")
+    return (f"{record.get('method')}: every {record.get('interval_s')} s, {queues}, "
+            f"{record.get('workers')} workers")
 
 
 @dataclass(frozen=True)
@@ -225,6 +283,7 @@ class ScenarioResult:
     notes: list[str] = field(default_factory=list)
     # Postgres and db-container counter deltas per window (pg_stats.counter_windows)
     db_counters: dict = field(default_factory=dict)
+    sampler: Optional[SamplerSummary] = None
 
 
 @dataclass

@@ -185,7 +185,8 @@ def test_get_plugin_selects_first_match_and_counts_versions():
     api = make_api(FakeSession(responses=[FakeResponse(200, payload)]))
     assert api.get_plugin("pl-x") == {
         "id": 7, "name": "pl-x", "version": "1.0.13",
-        "dock_image": "fnndsc/pl-x", "matches": 2}
+        "dock_image": "fnndsc/pl-x", "matches": 2,
+        "installed_versions": ["1.0.13", "1.0.12"]}
 
 
 def test_get_plugin_single_match_and_id_delegates():

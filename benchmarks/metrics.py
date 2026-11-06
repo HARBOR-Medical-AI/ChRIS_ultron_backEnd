@@ -272,29 +272,52 @@ def queue_rollup(samples: list[QueueSample]) -> dict:
 
 def resource_rollup(samples: list[ResourceSample]) -> dict:
     """
-    Peak/mean CPU%, peak memory, block-I/O deltas and peak pids per container.
+    Peak/mean CPU% over the readings that have a CPU window (``None`` without one),
+    peak memory with and without the page cache, the block I/O and CPU throttling in the
+    scenario's window, and peak pids, per container.
     """
     by_container: dict[str, list[ResourceSample]] = defaultdict(list)
-    
+
     for s in samples:
         by_container[s.container].append(s)
 
     out = {}
     for container, ss in by_container.items():
-        cpu = [s.cpu_pct for s in ss]
-        mem = [s.mem_bytes for s in ss]
-        blk_r = [s.blkio_read_bytes for s in ss]
-        blk_w = [s.blkio_write_bytes for s in ss]
-        
+        ss = sorted(ss, key=lambda s: s.t)
+        cpu = [s.cpu_pct for s in ss if s.cpu_pct is not None]
+        anon = [s.mem_anon_bytes for s in ss if s.mem_anon_bytes is not None]
+        throttled = [s.cpu_throttled_s for s in ss if s.cpu_throttled_s is not None]
+
         out[container] = {
             "kind": ss[0].kind,
-            "cpu_pct_peak": round(max(cpu), 1) if cpu else 0.0,
-            "cpu_pct_mean": round(_mean(cpu), 1),
-            "mem_bytes_peak": int(max(mem)) if mem else 0,
-            # blkio counters are cumulative since container start -> delta over scenario
-            "blkio_read_bytes": int(max(blk_r) - min(blk_r)) if blk_r else 0,
-            "blkio_write_bytes": int(max(blk_w) - min(blk_w)) if blk_w else 0,
+            "cpu_pct_peak": round(max(cpu), 1) if cpu else None,
+            "cpu_pct_mean": round(_mean(cpu), 1) if cpu else None,
+            "cpu_windows": len(cpu),
+            "cpu_throttled_s": round(sum(throttled), 3) if throttled else None,
+            "mem_bytes_peak": int(max(s.mem_bytes for s in ss)),
+            "mem_anon_peak": int(max(anon)) if anon else None,
+            # blkio counters are cumulative since the container started
+            "blkio_read_bytes": counter_increase(ss, "blkio_read_bytes"),
+            "blkio_write_bytes": counter_increase(ss, "blkio_write_bytes"),
             "pids_peak": max((s.pids for s in ss), default=0),
             "samples": len(ss),
         }
     return out
+
+
+def counter_increase(samples: list[ResourceSample], counter: str) -> int:
+    """
+    How much a counter that runs from the container's start grew over time-ordered
+    ``samples``: the sum of its increases between consecutive readings of one start. A
+    pair across a restart (the sampler inspects the start time again after one) is left
+    out, so that the counter's climb from zero after it is not counted from the value
+    before it; a fall is never counted.
+    """
+    total = 0.0
+
+    for before, after in zip(samples, samples[1:]):
+        grew = getattr(after, counter) - getattr(before, counter)
+
+        if after.started_at == before.started_at and grew > 0:
+            total += grew
+    return int(total)

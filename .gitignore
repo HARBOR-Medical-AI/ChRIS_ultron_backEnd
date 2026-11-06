@@ -38,3 +38,7 @@ chris_backend/.lesshist
 # benchmark run outputs (keep the directory, ignore generated runs)
 benchmarks/results/*
 !benchmarks/results/.gitkeep
+
+# a machine's own benchmark pin, e.g. an arm64 laptop's local plugin builds (see
+# benchmarks/envelope.md § "Pinned workload plugin versions")
+benchmarks/chrisomatic/*.local.yml

@@ -80,7 +80,7 @@ Both planes share `chris_api.py` (the Collection+JSON adapter): the data-plane e
 
 ## 5. Workload Plugins
 
-All three are installed by `chrisomatic` in the default dev environment (`chrisomatic/chrisomatic.yml`), so the benchmark needs no extra provisioning.
+`just bench-start` registers all three through `chrisomatic` from the benchmark's own committed pin, `benchmarks/chrisomatic/benchmark.yml`, not from the dev environment's `chrisomatic/chrisomatic.yml`, which is not pinned and takes `pl-topologicalcopy` from the public ChRIS store (now a no-op 2.0.0 under that name).
 
 | **Plugin** | **Type** | **Role** | **Key parameters** |
 |---|---|---|---|
@@ -88,7 +88,7 @@ All three are installed by `chrisomatic` in the default dev environment (`chriso
 | **`pl-simpledsapp`** | `ds` | Downstream: streams input→output (8 MiB chunks) | `--sleepLength`, `--prefix` |
 | **`pl-topologicalcopy`** | `ts` | Fan-in/merge: copies filtered parent output | `--plugininstances`, `--filter`, `--groupByInstance` |
 
-**Versions (pinned).** Runs used `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5, and `pl-topologicalcopy` 1.0.13. The harness resolves each plugin **by name** (`get_plugin` → `plugins/search/?name_exact=`, taking the first match in CUBE's `('meta', '-version')` order) and never pins a version, so **reproducible runs require exactly one version of each installed.** With more than one present it warns at startup and binds to the lexicographically-highest version *string* (`version` is a `CharField`, so `1.0.9` sorts above `1.0.13`), not necessarily the intended one — and `chrisomatic.yml` provisions these images untagged, so verify the installed versions there. Each run records what it resolved (name, version, id, match count) under `workload_plugins` in `environment.json`.
+**Versions (pinned).** Runs use `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5, and `pl-topologicalcopy` 1.0.13, each pinned by the index digest of the image the archived baselines ran: a digest is immutable, while a plugin's `latest` moves with every master commit and a version tag is a separate build. chrisomatic only registers what an image reports, so the harness reads the same pin and verifies it: it resolves each plugin **by name** (`get_plugin` → `plugins/search/?name_exact=`) and refuses to start unless each has **exactly one** registered version — the pinned one, under the pinned `dock_image`, with its image present where Docker can tell. Exactly one, rather than the pinned one among several, because CUBE orders versions as strings (`version` is a `CharField`, so `1.0.9` sorts above `1.0.13`) and itself resolves `pl-topologicalcopy` by name. Each run records the registrations (name, version, id, `dock_image`, match count), each image's id and digests, and the pin's path and sha256 (`workload_plugins`, `workload_plugins_pin` in `environment.json`); `bench-compare` treats another version as a blocker and other image digests as a caution. `envelope.md` § "Pinned workload plugin versions" covers changing a pin, the shared dev/benchmark volumes, and a laptop's own pin.
 
 **Note:** `--sleepLength` produces two workload classes — storage/registration pressure at `0`, scheduling/long-active-job pressure at `>0`.
 
@@ -199,7 +199,7 @@ services:
 
 Every report header pins the envelope and knobs: git commit + dirty status, CUBE/pfcon image ids, envelope limits, poll interval, worker `-c`, pfcon `-w`, `uvicorn` worker count, storage mode, API auth mode, host hardware (§13), and a measured noise floor.
 
-**Note:** `cpus`/`mem_limit` are the portable controls. Block I/O is **measured** per container (reported as peak disk write), but **not capped**: `blkio_config` is platform-sensitive (cgroup v2, real block devices, ignored on Docker Desktop) and stays out of v1 — a real disk cap belongs with the deferred non-`fslink` storage modes, where byte-copy is real.
+**Note:** `cpus`/`mem_limit` are the portable controls. Block I/O is **measured** per container (reported as the bytes each one wrote in the scenario's window), but **not capped**: `blkio_config` is platform-sensitive (cgroup v2, real block devices, ignored on Docker Desktop) and stays out of v1 — a real disk cap belongs with the deferred non-`fslink` storage modes, where byte-copy is real.
 
 ## 9. Metrics & Reporting
 
@@ -215,7 +215,7 @@ end-to-end makespan per feed; **per-phase decomposition** (`created → waiting 
 
 ### 9.3 Resources (USE) and backpressure
 
-CPU/mem, block-I/O deltas and peak pids per container — `chris`, `worker-mains`, `worker-periodic`, `db`, broker, `pfcon`, and plugin-job containers (label `org.chrisproject.miniChRIS=plugininstance`) — sampled every 2 s via the Docker SDK (`docker_client.py` against the mounted socket). The same cadence samples the **Celery queue depths** (`LLEN main1/main2/periodic`, `broker.py`): a sustained rise on `main2` means status checks are produced faster than workers consume them — backpressure shows here before CPU graphs make it obvious. Report peak and mean.
+CPU/mem, block-I/O deltas and peak pids per container — `chris`, `worker-mains`, `worker-periodic`, `db`, the broker, the cache, `pfcon`, and plugin-job containers (label `org.chrisproject.miniChRIS=plugininstance`) — read every 1 s, start to start, via the Docker SDK (`docker_client.py` against the mounted socket): one-shot stats reads, a few milliseconds each and made concurrently, with each container's CPU over the second since its previous reading — the ~1 s window of Docker's own figure, short enough not to average away the 2 s Celery beat's bursts. A plugin job's first reading gives its CPU since it started. The **Celery queue depths** (`LLEN main1/main2/periodic`, `broker.py`) have a timer of their own, every 0.5 s, under the beat's period: a sustained rise on `main2` means status checks are produced faster than workers consume them — backpressure shows here before CPU graphs make it obvious. Report peak and mean, and how the sampling went (ticks, late ticks, failed reads, plugin-job containers seen) in `report.md` and the level rows; `environment.json` records the sampler's settings (`benchmarks/envelope.md` § "Knobs (env vars, with defaults)", "Resource sampling"). Runs without that record read each container in turn with a call that blocks 1–2 s, about every 2 s × the number of containers, so their peaks are lower bounds.
 
 ### 9.4 DB / state deltas and query attribution
 
@@ -274,7 +274,7 @@ benchmarks/
   metrics.py           # RED/USE/makespan rollups + thread-safe sink (pure)
   chris_api.py         # measured Collection+JSON adapter (token auth; the Locust seam)
   executor.py / poller.py                 # DAG instantiation; status polling + ProgressProbe
-  docker_client.py / stats_sampler.py     # Docker SDK access; 2 s resource + queue sampler
+  docker_client.py / stats_sampler.py     # Docker SDK access; 1 s resource + 0.5 s queue sampler
   broker.py / pg_stats.py                 # LLEN queue depths; pg_stat_statements snapshots
   environment.py / recovery.py            # env manifest; logs/reap/health + quiescence
   results.py           # on-disk layout: store (write) + load_run/resolve_run (read)
@@ -306,11 +306,11 @@ chris_backend/config/settings/benchmark.py
 
 ## 13. Test Environment
 
-Authoritative `full`-tier runs are performed on a **dedicated bare-metal Linux box** (no Docker Desktop VM layer, so Compose `cpus`/`mem_limit` are honored directly). The box's full hardware is captured in each report header. Quick `smoke`/`default` tiers may run on a developer laptop and are treated as **directional only** — on Docker Desktop the VM's own CPU/mem/disk limits dominate per-container limits.
+Authoritative `full`-tier runs are performed on a **dedicated bare-metal Linux box** (no Docker Desktop VM layer so Compose `cpus`/`mem_limit` are honored directly). The box's full hardware is captured in each report header. Quick `smoke`/`default` tiers may run on a developer laptop and are treated as **directional only** — on Docker Desktop the VM's own CPU/mem/disk limits dominate per-container limits.
 
 The runner auto-collects what it can and leaves explicit manual placeholders.
 
-- **Automatic (`environment.json`):** host OS, kernel, architecture, logical CPU count, total memory, Docker engine/API versions and data root, CUBE/pfcon/db image ids, git commit + dirty status, storage mode, the full envelope knob set, each service container's applied CPU/memory/swap/`/dev/shm` limits, the Postgres server's settings, API auth mode, the resolved workload-plugin versions, the workload fingerprint, attribution availability (queue sampling, `pg_stat_statements`, Postgres counters), and a measured idle noise floor.
+- **Automatic (`environment.json`):** host OS, kernel, architecture, logical CPU count, total memory, Docker engine/API versions and data root, CUBE/pfcon/db/broker/cache image ids, git commit + dirty status, storage mode, the full envelope knob set, each service container's applied CPU/memory/swap/`/dev/shm` limits, the Postgres server's settings, API auth mode, the workload-plugin registrations, their images and the pin they were checked against, the workload fingerprint, the resource sampler's settings, attribution availability (resource sampling, queue sampling, `pg_stat_statements`, Postgres counters), and a measured idle noise floor.
 - **Manual (in the report):** storage device type/throughput, power/thermal mode, and other significant workloads running during the benchmark.
 
 ## 14. Implementation Phases
@@ -344,7 +344,7 @@ All phases (1–7) are implemented.
 - `chris_backend/plugininstances/enums.py` — plugin-instance status set.
 - `chris_backend/plugininstances/serializers.py:279` — `ts` `plugininstances` parent validation.
 - `docker-compose.yml` — worker `-c`, pfcon `-w`, `runserver`, `fslink`, `JOB_LABELS`.
-- `chrisomatic/chrisomatic.yml` — workload plugin registration.
+- `benchmarks/chrisomatic/benchmark.yml` — the pinned workload plugin registration (`just bench-start`); `chrisomatic/chrisomatic.yml` is the dev environment's.
 
 **Docker Compose resource controls:**
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 from .chris_api import ChrisApi
 from .docker_client import DockerClient
@@ -26,7 +28,7 @@ ENVELOPE_KEYS = (
     "CUBE_CELERY_POLL_INTERVAL", "CUBE_UVICORN_WORKERS", "CUBE_DB_POOL_MIN_SIZE",
     "CUBE_DB_POOL_MAX_SIZE", "CUBE_DB_POOL_TIMEOUT", "CUBE_DB_MAX_CONNECTIONS",
     "CUBE_DB_SYNCHRONOUS_COMMIT", "CUBE_WORKER_MAINS_CONCURRENCY", "PFCON_WORKERS",
-    "STORAGE_ENV", "CUBE_DEBUG",
+    "STORAGE_ENV", "CUBE_DEBUG", "CUBE_CACHE_URL",
 )
 
 #: Postgres settings recorded with every run whatever their source: the server version
@@ -46,6 +48,38 @@ POSTGRES_SETTINGS = (
 )
 
 
+def envelope(env: os._Environ | dict) -> dict:
+    """
+    The envelope knobs as the environment sets them, with any password in a URL masked: the
+    manifests are archived in the repository.
+    """
+    return {k: _without_password(env.get(k)) for k in ENVELOPE_KEYS}
+
+
+def _without_password(value):
+    # RedisCache reads several servers from one LOCATION, split at ; and ,
+    if not value or "://" not in value:
+        return value
+    return "".join(_url_without_password(part) for part in re.split(r"([;,])", value))
+
+
+def _url_without_password(value):
+    parts = urlsplit(value) if "://" in value else None
+    if parts is None:
+        return value
+
+    netloc = parts.netloc
+    if parts.password is not None:
+        netloc = netloc.replace(f":{parts.password}@", ":***@", 1)
+
+    # redis-py also takes the password, and the TLS key's, from the query string
+    query = re.sub(r"(^|&)((?:ssl_)?password)=[^&]*", r"\1\2=***", parts.query)
+
+    if (netloc, query) == (parts.netloc, parts.query):
+        return value
+    return urlunsplit(parts._replace(netloc=netloc, query=query))
+
+
 def postgres_settings(docker: DockerClient) -> dict:
     """
     The Postgres server's effective settings (see ``pg_stats.server_settings``).
@@ -54,8 +88,9 @@ def postgres_settings(docker: DockerClient) -> dict:
 
 
 def collect_environment(docker: DockerClient, *, env: os._Environ | dict | None = None,
-                        image_services: tuple[str, ...] = ("chris", "pfcon",
-                                                           "db")) -> dict:
+                        image_services: tuple[str, ...] = ("chris", "pfcon", "db",
+                                                           "chris-broker",
+                                                           "chris-cache")) -> dict:
     env = os.environ if env is None else env
     info = docker.info()
     version = docker.version()
@@ -87,7 +122,7 @@ def collect_environment(docker: DockerClient, *, env: os._Environ | dict | None 
         "images": images,
         "git": {"commit": env.get("GIT_COMMIT"), "dirty": env.get("GIT_DIRTY")},
         "storage_mode": env.get("STORAGE_ENV", "fslink"),
-        "envelope": {k: env.get(k) for k in ENVELOPE_KEYS},
+        "envelope": envelope(env),
         # the CPU/memory knobs as the engine applied them, not as the env vars asked
         "limits": docker.service_limits(),
         "postgres": postgres_settings(docker),

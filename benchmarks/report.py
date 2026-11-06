@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import fields
 from pathlib import Path
 from typing import Iterable
+
+from .models import SamplerSummary, describe_sampler
 
 
 def render(summary: dict, levels: list[dict]) -> str:
@@ -92,6 +95,42 @@ def _approach_curves(levels: list[dict]) -> list[str]:
         out += _peak_cpu_note(rows)
         out += _peak_io_note(rows)
         out += _db_counters_note(rows)
+        out += _sampler_note(rows)
+    return out
+
+
+_SAMPLER_TROUBLE = tuple(f.name for f in fields(SamplerSummary) if f.metadata.get("trouble"))
+
+
+def _sampler_note(rows: list[dict]) -> list[str]:
+    """
+    How the resources and queues were sampled at the highest level reached, and a warning
+    naming every level whose sampling fell behind or failed: the peaks above are only as
+    good as the readings behind them.
+    """
+    last = (rows[-1] if rows else {}).get("sampler") or {}
+
+    if not last:
+        return []
+
+    instances = sum(((rows[-1].get("final_status_counts") or {}).values()))
+    busy = (f", {last['busy_skips']} readings missed behind a read still running"
+            if last.get("busy_skips") else "")
+    queues = (f"; queues every {last['queue_interval_s']} s, {last.get('queue_ticks')} "
+              f"ticks" if last.get("queue_interval_s") else "; queues not sampled")
+    out = [f"_Sampling at level {rows[-1].get('level')}: every {last.get('interval_s')} s, "
+           f"{last.get('ticks')} ticks ({last.get('late_ticks')} skipped, slowest "
+           f"{last.get('max_tick_s')} s), {last.get('reads')} reads "
+           f"({last.get('failed_reads')} failed{busy}); {last.get('jobs_seen')} plugin-job "
+           f"containers seen for {instances} instances{queues}_", ""]
+
+    behind = [str(r.get("level")) for r in rows
+              if any((r.get("sampler") or {}).get(key) for key in _SAMPLER_TROUBLE)]
+    if behind:
+        out += [f"**Sampling fell behind or failed at level(s) {', '.join(behind)}** "
+                f"(skipped ticks, failed reads or listings, readings missed behind a "
+                f"hung read, or failed queue reads in "
+                f"`levels.jsonl`): their peaks may miss readings.", ""]
     return out
 
 
@@ -203,6 +242,25 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f} TiB"
 
 
+def record_digests(record: dict | None) -> list[str]:
+    """
+    The digests of an image record (``docker_client.image_record``), their ``sha256:…``
+    parts only and sorted: on overlay2 a RepoDigest can carry another repository's name for
+    the same image.
+    """
+    return sorted({d.rpartition("@")[2] for d in (record or {}).get("repo_digests") or []})
+
+
+def _short_digests(image: dict | None) -> str | None:
+    """
+    An image record's digests, shortened (``None`` for an unrecorded image, so the table
+    shows an em dash; "none" for an image without any, a local build on overlay2).
+    """
+    if not image:
+        return None
+    return ", ".join(d[:19] for d in record_digests(image)) or "none"
+
+
 def _environment_section(env: dict) -> list[str]:
     host = env.get("host", {})
     envelope = env.get("envelope", {})
@@ -220,6 +278,8 @@ def _environment_section(env: dict) -> list[str]:
         ["API auth", _auth_cell(env.get("api_auth_mode"))],
         ["Noise floor (health p50/p95 ms)",
          f"{(noise or {}).get('health_p50_ms')} / {(noise or {}).get('health_p95_ms')}"],
+        *([["Resource sampler", _sampler_cell(env["sampler"])]] if env.get("sampler")
+          else []),
     ])
 
     out.append("")
@@ -233,9 +293,13 @@ def _environment_section(env: dict) -> list[str]:
         out.append("")
         out += ["### Workload plugins", ""]
         out += markdown_table(
-            ["Role", "Plugin", "Version", "Installed versions"],
-            [[role, p.get("name"), p.get("version"), p.get("matches")]
+            ["Role", "Plugin", "Version", "Image", "Digest", "Installed versions"],
+            [[role, p.get("name"), p.get("version"), p.get("dock_image"),
+              _short_digests(p.get("image")), p.get("matches")]
              for role, p in plugins.items()])
+        pin = env.get("workload_plugins_pin")
+        out += ["", f"Pinned by `{pin['path']}` (sha256 {pin['sha256'][:12]})." if pin
+                else "Not pinned: resolved by name."]
 
     out.append("")
     out += ["### Manual fields (fill in)", ""]
@@ -245,6 +309,10 @@ def _environment_section(env: dict) -> list[str]:
 
     out.append("")
     return out
+
+
+def _sampler_cell(sampler: dict) -> str:
+    return describe_sampler(sampler)
 
 
 def _limits_section(limits: dict) -> list[str]:

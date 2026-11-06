@@ -146,13 +146,70 @@ def test_unrecorded_limits_give_a_single_caution():
     assert fields == ["limits"]  # nosec B101 - pytest assertion
 
 
-def test_db_image_difference_is_informational():
-    c = check_comparability(_env(images={"db": {"image_id": "sha256:a"}}),
-                            _env(images={"db": {"image_id": "sha256:b"}}))
+def test_db_broker_and_cache_image_differences_are_informational():
+    for service in ("db", "chris-broker", "chris-cache"):
+        c = check_comparability(_env(images={service: {"image_id": "sha256:a"}}),
+                                _env(images={service: {"image_id": "sha256:b"}}))
+
+        assert c.status == "comparable"  # nosec B101 - pytest assertion
+        severities = [d.severity for d in c.diffs if d.field == f"images.{service}"]
+        assert severities == ["info"]  # nosec B101 - pytest assertion
+
+
+def test_broker_image_missing_from_an_older_run_is_informational():
+    c = check_comparability(_env(), _env(images={"chris-broker": {"image_id": "sha256:b"}}))
+
+    diffs = [(d.field, d.severity) for d in c.diffs]
 
     assert c.status == "comparable"  # nosec B101 - pytest assertion
-    severities = [d.severity for d in c.diffs if d.field == "images.db"]
-    assert severities == ["info"]  # nosec B101 - pytest assertion
+    assert diffs == [("images.chris-broker", "info")]  # nosec B101 - pytest assertion
+
+
+def test_a_run_from_before_the_rename_compares_under_the_current_names():
+    # runs archived before the rename recorded the broker's limits under dragonflydb
+    limits = {"cpus": 2.0, "mem_limit": 1073741824, "memswap_limit": None, "shm_size": None}
+    old = _env(limits={"dragonflydb": limits, "db": limits})
+    new = _env(limits={"chris-broker": {**limits, "cpus": 1.0}, "db": limits})
+    diffs = {d.field: (d.baseline, d.candidate, d.severity)
+             for d in check_comparability(old, new).diffs}
+    expected = {"limits.chris-broker.cpus": (2.0, 1.0, "warning")}
+
+    assert diffs == expected  # nosec B101 - pytest assertion
+
+    # in either order: a run made later from an older checkout records the old name too
+    mirrored = {d.field: (d.candidate, d.baseline, d.severity)
+                for d in check_comparability(new, old).diffs}
+    assert mirrored == expected  # nosec B101 - pytest assertion
+
+
+def test_a_later_run_that_records_an_old_name_shows_it():
+    # a container left over from before the rename ran beside the renamed one
+    limits = {"cpus": 2.0, "mem_limit": 1073741824}
+    new = _env(limits={"chris-broker": limits})
+    leftover = _env(limits={"chris-broker": limits, "dragonflydb": limits})
+    fields = sorted(d.field for d in check_comparability(new, leftover).diffs)
+
+    assert fields == ["limits.dragonflydb.cpus",  # nosec B101 - pytest assertion
+                      "limits.dragonflydb.mem_limit"]
+
+
+SAMPLER = {"method": "one-shot reads, CPU between consecutive readings", "interval_s": 1.0,
+           "queue_interval_s": 0.5, "workers": 8}
+
+
+def test_runs_sampled_differently_are_a_caution():
+    # an archived run records no sampler: one caution, as for any block it lacks
+    rows = [(d.field, d.baseline, d.candidate, d.severity)
+            for d in check_comparability(_env(), _env(sampler=SAMPLER)).diffs]
+    assert rows == [  # nosec B101 - pytest assertion
+        ("sampler", "not recorded", "recorded", "warning")]
+
+    slower = _env(sampler={**SAMPLER, "interval_s": 2.0})
+    rows = [(d.field, d.baseline, d.candidate, d.severity)
+            for d in check_comparability(_env(sampler=SAMPLER), slower).diffs]
+    assert rows == [("sampler.interval_s", 1.0, 2.0, "warning")]  # nosec B101 - pytest assertion
+    assert not check_comparability(  # nosec B101 - pytest assertion
+        _env(sampler=SAMPLER), _env(sampler=SAMPLER)).diffs
 
 
 # -- delta classification ------------------------------------------------------------------
@@ -321,6 +378,18 @@ def test_trend_tables_follow_a_dotted_metric_into_nested_values():
     assert rows[0] == [8, 300, 200, 100]  # nosec B101 - pytest assertion
 
 
+def test_trend_tables_find_a_renamed_service_under_its_old_name_in_older_runs_only():
+    later = _env(images={"chris-broker": {"image_id": "sha256:a"}})
+    runs = [_run("A", [dict(_lvl(level=8), peak_cpu_pct={"dragonflydb": 7.5})]),
+            # a zero peak, and those of a container left over from before the rename
+            _run("B", [dict(_lvl(level=8), peak_cpu_pct={"chris-broker": 0.0,
+                                                         "dragonflydb": 9.9})], env=later),
+            _run("C", [dict(_lvl(level=8), peak_cpu_pct={"dragonflydb": 9.9})], env=later)]
+    (_, _, rows), = trend_tables(runs, "peak_cpu_pct.chris-broker")
+
+    assert rows[0] == [8, 7.5, 0.0, None]  # nosec B101 - pytest assertion
+
+
 # -- CLI ---------------------------------------------------------------------------------
 
 def _write_run(root, run_id, levels, breaking_points=(), env=None):
@@ -393,6 +462,66 @@ def test_trend_tables_reach_per_process_type_counters_and_tolerate_scalars():
     assert rows[0] == [1, None, None]  # nosec B101 - pytest assertion
 
 
+def test_a_trend_of_a_sampled_metric_says_how_each_run_was_sampled(tmp_path):
+    old = _write_run(tmp_path, "A", [dict(_lvl(), peak_cpu_pct={"db": 50.0})])
+    new = _write_run(tmp_path, "B", [dict(_lvl(), peak_cpu_pct={"db": 90.0})],
+                     env=_env(sampler=SAMPLER))
+    out = tmp_path / "cmp"
+
+    assert main([str(old), str(new), "--out", str(out),  # nosec B101 - pytest assertion
+                 "--metric", "peak_cpu_pct.db"]) == 0
+    note = ("_The runs were sampled differently — A: not recorded (the sparse sampler: "
+            "lower bounds); B: one-shot reads, CPU between consecutive readings: every "
+            "1.0 s, queues every 0.5 s, 8 workers._")
+    assert note in (out / "compare.md").read_text()  # nosec B101 - pytest assertion
+
+    # a metric the sampler does not produce gets no note
+    assert main([str(old), str(new), "--out", str(out),  # nosec B101 - pytest assertion
+                 "--metric", "makespan_median_s"]) == 0
+    md = (out / "compare.md").read_text()
+    assert "sampled differently" not in md  # nosec B101 - pytest assertion
+
+
+def _trend_note(tmp_path, envs, metric, row):
+    paths = [_write_run(tmp_path, f"R{i}", [dict(_lvl(), **row)], env=env)
+             for i, env in enumerate(envs)]
+    out = tmp_path / "cmp"
+    main([str(p) for p in paths] + ["--out", str(out), "--metric", metric])
+    return [line for line in (out / "compare.md").read_text().splitlines()
+            if "sampled differently" in line]
+
+
+def test_a_trend_says_so_whatever_part_of_the_sampler_differs(tmp_path):
+    queues = _env(sampler={**SAMPLER, "queue_interval_s": 2.0})
+    workers = _env(sampler={**SAMPLER, "workers": 4})
+    rows = {"peak_queue_depth.main2": {"peak_queue_depth": {"main2": 5}},
+            "peak_mem_bytes.db": {"peak_mem_bytes": {"db": 100}},
+            "peak_job_cpu_pct": {"peak_job_cpu_pct": 50.0}}
+
+    for metric, row in rows.items():
+        for other in (queues, workers):
+            note = _trend_note(tmp_path / metric / str(id(other)),
+                               [_env(sampler=SAMPLER), other], metric, row)
+            assert len(note) == 1, (metric, other["sampler"])  # nosec B101 - pytest assertion
+
+    # runs sampled alike get no note
+    alike = _trend_note(tmp_path / "alike", [_env(sampler=SAMPLER)] * 2,
+                        "peak_queue_depth.main2", rows["peak_queue_depth.main2"])
+    assert alike == []  # nosec B101 - pytest assertion
+
+
+def test_main_finds_a_renamed_services_metric_in_older_runs(tmp_path):
+    paths = [_write_run(tmp_path, rid, [dict(_lvl(), peak_cpu_pct={"dragonflydb": cpu})])
+             for rid, cpu in (("A", 7.5), ("B", 5.2))]
+    out = tmp_path / "cmp"
+
+    assert main([str(p) for p in paths]  # nosec B101 - pytest assertion
+                + ["--out", str(out), "--metric", "peak_cpu_pct.chris-broker"]) == 0
+    md = (out / "compare.md").read_text()
+    assert "| 1 | 7.5 | 5.2 |" in md  # nosec B101 - pytest assertion
+    assert "not found" not in md  # nosec B101 - pytest assertion
+
+
 def test_main_renders_a_two_run_trend_for_an_explicit_metric(tmp_path):
     paths = [_write_run(tmp_path, rid, [dict(_lvl(), peak_write_bytes={"db": written})])
              for rid, written in (("A", 300), ("B", 200))]
@@ -458,3 +587,108 @@ def test_render_markdown_echoes_policy_thresholds():
     md = render_markdown(compare_runs(_run("A", [_lvl()]), _run("B", [_lvl()]),
                                       DeltaPolicy(regress_pct=60.0)))
     assert "Flag thresholds" in md and "60%" in md
+
+
+# -- workload plugins --------------------------------------------------------------------
+
+DIGEST_REF = "fnndsc/pl-topologicalcopy@sha256:35cb"
+REFERENCE, DIGESTS = "workload_plugins.ts.dock_image", "workload_plugins.ts.digests"
+
+
+def _plugins(version="1.0.13", dock_image=DIGEST_REF, digests=(DIGEST_REF,),
+             name="pl-topologicalcopy"):
+    image = (None if digests is None
+             else {"image_id": "sha256:3329", "repo_digests": list(digests),
+                   "architecture": "amd64"})
+    return {"ts": {"name": name, "version": version, "id": 3,
+                   "dock_image": dock_image, "matches": 1, "image": image}}
+
+
+def _severities(base, cand, **cand_env):
+    c = check_comparability(_env(workload_plugins=base),
+                            _env(workload_plugins=cand, **cand_env))
+    return c.status, {d.field: d.severity for d in c.diffs}
+
+
+def test_identical_workload_plugins_are_comparable():
+    status, severities = _severities(_plugins(), _plugins())
+
+    assert (status, severities) == ("comparable", {})  # nosec B101 - pytest assertion
+
+
+def test_another_workload_plugin_name_or_version_is_a_blocker():
+    for other, field in ((_plugins(version="2.0.0"), "workload_plugins.ts.version"),
+                         (_plugins(name="pl-other"), "workload_plugins.ts.name")):
+        status, severities = _severities(_plugins(), other)
+
+        assert status == "not_comparable"  # nosec B101 - pytest assertion
+        assert severities == {field: "blocker"}  # nosec B101 - pytest assertion
+
+
+def test_another_reference_to_the_same_image_is_information():
+    # on overlay2 a RepoDigest can carry another repository's name for the same image
+    other = _plugins(dock_image="localhost/pl-topologicalcopy",
+                     digests=("localhost/pl-topologicalcopy@sha256:35cb",))
+    status, severities = _severities(_plugins(), other)
+
+    assert status == "comparable"  # nosec B101 - pytest assertion
+    assert severities == {REFERENCE: "info"}  # nosec B101 - pytest assertion
+
+
+def test_other_image_digests_or_a_local_build_are_a_caution():
+    for digests in (("fnndsc/pl-topologicalcopy@sha256:2e1b",), ()):
+        status, severities = _severities(_plugins(), _plugins(digests=digests))
+
+        assert status == "caution"  # nosec B101 - pytest assertion
+        assert severities == {DIGESTS: "warning"}  # nosec B101 - pytest assertion
+
+
+def test_two_references_to_other_digests_are_a_caution_without_image_records():
+    # neither run could read Docker, but two digests name two images
+    other = _plugins(dock_image="fnndsc/pl-topologicalcopy@sha256:2e1b", digests=None)
+    status, severities = _severities(_plugins(digests=None), other)
+
+    assert status == "caution"  # nosec B101 - pytest assertion
+    assert severities == {REFERENCE: "warning"}  # nosec B101 - pytest assertion
+
+
+def test_images_recorded_for_some_roles_only_are_a_caution():
+    base = {**_plugins(), "fs": {**_plugins()["ts"], "name": "dbg-bigfiles"}}
+    cand = {**base, "fs": {**base["fs"], "image": None}}
+    status, severities = _severities(base, cand)
+
+    assert status == "caution"  # nosec B101 - pytest assertion
+    assert severities == {"workload_plugins.fs.digests": "warning"}  # nosec B101 - pytest assertion
+
+
+def test_another_pin_with_the_same_plugins_is_information():
+    pin = {"path": "benchmarks/chrisomatic/benchmark.yml", "sha256": "ab12"}
+    other = {"path": "benchmarks/chrisomatic/laptop.local.yml", "sha256": "cd34"}
+    c = check_comparability(_env(workload_plugins=_plugins(), workload_plugins_pin=pin),
+                            _env(workload_plugins=_plugins(), workload_plugins_pin=other))
+    severities = {d.field: d.severity for d in c.diffs}
+    expected = {"workload_plugins_pin.path": "info", "workload_plugins_pin.sha256": "info"}
+
+    assert c.status == "comparable"  # nosec B101 - pytest assertion
+    assert severities == expected  # nosec B101 - pytest assertion
+
+
+def test_a_baseline_without_image_records_gives_a_single_caution():
+    # a baseline from before the pin: an untagged reference, no image record and no pin
+    baseline = _plugins(dock_image="fnndsc/pl-topologicalcopy", digests=None)
+    del baseline["ts"]["image"]
+    pin = {"path": "benchmarks/chrisomatic/benchmark.yml", "sha256": "ab12"}
+    status, severities = _severities(baseline, _plugins(), workload_plugins_pin=pin)
+    expected = {"workload_plugins.ts.dock_image": "info", "workload_plugins.image": "warning",
+                "workload_plugins_pin.path": "info", "workload_plugins_pin.sha256": "info"}
+
+    assert status == "caution"  # nosec B101 - pytest assertion
+    assert severities == expected  # nosec B101 - pytest assertion
+
+
+def test_a_run_before_workload_plugins_were_recorded_gives_a_single_caution():
+    c = check_comparability(_env(), _env(workload_plugins=_plugins()))
+    diffs = [(d.field, d.baseline, d.candidate) for d in c.diffs]
+    expected = [("workload_plugins", "not recorded", "recorded")]
+
+    assert diffs == expected  # nosec B101 - pytest assertion

@@ -5,10 +5,12 @@ Results persistence — the single source of truth for the on-disk layout.
       environment.json
       summary.json
       report.md
+      levels.jsonl, levels.csv
       api_requests.jsonl
       docker_stats.jsonl
+      queue_depths.jsonl
       status_samples.jsonl
-      scenarios/<scenario_id>/scenario.json
+      scenarios/<scenario_id>/{scenario.json, pg_stats.json}
       scenarios/<scenario_id>/{failure.json, logs/}   # on the level's failing repeat only
 
 Both the runner (writes) and ``report``/``compare`` (reads) go through this module so

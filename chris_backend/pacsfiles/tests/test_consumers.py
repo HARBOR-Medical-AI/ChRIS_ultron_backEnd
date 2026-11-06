@@ -181,7 +181,7 @@ class PACSFileProgressTests(TransactionTestCase):
     def _get_download_token(self) -> FileDownloadToken:
         """
         Copy-pasted from
-        https://github.com/FNNDSC/ChRIS_ultron_backEnd/blob/7bcccc2031386955875ef4e9758025577f5ee067/chris_backend/userfiles/tests/test_views.py#L210-L213
+        https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/blob/7bcccc2031386955875ef4e9758025577f5ee067/chris_backend/userfiles/tests/test_views.py#L210-L213
         """
         dt = timezone.now() + timezone.timedelta(minutes=10)
         token = jwt.encode(

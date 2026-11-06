@@ -1,5 +1,5 @@
 # Benchmark override for docker-compose.yml. Layered on top of the base dev stack by the
-# `just bench-*` recipes (never used by normal `just`). It does two things:
+# `just bench-*` recipes (never used by normal `just`). It does three things:
 #   1. swaps CUBE from the dev `runserver` to a production-like uvicorn with N workers,
 #      Django `DEBUG` off as in production (`CUBE_DEBUG=false`, on `chris` and the Celery
 #      services), a larger DB pool, and a higher Postgres max_connections — a pinned,
@@ -7,12 +7,16 @@
 #      the dev stack's postgres/cube.conf; this file only adds max_connections and
 #      synchronous_commit to its command line;
 #   2. adds a `benchmark` service (profile `bench`) that runs the harness as an external
-#      API client, with the Docker socket mounted for stats/logs/reaping.
+#      API client, with the Docker socket mounted for stats/logs/reaping;
+#   3. shows chrisomatic the benchmark's own files in benchmarks/chrisomatic/, the pinned
+#      workload plugins `just bench-start` registers (which file is that recipe's argument,
+#      not an env var; see envelope.md § "Pinned workload plugin versions").
 #
 # Tunable via the env vars below. The envelope knobs are recorded in each run's environment
 # manifest (the CPU and memory limits as the containers got them); the harness settings
 # (BENCH_*, credentials, CUBE_DB_POOL_STATS_INTERVAL) are not. See benchmarks/envelope.md.
-# Set them identically for `just bench-start` and `just bench-run`.
+# Set them identically for `just bench-start` and `just bench-run`; 0 removes a CPU or memory
+# limit (a Dragonfly's CPUs only together with enough memory, see below).
 
 services:
 
@@ -27,6 +31,7 @@ services:
       CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
       CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
       CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
       # one db_pool_stats log line per uvicorn worker every N seconds (0 disables)
       CUBE_DB_POOL_STATS_INTERVAL: "${CUBE_DB_POOL_STATS_INTERVAL:-5}"
 
@@ -41,8 +46,11 @@ services:
       CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
       CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
       CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
 
   worker-periodic:
+    cpus: ${CUBE_WORKER_PERIODIC_CPUS:-1}
+    mem_limit: ${CUBE_WORKER_PERIODIC_MEM_LIMIT:-1g}
     environment:
       DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
       CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
@@ -50,8 +58,11 @@ services:
       CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
       CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
       CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
 
   celery-scheduler:
+    cpus: ${CUBE_SCHEDULER_CPUS:-0.5}
+    mem_limit: ${CUBE_SCHEDULER_MEM_LIMIT:-512m}
     environment:
       DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
       CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
@@ -59,6 +70,7 @@ services:
       CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
       CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
       CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
 
   db:
     # docker-compose.yml's command line (postgres/cube.conf) plus the envelope's
@@ -71,10 +83,30 @@ services:
     cpus: ${CUBE_DB_CPUS:-2}
     mem_limit: ${CUBE_DB_MEM_LIMIT:-4g}
 
+  # The broker and the cache are Dragonflies which run one thread per CPU they are given
+  # and keep 80% of their memory limit as their maxmemory; without limits both follow the
+  # host. Dragonfly exits when that maxmemory is under 256 MiB per thread, so give each at
+  # least 320 MiB of memory per CPU (with 0 CPUs, per host CPU): 2 CPUs with 512m stop it
+  # and so do 0 CPUs with the default memory. Redis and Valkey take neither from the
+  # limits: they need --maxmemory below mem_limit or the kernel kills them when full.
+  chris-broker:
+    cpus: ${CUBE_BROKER_CPUS:-2}
+    mem_limit: ${CUBE_BROKER_MEM_LIMIT:-1g}
+
+  chris-cache:
+    cpus: ${CUBE_CACHE_CPUS:-1}
+    mem_limit: ${CUBE_CACHE_MEM_LIMIT:-512m}
+
   pfcon:
     command: gunicorn -b 0.0.0.0:30005 -w ${PFCON_WORKERS:-8} -t 120 pfcon.wsgi:application
     cpus: ${PFCON_CPUS:-2}
     mem_limit: ${PFCON_MEM_LIMIT:-2g}
+
+  chrisomatic:
+    volumes:
+      # beside the dev stack's read-only /etc/chrisomatic rather than inside it, where the
+      # mountpoint cannot be created
+      - "./benchmarks/chrisomatic:/etc/chrisomatic-benchmark:ro"
 
   benchmark:
     image: ${BENCH_IMAGE:-localhost/fnndsc/cube-benchmark:dev}
@@ -86,7 +118,7 @@ services:
       CUBE_URL: "http://chris:8000/api/v1/"
       CUBE_USERNAME: "${CUBE_USERNAME:-chris}"
       CUBE_PASSWORD: "${CUBE_PASSWORD:-chris1234}"
-      BENCH_BROKER: "dragonflydb:6379"
+      BENCH_BROKER: "chris-broker:6379"
       COMPOSE_PROJECT_NAME: "${COMPOSE_PROJECT_NAME:-}"
       BENCH_RESULTS_DIR: "/app/benchmarks/results"
       GIT_COMMIT: "${GIT_COMMIT:-}"
@@ -105,6 +137,7 @@ services:
       CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
       CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
       CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
       CUBE_DB_MAX_CONNECTIONS: "${CUBE_DB_MAX_CONNECTIONS:-300}"
       CUBE_DB_SYNCHRONOUS_COMMIT: "${CUBE_DB_SYNCHRONOUS_COMMIT:-on}"
       CUBE_WORKER_MAINS_CONCURRENCY: "${CUBE_WORKER_MAINS_CONCURRENCY:-4}"

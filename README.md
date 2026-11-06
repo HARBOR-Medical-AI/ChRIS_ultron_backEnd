@@ -1,7 +1,7 @@
 # ![ChRIS logo](./docs/assets/logo_chris.png) ChRIS\_ultron\_backEnd
 
-[![Build](https://github.com/FNNDSC/ChRIS_ultron_backEnd/actions/workflows/ci.yml/badge.svg)](https://github.com/FNNDSC/ChRIS_ultron_backEnd/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/fnndsc/ChRIS_ultron_backEnd.svg)](./LICENSE)
+[![Build](https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/actions/workflows/ci.yml/badge.svg)](https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/HARBOR-Medical-AI/ChRIS_ultron_backEnd.svg)](./LICENSE)
 
 _ChRIS_ is an open-source platform for containerized medical compute.
 
@@ -12,7 +12,7 @@ https://chrisproject.org/
 With [Docker Compose](https://docs.docker.com/compose/) and [just](https://just.systems/) installed, run
 
 ```shell
-git clone https://github.com/FNNDSC/ChRIS_ultron_backEnd.git
+git clone https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd.git
 cd ChRIS_ultron_backEnd
 just
 ```
@@ -74,7 +74,7 @@ just prefer podman  # or
 just prefer docker
 ```
 
-With Podman, DragonflyDB might fail to start. Simply retry the command. See https://github.com/FNNDSC/ChRIS_ultron_backEnd/issues/573
+With Podman, DragonflyDB might fail to start. Simply retry the command. See https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/573
 
 On Ubuntu 26.04, `just down` or `just nuke` can fail with "rootless netns: kill network process: permission denied": the AppArmor profile for `pasta` does not let it receive a signal from Podman ([Debian bug 1100135](https://bugs.debian.org/1100135)). Add the missing rule (running this again changes nothing):
 
@@ -173,6 +173,31 @@ These run uv in a throwaway container, so no local uv installation is required. 
 benchmark harness has its own `benchmarks/pyproject.toml` and `benchmarks/uv.lock`,
 because `docker-compose.benchmark.yml` builds it with `context: ./benchmarks`.
 
+#### Check for Codacy issues before pushing
+
+[Codacy](https://app.codacy.com/gh/HARBOR-Medical-AI/ChRIS_ultron_backEnd/dashboard) fails a
+pull request on any issue its merge-base (`git merge-base HEAD origin/master`) does not have.
+`just lint` runs the same Python checks in the dev image (Bandit, pyflakes, dodgy and Pylint
+with Codacy's rules, and `uv audit` for the lockfiles) on the files changed since the merge-base
+with `origin/master` and lists only the new issues:
+
+```shell
+just lint                 # new issues on this branch, uncommitted changes included
+just lint --all           # every issue in the changed files
+just lint-fix             # let Ruff fix new unused imports and f-strings without placeholders
+just lint-fix --unsafe    # ... and unused variables
+just lint-test            # the tests of scripts/lint.py
+```
+
+An image built before these tools were added says so and needs `just build` first. `just lint`
+finds nearly all of Codacy's issues but not those of Opengrep (unpinned GitHub
+Actions, a Dockerfile without `USER`), ESLint, ShellCheck, Hadolint, markdownlint, PMD,
+Agentlinter (which reads `CLAUDE.md`), Jackson Linter or Lizard. An advisory of a changed
+lockfile that the merge-base has too is listed with a `?`: Codacy compares with its stored
+analysis of master, which can predate the advisory, so it may still call it new; upgrading the
+package clears it. Silence a false positive as the code does, e.g.
+`# nosec B105 - a label, not a password`.
+
 #### Trying HTTP requests from the CLI
 
 For CLI tools, I recommend [xh](https://github.com/ducaale/xh) and [jnv](https://github.com/ynqa/jnv) or [jq](https://jqlang.github.io/jq/). Example:
@@ -247,7 +272,7 @@ And you are ready to run your LSP + text editor.
 Generally, its introspection is capable and accurate, but some special care is necessary to make
 everything work. See:
 
-- https://github.com/FNNDSC/ChRIS_ultron_backEnd/pull/584
+- https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/pull/584
 - https://github.com/tfranzel/drf-spectacular/issues/1303#issuecomment-2387220962
 - https://drf-spectacular.readthedocs.io/en/latest/faq.html#my-get-queryset-depends-on-some-attributes-not-available-at-schema-generation-time
 
@@ -261,6 +286,45 @@ just openapi-split > /dev/null
 ## Production Deployment
 
 See https://chrisproject.org/docs/run/helm
+
+### Shared cache: `CACHE_URL` is optional for now
+
+CUBE's shared cache (`core/cache.py`) runs on a Redis-protocol server of its own, whose URL the
+API server, the Celery workers and beat all read from `CACHE_URL`. Nothing uses the cache yet,
+so a deployment can leave `CACHE_URL` unset or empty: nothing is cached, no process connects to
+a cache server, and the helpers would go ahead without their locks, markers and bounded
+counters, logging one warning per process the first time something calls them. It will become
+required with the first feature that uses the cache, so a deployment whose stack has no such
+server, e.g. one with RabbitMQ as the Celery broker, should plan to add one.
+
+When `CACHE_URL` is set, the server needs to be:
+
+- **Its own server.** Not the Celery broker's, whatever the database: one server has one
+  memory limit and one eviction policy, so a full cache would refuse the broker's writes and
+  evicting would drop its queues. CUBE refuses to start on a URL with the broker's host and
+  port; it compares them as written, so an IP address or an alias for the same server gets
+  past this check.
+- **Evicting and keeping nothing.** Anything in it may vanish. Dragonfly with
+  `--cache_mode=true --dbfilename=` (as `chris-cache` in `docker-compose.yml`), or Redis 7+ or
+  Valkey 8 with a `--maxmemory`, an `allkeys-*` eviction policy and no persistence
+  (`--save '' --appendonly no`).
+- **The URL.** `redis://[[user]:password@]host:6379/<db>`, `rediss://` for TLS, or
+  `unix:///path/to.sock?db=<db>`, with a logical database. TLS options and socket timeouts
+  (above 0, at most 5 s; 0.5 s by default) can go in its query string, retry options cannot.
+  Percent-encode a `/`, `#`, `?` or `@` in the credentials.
+- **Its permissions.** A user the server's ACL limits needs the commands the helpers send
+  (`PING`, `SET`, `DEL`, `ZREM`, `SCRIPT LOAD`, `SCRIPT EXISTS` and `EVALSHA`, and `SELECT` when
+  the database is not 0) and those their scripts run (`GET`, `DEL`, `TIME`, `PEXPIREAT` and the
+  sorted-set commands), on the keys under CUBE's prefix (`cube:*`).
+
+At start-up CUBE checks the server and refuses to start on a wrong configuration: another
+cache backend, the broker's host and port, a URL it cannot parse or use or without a database,
+retries or a timeout out of bounds, a refused password, or a server that refuses its scripts. A
+server that does not answer, or a full Dragonfly, only gets a warning: CUBE starts without it,
+and the helpers go ahead without their locks, markers and bounded counters until it answers.
+Most TLS mistakes are in that case (a refused certificate, or `redis://` against `rediss://`), so
+read that warning if the server should be up; a TLS-only Dragonfly answers a plain-text URL's
+password with an error, which is refused.
 
 ## GitHub Actions
 
@@ -280,7 +344,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Run ChRIS backend integration tests
-        uses: FNNDSC/ChRIS_ultron_backEnd@master
+        uses: HARBOR-Medical-AI/ChRIS_ultron_backEnd@master
         # all inputs are optional
         with:
           engine: docker  # or podman
@@ -312,7 +376,7 @@ See [`benchmarks/README.md`](./benchmarks/README.md) for usage and [`benchmarks/
 
 #### REST API reference
 
-Available [here](https://fnndsc.github.io/ChRIS_ultron_backEnd).
+Available [here](https://harbor-medical-ai.github.io/ChRIS_ultron_backEnd/).
 
 Install Sphinx and the http extension (useful to document the REST API)
 ```
@@ -328,8 +392,8 @@ make html
 
 #### ChRIS REST API design.
 
-Available [here](https://github.com/FNNDSC/ChRIS_ultron_backEnd/wiki/ChRIS-REST-API-design).
+Available [here](https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/wiki/ChRIS-REST-API-design).
 
 #### ChRIS backend database design.
 
-Available [here](https://github.com/FNNDSC/ChRIS_ultron_backEnd/wiki/ChRIS-backend-database-design).
+Available [here](https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/wiki/ChRIS-backend-database-design).

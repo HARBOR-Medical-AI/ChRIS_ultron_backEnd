@@ -1,0 +1,43 @@
+# The benchmark's workload plugins, pinned to the images the archived baselines ran.
+# `just bench-start` registers this file instead of chrisomatic/chrisomatic.yml, and the
+# harness refuses to run unless CUBE holds exactly these registrations (see
+# benchmarks/envelope.md § "Pinned workload plugin versions").
+version: 1.2
+
+on:
+  cube_url: http://chrisdev.local:8000/api/v1/
+  # empty: never consult the ChRIS store
+  public_store:
+  chris_superuser:
+    username: chris
+    password: chris1234
+
+cube:
+  compute_resource:
+    - name: host
+      url: "http://pfcon.remote:30005/api/v1/"
+      username: pfcon
+      password: pfcon1234
+      description: host Description
+
+  # chrisomatic 1.0.0 cannot pull a digest reference (`just bench-start` pulls these first)
+  # and infers a wrong name and repository from one, hence name and public_repo. version is
+  # only what it searches CUBE for: CUBE records the version the image reports.
+  plugins:
+    # 1.0.0, the same image as the 1.0.0 and latest tags; multi-arch
+    - name: dbg-bigfiles
+      version: 1.0.0
+      dock_image: fnndsc/dbg-bigfiles@sha256:b956e35ee69c249677489b2bf1815a578c129c478bbdc4bff8c4c75535cd3e7f
+      public_repo: https://github.com/FNNDSC/dbg-bigfiles
+    # master at bcf7449: 2.1.5 plus a README-only commit (the 2.1.5 tag is a separate,
+    # code-identical build); amd64 only
+    - name: pl-simpledsapp
+      version: 2.1.5
+      dock_image: fnndsc/pl-simpledsapp@sha256:c4e8726281d4dff3266bb78ea80dcd9e3732eb02dbde86ce5633da2d960a7207
+      public_repo: https://github.com/FNNDSC/pl-simpledsapp
+    # master build of the 1.0.13 commit 6d5111b (the 1.0.13 tag is a separate,
+    # code-identical build); multi-arch
+    - name: pl-topologicalcopy
+      version: 1.0.13
+      dock_image: fnndsc/pl-topologicalcopy@sha256:35cb5798f9035cbd4f879049498ecd3d1bcf93bb95aa0b5eb3960fc65e47b8ee
+      public_repo: https://github.com/FNNDSC/pl-topologicalcopy

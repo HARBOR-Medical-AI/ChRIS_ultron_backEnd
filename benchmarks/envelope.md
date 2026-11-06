@@ -27,8 +27,13 @@ artificial dev cap.
 | `CUBE_DB_CPUS` / `CUBE_DB_MEM_LIMIT` | `2` / `4g` | `db` CPU and memory |
 | `PFCON_WORKERS` | `8` | `gunicorn -w` on `pfcon` (compute-side request parallelism) |
 | `PFCON_CPUS` / `PFCON_MEM_LIMIT` | `2` / `2g` | `pfcon` CPU and memory |
+| `CUBE_WORKER_PERIODIC_CPUS` / `CUBE_WORKER_PERIODIC_MEM_LIMIT` | `1` / `1g` | `worker-periodic` (the beat tasks) CPU and memory |
+| `CUBE_SCHEDULER_CPUS` / `CUBE_SCHEDULER_MEM_LIMIT` | `0.5` / `512m` | `celery-scheduler` (beat) CPU and memory |
+| `CUBE_BROKER_CPUS` / `CUBE_BROKER_MEM_LIMIT` | `2` / `1g` | `chris-broker` (the Celery broker) CPU and memory |
+| `CUBE_CACHE_CPUS` / `CUBE_CACHE_MEM_LIMIT` | `1` / `512m` | `chris-cache` (the shared cache) CPU and memory |
 | `CUBE_CELERY_POLL_INTERVAL` | `2.0` | Celery-beat scheduling/status poll cadence (s) — sweep `{2, 4, 8}` |
 | `CUBE_DEBUG` | `false` | Django `DEBUG` on `chris` and the Celery services (see below) |
+| `CUBE_CACHE_URL` | `redis://chris-cache:6379/0` | the shared cache (`CACHES['default']`) of `chris` and the Celery services; earlier runs did not record it, so `bench-compare` reports it as a caution against them |
 
 **Why `DEBUG` is off:** production runs with `DEBUG = False`, and `DEBUG` changes what is
 measured: every SQL statement goes through Django's query recorder, the debug toolbar's
@@ -51,6 +56,61 @@ as a baseline: `bench-compare` flags `envelope.CUBE_DB_SYNCHRONOUS_COMMIT` and
 **Not part of the envelope:** `CUBE_DB_POOL_STATS_INTERVAL` (default `5`) is the number of
 seconds between the `db_pool_stats` log lines each `uvicorn` worker writes, which the Locust
 recovery check reads (`0` disables them). It is instrumentation and is not recorded.
+
+**Resource sampling** is instrumentation too, but it is recorded, because it decides what the
+peaks mean. The sampler lists the stack's service and plugin-job containers every 1 s, start to
+start, without inspecting them (a new one is inspected for its start time, and again after a
+restart, which keeps its id), and reads each
+with a one-shot stats read, a few milliseconds, 8 at a time. Each container's CPU is over the
+second since its previous reading: the ~1 s window of Docker's own figure, short enough not to
+average away the 2 s beat's bursts. A plugin job's first reading gives its CPU since it started. A
+reading has none without a window of its own: a service's first in a scenario, one under 0.75 s
+after the previous (the closing reading at the end of a scenario can be; the next reading's window
+then starts where this one did, so no CPU goes unreported), a job's first under 0.25 s after its
+start, and the first after a restart. A read still running after 0.8 of its tick counts as failed
+and is not sent again until it answers, the ticks it holds the container out of counted too, so a
+read that hangs cannot slow the ticks or hold the end of a scenario; a listing that hangs can, for
+up to the sampler's 10 s Docker timeout. The queue depths have a timer of their own, every 0.5 s,
+four times per period of the 2 s beat. `environment.json` records the settings under `sampler`,
+each level row how the sampling went (`sampler`: ticks, late ticks (slots skipped after a tick
+that overran), the slowest tick, failed and vanished reads, failed listings, readings missed
+behind a read still running (`busy_skips`), plugin-job containers seen), and
+`report.md` flags a level whose sampling fell behind or failed. A run without the `sampler` record
+read each container in turn with a call that blocks 1-2 s, so each container was read about every
+2 s times the number of containers (19.1-19.8 s on the benchmark box), and short scenarios missed
+the containers listed last: its peaks are lower bounds. `bench-compare` reports runs sampled
+differently, or one without the record, as a caution, and a trend of a sampled metric (`peak_*`,
+`cpu_throttled_s`) says which runs were sampled which way. On the benchmark box a probe of a
+listing and one read per container each second cost the engine (dockerd, containerd and the shims)
+3.2% of a CPU for 10 containers and 16.9% for 70, outside every container
+limit.
+
+**The broker and the cache:** Dragonfly runs twice, as the Celery broker (`chris-broker`) and
+as the shared cache (`chris-cache`, `CUBE_CACHE_URL`). Each runs one thread per CPU it is
+given and keeps 80% of its memory limit as its `maxmemory`, so without the limits above both
+would follow the host (16 threads and about 92 GiB on the benchmark box). It exits at start-up
+when that `maxmemory` is under 256 MiB per thread, so change a Dragonfly's CPUs together with
+its memory, at least 320 MiB per CPU: 2 CPUs with `512m` stop it, and so do `0` CPUs (one
+thread per host CPU) with the default memory. A Dragonfly that exits stops `just bench-start`
+at its migrate step, since every CUBE service waits for both to be healthy. The 2026-10-27 runs
+(REPORT.md §16) peaked at 0.08 of a CPU and 30 MiB for the broker, 0.04 and 15 MiB for the cache,
+0.30 of a CPU and 256 MiB (247 MiB without the page cache) for `worker-periodic` and 0.04 and 114
+MiB for `celery-scheduler`, none throttled for more than 0.2 s, so the limits leave room for what
+later issues add. Runs from before these limits have none of them, and `bench-compare` reports
+each as a caution against them; `0` removes a limit, for a run without it. Their images are
+recorded under `images` in `environment.json`; `bench-compare` lists a different image, or none in
+a run that predates the record (`—`), as information. `CUBE_BROKER_IMAGE` and `CUBE_CACHE_IMAGE`
+replace the image of each, for example for an A/B of two Dragonfly versions. Export them for
+`just bench-start` and `just bench-run` alike: `bench-run`'s `compose run` recreates a dependency
+whose configuration differs, so a variable set for one recipe only silently brings the default
+image back. Another server than Dragonfly needs its own command line in `docker-compose.yml` as
+well (Redis and Valkey take no memory limit from the container, so they need `--maxmemory`).
+
+**The broker's rename:** runs archived before the shared cache name the broker `dragonflydb`,
+which `bench-compare` reads as `chris-broker` in their limits and in a trend's `--metric`
+(`peak_cpu_pct.chris-broker`). A later run that records the old name ran beside a container left
+over from before, and `bench-compare` shows it as it is. The broker's volume, `dragonflydata`,
+is now `chris_broker_data`.
 
 **Why the 2.0 s floor for the Celery poll interval:** the periodic tasks are guarded by `skip_if_running`
 (`plugininstances/tasks.py`), which spends ~1 s in a broker-wide `inspect().active()`
@@ -176,13 +236,15 @@ The harness reads these from the running server and the `db` container.
     the timed checkpoints an idle server skips, so `num_done` is the number written.
   - `db` container: bytes written to disk, pages swapped out and in, OOM kills.
 
-  Each scenario records deltas for two windows. `workload` runs from scenario start to the end
-  of the workload, slightly wider than the 2 s samples behind `peak_write_bytes`, so its
-  `cgroup_write_bytes` is at least `peak_write_bytes.db`. `cleanup` covers feed deletion and
-  quiescence. Both windows go into `scenario.json` (`db_counters`, with the raw snapshots).
-  Each `levels.jsonl` row gets each counter's largest value across the level's repeats, so the
-  counters of one row can come from different repeats. The run's total, taken 11 s after the
-  last level, goes into `summary.json` (`db_counters.run`).
+  Each scenario records deltas for two windows. `workload` runs from scenario start to the end of
+  the workload, slightly wider than the 1 s readings behind `peak_write_bytes` (the sampler takes
+  its last at the end of the workload), so its `cgroup_write_bytes` is at least
+  `peak_write_bytes.db`, and close to it; in runs without the `sampler` record the readings could
+  fall 20 s inside the window or miss the db, so cite `cgroup_write_bytes` for what `db` wrote.
+  `cleanup` covers feed deletion and quiescence. Both windows go into `scenario.json`
+  (`db_counters`, with the raw snapshots). Each `levels.jsonl` row gets each counter's largest
+  value across the level's repeats, so the counters of one row can come from different repeats.
+  The run's total, taken 11 s after the last level, goes into `summary.json` (`db_counters.run`).
 
   Backends publish their statistics up to about 10 s after they go idle, so a few seconds of
   short transactions can land in the next window. The run total holds everything published by
@@ -211,25 +273,73 @@ the Compose envelope; note the plugin-job defaults separately if you change them
 
 ## Pinned workload plugin versions
 
-Runs used `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5, and `pl-topologicalcopy` 1.0.13
-(provisioned by a local edit to `chrisomatic.yml`, below). The harness resolves each plugin **by name** and uses the
-first match (CUBE orders by `-version`), so **install exactly one version of each** — otherwise
-it warns and binds to the lexicographically-highest version string, not necessarily the pinned
-one. Each run now records the resolved versions (and how many matched) under `workload_plugins` in `environment.json`/`summary.json`; the pin is still what keeps a run reproducible, since the harness resolves by name.
+Runs use `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5 and `pl-topologicalcopy` 1.0.13, which
+`just bench-start` registers from the committed `benchmarks/chrisomatic/benchmark.yml` — not from
+the dev stack's `chrisomatic/chrisomatic.yml` — with the ChRIS store lookup disabled (an empty
+`public_store:`). Each is pinned by the index digest of the image the archived baselines ran:
 
-**Reproducing those versions.** The committed `chrisomatic/chrisomatic.yml` registers
-`pl-topologicalcopy` by name from the public ChRIS store, and the store now serves 2.0.0 — a no-op
-image — under that name, so a stock `just` can bind the harness to a plugin that does no work, and
-a run against it reads as a large speed-up rather than a failure. Before provisioning a benchmark
-stack, edit `chrisomatic.yml` locally: replace `- name: pl-topologicalcopy` with
-`- dock_image: fnndsc/pl-topologicalcopy:1.0.13` (Docker Hub carries the 1.0.x tags; the store's
-2.0.0 is not there), or add an empty `public_store:` under `on:` to disable the store lookup
-altogether. The second option also needs every `- name:` entry turned into a pinned
-`- dock_image:`: without a store, chrisomatic cannot resolve a plugin from its name alone, so
-those plugins fail to register and `just bench-start` fails. Keep that edit out of commits — the dev environment is deliberately not pinned to the
-benchmark's versions. If another version is already registered, remove it first (or `just nuke`),
-then confirm `workload_plugins` in the run's `environment.json` reads `pl-topologicalcopy` 1.0.13,
-`pl-simpledsapp` 2.1.5 and `dbg-bigfiles` 1.0.0, each with `"matches": 1`.
+| Plugin | Pinned image | Which build |
+|---|---|---|
+| `dbg-bigfiles` 1.0.0 | `fnndsc/dbg-bigfiles@sha256:b956e35e…` | the 1.0.0 tag's image (also `latest`); multi-arch |
+| `pl-simpledsapp` 2.1.5 | `fnndsc/pl-simpledsapp@sha256:c4e87262…` | `latest` since 2026-02-25: 2.1.5 plus a README-only commit (the 2.1.5 tag is a separate build of the same code); amd64 only |
+| `pl-topologicalcopy` 1.0.13 | `fnndsc/pl-topologicalcopy@sha256:35cb5798…` | `latest`, the master build of the 1.0.13 commit (the 1.0.13 tag is the tag's own build of it); multi-arch |
+
+**Why digests.** The dev file registers `pl-topologicalcopy` by name from the public ChRIS
+store, which serves 2.0.0 under that name — a no-op image (`backplane/true`) declaring the
+parameters the harness passes — and does not hold 1.0.13; a run against 2.0.0 reads as a
+speed-up rather than a failure. A plugin's `latest` moves with every master commit, docs-only
+ones included, and a version tag is a build of its own. A digest is immutable: a pinned run
+executes exactly the image the pin names.
+
+**What the harness checks.** chrisomatic does not verify versions (CUBE records the version the
+image reports), so the harness reads the same file and refuses to start, with one error that
+lists every problem, unless each workload plugin has exactly one registered version, the pinned
+one under the pinned `dock_image`, and, where the harness can read the Docker daemon, its image
+is present (pfcon would otherwise pull it inside the first measured scenario). Exactly one,
+rather than the pinned one among several, because CUBE itself resolves `pl-topologicalcopy` by
+name. `just bench-run --plugins <file name>` checks against another pin in
+`benchmarks/chrisomatic/` (or one at a path).
+
+**Fresh volumes.** chrisomatic never removes a plugin, and CUBE refuses to register a version
+again under another image reference, or an image reference again: so `just bench-start` fails,
+with a hint, on volumes that already hold a pinned version or image under another registration,
+after a dev `just` for one (the dev and benchmark stacks are one compose project and share their
+volumes). Another version of a plugin, such as the store's 2.0.0, registers next to the pin, and
+the harness then refuses to start. `just bench-nuke` resets the volumes (stack down, plugin-job
+containers reaped, volumes removed); it deletes the dev stack's data too (database, files,
+lldap, Orthanc, pfdcm).
+
+**Pulling.** chrisomatic 1.0.0 cannot pull an image by digest, so `just bench-start` first pulls
+each image the pin names that is not present (`just bench-pull-plugins`); an image that is
+present is never pulled again.
+
+**Changing a pin.** Look up the index digest (`docker buildx imagetools inspect
+fnndsc/<plugin>:<tag>`), edit the entry's `version` and `dock_image`, and commit the file with
+the runs it produced. Keep each entry in block style with `dock_image:` on a line of its own:
+chrisomatic's YAML forbids flow style, and `bench-pull-plugins` reads the references line by line.
+
+**On an arm64 laptop.** `pl-simpledsapp` 2.1.4 and later have no arm64 image, so the committed
+pin stops at `bench-pull-plugins`. Write the laptop a pin of its own,
+`benchmarks/chrisomatic/<name>.local.yml` (git-ignored), naming its local builds, and pass it to
+both recipes, by its file name: `just bench-start <name>.local.yml`, then `just bench-run
+--plugins <name>.local.yml …`. When its entries name exactly the references a local
+edit of `chrisomatic.yml` registers for development, with `name` and `version` but no
+`public_repo`, chrisomatic finds either file's registrations and the two stacks share one database
+without a reset. Laptop runs are directional only.
+
+**What each run records.** `workload_plugins` in `environment.json`/`summary.json` holds each
+role's name, version, `dock_image`, match count and `image` (the local image's id, digests and
+architecture; `null` when the harness cannot read the Docker daemon), and `workload_plugins_pin`
+the pin's path and sha256. `bench-compare` reports another name or version as a blocker, other
+image digests as a caution, and another `dock_image` or pin as information; against a run from
+before the image records it reports `workload_plugins.image` as one caution.
+
+**Earlier runs.** Runs archived before the committed pin registered the plugins from
+`chrisomatic/chrisomatic.yml`, edited locally or as committed at the time, under untagged
+references (`latest`), which on the benchmark box are the images the pin names; from 2026-10-07
+`dbg-bigfiles` was registered as `localhost/dbg-bigfiles`, a second tag on the same image. The
+June runs record no plugin versions or images. [history/README.md](history/README.md) notes the
+file each campaign used.
 
 ## Manual hardware fields
 

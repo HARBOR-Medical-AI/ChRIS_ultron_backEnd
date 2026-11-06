@@ -165,7 +165,7 @@ def subject_of(pacs_name: str, series_instance_uid: str) -> str:
     """
     Get the NATS subject for a series.
 
-    Equivalent to https://github.com/FNNDSC/oxidicom/blob/33838f22a5431a349b3b83a313035b8e22d16bb1/src/lonk.rs#L36-L48
+    Equivalent to https://github.com/HARBOR-Medical-AI/oxidicom/blob/33838f22a5431a349b3b83a313035b8e22d16bb1/src/lonk.rs#L36-L48
     """
     return f'oxidicom.{_sanitize_topic_part(pacs_name)}.{_sanitize_topic_part(series_instance_uid)}'
 

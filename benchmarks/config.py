@@ -1,11 +1,15 @@
 """
-Typed benchmark configuration and the ``matrix.yml`` loader (no logic).
+Typed benchmark configuration: the ``matrix.yml`` loader and the workload-plugin pin
+loader (no logic).
 
 A *tier* (smoke / default / full, plus the aging-grow / aging-probe pair) defines a
 baseline workload, the escalation axes per topology (with binary caps), repetition
 count, failure thresholds and the poll cadence. The escalation engine walks
 ``topology_axes``; the runner overrides the matching baseline field with the current
 level to build a ``ScenarioParams``.
+
+The *pin* is the chrisomatic file ``just bench-start`` registers the workload plugins
+from; the runner checks CUBE's registrations against the same file.
 """
 
 from __future__ import annotations
@@ -19,6 +23,12 @@ import yaml
 
 
 DEFAULT_MATRIX = Path(__file__).with_name("matrix.yml")
+
+#: the committed pin, what `just bench-start` registers unless given another file
+DEFAULT_PINS = Path(__file__).with_name("chrisomatic") / "benchmark.yml"
+
+#: the fields of a pinned plugin entry (chrisomatic's search keys, but public_repo)
+PIN_FIELDS = ("name", "version", "dock_image")
 
 #: scenario fields an axis may escalate (must be attribute names on Baseline)
 ESCALATABLE_AXES = ("depth", "branches", "layers", "merges", "feeds", "file_count")
@@ -56,6 +66,29 @@ class Thresholds:
     scenario_timeout_s: int
     #: max wait for async feed deletion to settle between scenarios (see recovery)
     quiesce_timeout_s: int = 300
+
+
+@dataclass(frozen=True)
+class PluginPin:
+    name: str
+    version: str
+    dock_image: str
+
+
+@dataclass(frozen=True)
+class PluginPins:
+    """
+    The workload plugins a chrisomatic file pins, and which file it was: ``path`` is
+    relative to the repository root, so it reads the same on the host and in the
+    benchmark container.
+    """
+    path: str
+    sha256: str
+    #: plugin name -> pin
+    plugins: dict[str, PluginPin]
+
+    def record(self) -> dict:
+        return {"path": self.path, "sha256": self.sha256}
 
 
 @dataclass(frozen=True)
@@ -147,3 +180,56 @@ def load_tier(name: str, path: "str | Path | None" = None) -> Tier:
         poll_every_s=float(raw.get("poll_every_s", 1.0)),
         topology_axes=topology_axes,
     )
+
+
+def load_pins(path: "str | Path | None" = None) -> PluginPins:
+    """
+    Load the pinned workload plugins from a chrisomatic file: the entries of its
+    ``cube.plugins`` that are mappings, each with a name, version and dock_image (a bare
+    image or name pins nothing). ``path`` is a file name in ``benchmarks/chrisomatic/``,
+    as ``just bench-start`` takes it, or a path.
+
+    chrisomatic reads the file as StrictYAML, where every value is a string; so does this,
+    since PyYAML's ``safe_load`` would read the ``on:`` key as ``True`` and a version like
+    ``1.10`` as the float ``1.1``.
+    """
+    path = Path(path) if path else DEFAULT_PINS
+
+    if not path.is_absolute() and len(path.parts) == 1:
+        path = DEFAULT_PINS.parent / path
+
+    raw = path.read_bytes()
+    doc = yaml.load(raw, Loader=yaml.BaseLoader)  # nosec B506 - BaseLoader: strings only
+    cube = doc.get("cube") if isinstance(doc, dict) else None
+    entries = cube.get("plugins") if isinstance(cube, dict) else None
+
+    if not isinstance(entries, list):
+        raise ValueError(f"{path}: no cube.plugins list, so not a chrisomatic file")
+
+    plugins: dict[str, PluginPin] = {}
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        missing = [key for key in PIN_FIELDS if not entry.get(key)]
+
+        if missing:
+            raise ValueError(f"{path}: plugin entry {entry} has no {', '.join(missing)}")
+
+        if entry["name"] in plugins:
+            raise ValueError(f"{path}: plugin {entry['name']!r} is pinned twice")
+
+        plugins[entry["name"]] = PluginPin(*(entry[key] for key in PIN_FIELDS))
+
+    return PluginPins(path=_repo_relative(path), sha256=hashlib.sha256(raw).hexdigest(),
+                      plugins=plugins)
+
+
+def _repo_relative(path: Path) -> str:
+    root = Path(__file__).resolve().parent.parent
+
+    try:
+        return str(path.resolve().relative_to(root))
+    except ValueError:
+        return str(path)

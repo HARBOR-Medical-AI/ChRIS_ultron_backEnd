@@ -21,7 +21,7 @@ storage := `if [ -f '.storage' ]; then cat .storage; else echo fslink; fi`
 # image build. Force it off with `just tty=false ...`.
 tty := `if [ -t 0 ]; then echo true; else echo false; fi`
 
-# Start the ChRIS backend in development mode, and attach to the live-reloading server.
+# Start the ChRIS backend in development mode and then attach to the live-reloading server.
 [group('(1) start-up')]
 dev: chrisomatic attach
 
@@ -40,9 +40,9 @@ attach: (docker-compose '--profile=cube attach chris | grep -Fv "\"GET /api/v1/u
 # `runserver` is WSGI here — channels is wired up in config/asgi.py, not INSTALLED_APPS —
 # so it cannot serve WebSockets at all, and `channels.testing` exercises the consumers
 # in-process. Neither reaches the uvicorn protocol stack production uses
-# (websockets-sansio since uvicorn 0.50); this recipe does, on the dev stack and dev
-# settings. `just bench-start` also runs uvicorn, but under the benchmark envelope.
-# Publishes host port 8000, so stop the dev server (`just down`) before running it.
+# (websockets-sansio since uvicorn 0.50); this recipe does on the dev stack and dev
+# settings. `just bench-start` also runs uvicorn but under the benchmark envelope.
+# Publishes host port 8000 therefore stop the dev server (`just down`) before running it.
 #
 # Serve CUBE with uvicorn (ASGI) on port 8000 instead of the dev `runserver`.
 [group('(3) development')]
@@ -106,6 +106,41 @@ test-unit-coverage: start-ancillary
     @just storage={{ storage }} run coverage run manage.py test --force-color --exclude-tag integration
     @just storage={{ storage }} run coverage xml
 
+# Codacy fails a pull request on any issue its merge-base (git) does not have.
+# `lint` runs the checks behind nearly all of Codacy's findings (Bandit, pyflakes, dodgy,
+# Pylint, and `uv audit` for Trivy) on the files changed since the merge-base with
+# origin/master and lists the issues only the working tree has, with the advisories of a
+# changed lockfile that Codacy may call new all the same (marked ?); `--all` lists the
+# older ones too, `--base` names another branch. See scripts/lint.py.
+#
+# List the issues Codacy would report as new on this branch.
+[group('(3) development')]
+lint *args: (lint-run 'check' args)
+
+# Ruff fixes unused imports and f-strings without placeholders, with `--unsafe` unused
+# variables too, only where `lint` reports them as new and never on an older issue's line.
+#
+# Fix the new issues Ruff can fix then list what is left.
+[group('(3) development')]
+lint-fix *args: (lint-run 'fix' args)
+
+# Test scripts/lint.py (scripts/test_lint.py) in the dev image.
+[group('(3) development')]
+lint-test:
+    @just storage={{ storage }} docker-compose --profile=cube run --rm --no-deps -T \
+        -v '{{ justfile_directory() }}:/w:z' -w /w -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+        chris python -m unittest discover -s scripts -p 'test_*.py'
+
+# Run scripts/lint.py in the dev image with the repository mounted at /w, and the host's
+# global git excludes (core.excludesFile) so that the files they ignore stay ignored.
+[group('helper function')]
+lint-run command *args:
+    @excludes="$(git config --path --get core.excludesFile || echo "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore")"; \
+    just storage={{ storage }} docker-compose --profile=cube run --rm --no-deps -T \
+        -v '{{ justfile_directory() }}:/w:z' -w /w -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+        $([ -f "$excludes" ] && echo "-v $excludes:/etc/git-excludes:ro -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=core.excludesFile -e GIT_CONFIG_VALUE_0=/etc/git-excludes") \
+        chris python scripts/lint.py {{ command }} {{ args }}
+
 # Start dependency services.
 [group('(1) start-up')]
 start-ancillary: (docker-compose 'up -d')
@@ -167,8 +202,8 @@ get-engine:
       echo docker;                           \
     fi                                       \
 
-# This is every `user: ${UID}:${GID}` in the compose files, and pfcon's CONTAINER_USER for
-# plugin jobs. Under rootless Podman a container's root *is* the invoking user, and any
+# This is every `user: ${UID}:${GID}` in the compose files and pfcon's CONTAINER_USER for
+# plugin jobs. Under rootless Podman a container's root *is* the invoking user and any
 # other uid maps to a subordinate uid that cannot write into the working tree (`just lock`,
 # `just makemigrations`, coverage), so there it is root. Everywhere else it is the invoking
 # user.
@@ -184,9 +219,9 @@ get-user:
     fi
 
 # Podman must be 5.4 or above (the Dockerfiles, README, CLAUDE.md and ci.yml point
-# here): both Dockerfiles bind-mount pyproject.toml and uv.lock, and Buildah before 1.39
-# (the one in Podman before 5.4) leaves bind-mounted content out of its layer cache key, so
-# a rebuild after a lock change reuses the old layer and silently keeps the old
+# here): both Dockerfiles bind-mount pyproject.toml and uv.lock but Buildah before 1.39
+# (the one in Podman before 5.4) leaves bind-mounted content out of its layer cache key,
+# so a rebuild after a lock change reuses the old layer and silently keeps the old
 # dependencies (containers/buildah#5400). `podman info` reports the Buildah that builds,
 # the server's when Podman is remote. The recipes that rebuild an image depend on this.
 # `run` and `up` only build a missing image; on older Podman that build can still reuse a
@@ -207,6 +242,15 @@ check-builder:
         exit 1;                                                                                  \
       fi;                                                                                        \
     fi
+
+# chrisomatic sees benchmarks/chrisomatic/ only (docker-compose.benchmark.yml) so a pin
+# is a file name there.
+#
+# Fail unless a benchmark pin names a file in benchmarks/chrisomatic/.
+[group('helper function')]
+check-pins pins:
+    @case '{{ pins }}' in ''|*/*) >&2 echo "a pin is a file name in benchmarks/chrisomatic/, not '{{ pins }}'"; exit 1;; esac
+    @test -f 'benchmarks/chrisomatic/{{ pins }}' || { >&2 echo "no such pin: benchmarks/chrisomatic/{{ pins }}"; exit 1; }
 
 # Get the docker daemon socket path.
 [group('helper function')]
@@ -271,13 +315,47 @@ bench-compose +command:
         GIT_DIRTY="$(git diff --quiet HEAD 2>/dev/null && echo false || echo true)" \
         $(just get-engine) compose -f docker-compose.yml -f docker-compose.benchmark.yml {{ command }}
 
-# Start the benchmark stack (fslink + uvicorn envelope), migrate, and register plugins.
+# The pin is a file in benchmarks/chrisomatic/: the committed benchmark.yml unless named,
+# e.g. an arm64 laptop's own file (see benchmarks/envelope.md § "Pinned workload plugin
+# versions"); `just bench-run --plugins` names the same file. chrisomatic fails when the
+# database already holds another registration of a pinned version, e.g. from a dev `just`:
+# the two stacks share their volumes.
+#
+# Start the benchmark stack (fslink + uvicorn envelope), migrate and then register the pinned workload plugins.
 [group('(6) benchmarks')]
-bench-start: check-builder
-    just bench-compose 'up -d --build db dragonflydb nats pfcon cube-nonroot-user-volume-fix'
+bench-start pins='benchmark.yml': check-builder (bench-pull-plugins pins)
+    just bench-compose 'up -d --build db chris-broker chris-cache nats pfcon cube-nonroot-user-volume-fix'
     just bench-compose 'run --rm chris python manage.py migrate --noinput'
     just bench-compose 'up -d --build chris worker-mains worker-periodic celery-scheduler'
-    just bench-compose '--profile cube run --rm chrisomatic chrisomatic'
+    just bench-compose '--profile cube run --rm chrisomatic chrisomatic /etc/chrisomatic-benchmark/{{ pins }}' \
+        || { >&2 echo "[bench] chrisomatic failed. If a dev 'just' ran on these volumes, reset them with 'just bench-nuke' (it deletes the dev stack's data too) and run 'just bench-start {{ pins }}' again."; exit 1; }
+
+# chrisomatic 1.0.0 cannot pull an image by digest but registers one that is present, so
+# pull what the pin names first. A reference that is present is never pulled again.
+# A name without a registry is pulled from docker.io explicitly (docker.io/library/ for a
+# one-part name), so Podman need not resolve it. A pin keeps each `dock_image:` on a line
+# of its own (chrisomatic's YAML forbids flow style); a comment after it is ignored.
+#
+# Pull the workload plugin images a benchmark pin names unless present.
+[group('(6) benchmarks')]
+bench-pull-plugins pins='benchmark.yml': (check-pins pins)
+    @for ref in $(sed -n -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' \
+        -e 's/^[ -]*dock_image:[[:space:]]*//p' 'benchmarks/chrisomatic/{{ pins }}' | tr -d "\"'"); do \
+      $(just get-engine) image inspect "$ref" > /dev/null 2>&1 && continue; \
+      case "$ref" in */*) first="${ref%%/*}";; *) first="";; esac; \
+      case "$first" in \
+        *.*|*:*|localhost) src="$ref";; '') src="docker.io/library/$ref";; *) src="docker.io/$ref";; \
+      esac; \
+      $(just get-engine) pull "$src" || exit 1; \
+    done
+
+# The dev and benchmark stacks are one compose project so this deletes the dev stack's data
+# too (database, files, lldap, Orthanc, pfdcm). Stopping the stack first means no plugin-job
+# container is created after `nuke` reaps them.
+#
+# Stop the benchmark stack, then remove all its data and plugin-job containers.
+[group('(6) benchmarks')]
+bench-nuke: bench-down nuke
 
 # Run the benchmark harness, e.g. `just bench-run --tier smoke` or `just bench-run --tier full`.
 [group('(6) benchmarks')]

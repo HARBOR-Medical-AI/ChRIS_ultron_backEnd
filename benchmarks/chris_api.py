@@ -2,17 +2,17 @@
 Thin, measured Collection+JSON HTTP adapter for CUBE.
 
 This is the harness's transport layer and the seam a future Locust layer would share.
-Every call is timed and tagged by endpoint class, and a ``RequestRecord`` is emitted to
+Every call is timed and tagged by endpoint class and a ``RequestRecord`` is emitted to
 an injected observer (default no-op) — the client library swallows latency and HTTP
-status codes, which the benchmark must capture. No orchestration logic lives here.
+status codes which the benchmark must capture. No orchestration logic lives here.
 
 Authentication: a DRF token is obtained once from ``auth-token/`` and sent as a header
 on every subsequent request. Per-request HTTP Basic would make CUBE run its
 deliberately-slow password hasher on *every* call — ~100 ms of artificial latency in
 every measurement, plus SUT CPU load that scales with the harness's own traffic
-(including poll traffic, which grows with the feeds axis). If the token endpoint
-refuses, the adapter falls back to Basic and reports it via ``auth_mode`` so the run's
-environment manifest records the degraded measurement mode.
+(including poll traffic, which grows with the feeds axis). A token endpoint that
+refuses makes the adapter fall back to Basic and report it via ``auth_mode`` so the
+run's environment manifest records the degraded measurement mode.
 
 URL patterns (verified in ``core/api.py``), relative to the ``/api/v1/`` base:
   * obtain auth token    POST   auth-token/
@@ -82,6 +82,7 @@ def _total(payload: Optional[dict]) -> int:
 def _items(payload: Optional[dict]) -> list[dict]:
     coll = (payload or {}).get("collection", {})
     out = []
+
     for item in coll.get("items", []):
         d = {desc["name"]: desc.get("value") for desc in item.get("data", [])}
         d["_href"] = item.get("href")
@@ -91,6 +92,7 @@ def _items(payload: Optional[dict]) -> list[dict]:
 
 def _next_link(payload: Optional[dict]) -> Optional[str]:
     coll = (payload or {}).get("collection", {})
+
     for link in coll.get("links", []):
         if link.get("rel") == "next":
             return link.get("href")
@@ -107,10 +109,12 @@ class ChrisApi:
         self._username = username
         self._password = password
         self.session = requests.Session()
-        # the feeds axis fans out one thread per feed against this single host; with
-        # urllib3's default pool of 10, connections beyond that are discarded and the
-        # reconnect churn shows up as fake latency at exactly the high-concurrency levels
+
+        # the feeds axis fans out one thread per feed against this single host; urllib3's
+        # default pool keeps 10 connections and discards any beyond that so the reconnect
+        # churn shows up as fake latency at exactly the high-concurrency levels
         adapter = HTTPAdapter(pool_connections=4, pool_maxsize=pool_maxsize)
+
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         self._token: Optional[str] = None
@@ -219,10 +223,11 @@ class ChrisApi:
         Resolve a plugin by name and return the selected version's provenance.
 
         Searches ``plugins/search/?name_exact=`` and selects the first match — CUBE
-        orders plugins by ``('meta', '-version')``, so this is the highest-sorting
+        orders plugins by ``('meta', '-version')`` so this is the highest-sorting
         version *string* for the name. ``matches`` is how many versions the name
-        resolved to; ``> 1`` means the selection is ambiguous (the recorded
-        provenance and the run's warning both key off it).
+        resolved to and ``installed_versions`` lists them: the runner starts only when
+        each workload plugin has exactly one since CUBE itself resolves
+        ``pl-topologicalcopy`` by name too.
         """
         r = self._call("list", "GET", self.base + "plugins/search/",
                        params={"name_exact": name})
@@ -234,7 +239,8 @@ class ChrisApi:
         sel = r.items[0]
         return {"id": int(sel["id"]), "name": sel.get("name", name),
                 "version": sel.get("version"), "dock_image": sel.get("dock_image"),
-                "matches": len(r.items)}
+                "matches": len(r.items),
+                "installed_versions": [item.get("version") for item in r.items]}
 
     def get_plugin_id(self, name: str) -> int:
         return self.get_plugin(name)["id"]

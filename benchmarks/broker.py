@@ -4,7 +4,7 @@ Celery queue-depth sampling against the Redis-protocol broker (Dragonfly).
 Queue depth is the earliest place backpressure shows: a growing ``main2`` list means
 status checks are produced faster than the worker slots consume them, long before
 CPU graphs make that obvious. Celery queues are plain Redis lists named after the
-queue, so a depth sample is one ``LLEN`` per queue.
+queue so a depth sample is one ``LLEN`` per queue.
 
 Implemented over a raw socket (the RESP protocol is three lines of framing) to avoid
 adding a redis dependency to the harness. Degrades to unavailable — never raises out
@@ -51,7 +51,7 @@ class BrokerClient:
     Best-effort LLEN sampler for the Celery queues.
     """
 
-    def __init__(self, host: str = "dragonflydb", port: int = 6379, *,
+    def __init__(self, host: str = "chris-broker", port: int = 6379, *,
                  queues: tuple[str, ...] = CELERY_QUEUES, timeout: float = 2.0):
         self.host = host
         self.port = port
@@ -71,18 +71,26 @@ class BrokerClient:
 
     def depths(self) -> dict[str, int]:
         """
-        Current depth per queue; {} when the broker is unreachable.
+        Current depth per queue, the LLENs sent together on one connection; {} when the
+        broker is unreachable.
         """
         if not self.available:
             return {}
         try:
-            return {q: int(self._command("LLEN", q)) for q in self.queues}
+            replies = self._pipeline([("LLEN", q) for q in self.queues])
+            return {q: int(reply) for q, reply in zip(self.queues, replies)}
         except (OSError, ValueError):
             return {}
 
     def _command(self, *args: str):
+        return self._pipeline([args])[0]
+
+    def _pipeline(self, commands: list[tuple[str, ...]]) -> list:
+        """
+        Send ``commands`` at once on one connection and read their single-line replies.
+        """
         with socket.create_connection((self.host, self.port),
                                       timeout=self.timeout) as sock:
-            sock.sendall(encode_command(*args))
-            reply = sock.makefile("rb").readline()
-        return parse_reply(reply)
+            sock.sendall(b"".join(encode_command(*args) for args in commands))
+            stream = sock.makefile("rb")
+            return [parse_reply(stream.readline()) for _ in commands]

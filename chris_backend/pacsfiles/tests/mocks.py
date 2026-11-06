@@ -11,7 +11,7 @@ class Mockidicom:
     """
     A mock *oxidicom* which sends LONK messages to NATS.
 
-    Somewhat similar to https://github.com/FNNDSC/oxidicom/blob/e6bb83d1ea2fbaf5bb4af7dbf518a4b1a2957f2d/src/lonk.rs
+    Somewhat similar to https://github.com/HARBOR-Medical-AI/oxidicom/blob/e6bb83d1ea2fbaf5bb4af7dbf518a4b1a2957f2d/src/lonk.rs
     """
 
     def __init__(self, nc: NATS):

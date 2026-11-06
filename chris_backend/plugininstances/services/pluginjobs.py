@@ -141,7 +141,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     d_resp=d_resp, push_path_status=True)  
             self.c_plugin_inst.raw = json_zip2str(d_resp)
 
-            # https://github.com/FNNDSC/ChRIS_ultron_backEnd/issues/408
+            # https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/408
             now = timezone.now()
             self.c_plugin_inst.start_date = now
             self.c_plugin_inst.end_date = now

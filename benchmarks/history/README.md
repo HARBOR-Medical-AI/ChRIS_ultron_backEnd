@@ -54,10 +54,14 @@ pins at the 10 s pool timeout) and the clean write-path run. Raw CSVs alongside 
 
 ## How these results were generated
 
-All runs used the pinned envelope (`envelope.md`), `fslink` storage, on the dedicated Linux
-box. The harness binds each workload plugin by name to the first match, so keep exactly one
-version of each installed — runs used `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5, and
-`pl-topologicalcopy` 1.0.13. Two conventions matter for reproducing them faithfully:
+All runs used the pinned envelope (`envelope.md`), `fslink` storage, on the dedicated Linux box,
+and `dbg-bigfiles` 1.0.0, `pl-simpledsapp` 2.1.5, and `pl-topologicalcopy` 1.0.13. Since the
+committed pin (`benchmarks/chrisomatic/benchmark.yml`, `envelope.md` § "Pinned workload plugin
+versions") `just bench-start` registers those versions and the harness refuses to start against
+any other registration; earlier campaigns registered them from `chrisomatic/chrisomatic.yml`,
+edited locally or as committed at the time, as noted with each below (the June runs record no
+plugin versions or images, and the file committed then, 94e585d, took `pl-topologicalcopy` by
+name from the ChRIS store). Two conventions matter for reproducing them faithfully:
 
 - **Clean-stack discipline.** Isolation runs are preceded by a recovery so a prior failure
   can't contaminate them (we saw spurious failures otherwise). A light reset is a service
@@ -129,9 +133,9 @@ Host and stack differences from June: Docker 27.3 → 29.8, kernel 7.0.0-22 → 
 `chrisomatic/chrisomatic.yml`; that edit is deliberately not committed, because the dev environment
 should not be stuck at the benchmark's plugin versions. The ChRIS store now serves
 `pl-topologicalcopy` 2.0.0 — a no-op image — under the name the harness resolves, so reproducing
-these runs needs the recipe in [`../envelope.md`](../envelope.md) § "Pinned workload plugin
-versions". `bench-compare` does not check plugin versions: read `workload_plugins` in
-`environment.json` before comparing.
+these runs needed that edit. Since the committed pin ([`../envelope.md`](../envelope.md)
+§ "Pinned workload plugin versions") `just bench-start` registers the same versions, and
+`bench-compare` compares `workload_plugins`, which it did not when these runs were made.
 
 ### Per-command baselines
 
@@ -222,7 +226,9 @@ is only its network alias.
 The fix for the API's database pools staying exhausted after an overload (REPORT.md § 14). From
 here on the benchmark runs with `DEBUG` off (`CUBE_DEBUG`, see [`../envelope.md`](../envelope.md)),
 so `bench-compare` flags `envelope.CUBE_DEBUG` against every earlier run. The two data-plane runs
-that issue 1 compares against were repeated at the new envelope:
+that issue 1 compares against were repeated at the new envelope. They registered the workload
+plugins from a locally edited `chrisomatic.yml` (911fb6c's takes `pl-topologicalcopy` from the
+ChRIS store), which named `dbg-bigfiles` `localhost/dbg-bigfiles`, a second tag on the same image:
 
 | Run | Command (`just bench-run --tier ...`) | Result |
 |---|---|---|
@@ -239,7 +245,7 @@ package versions (`versions.txt`), which does not recover after 400 users either
 
 ## PostgreSQL configuration — 2026-10-14
 
-The before and after runs of issue 1 ([#150](https://github.com/FNNDSC/HARBOR-planning/issues/150),
+The before and after runs of issue 1 ([#150](https://github.com/HARBOR-Medical-AI/HARBOR-planning/issues/150),
 REPORT.md § 15): `postgres/cube.conf` for both compose stacks and migration `core.0004`. Before =
 8ea010b (the stock configuration, with the harness that records Postgres settings, limits and
 most counters); after = 2d52608 (the configuration, which also adds `wal_init_bytes` and the
@@ -247,8 +253,8 @@ per-statement temp and WAL columns of `pg_stats.json`). Every run started on a f
 `down -v`, plugin-job containers removed, `just bench-start`. diamond · layers = 8 ran twice each
 way, alternating, because its run-to-run variance (about 10%) is enough to move a single pair's
 result. All eight used `pl-topologicalcopy` 1.0.13 from the `chrisomatic.yml` committed at
-those commits; on a later commit, apply the edit in [`../envelope.md`](../envelope.md)
-§ "Pinned workload plugin versions" first.
+those commits; on a later commit `just bench-start` registers the same versions from the
+committed pin ([`../envelope.md`](../envelope.md) § "Pinned workload plugin versions").
 
 | Run | Commit | Command (`just bench-run --tier ...`) | Result |
 |---|---|---|---|
@@ -268,6 +274,35 @@ without `wal_init_bytes` and the per-statement temp and WAL columns), which earl
 `--metric peak_write_bytes.db` trends what `db` wrote back to them. The after runs are the
 baselines for these three commands from here on. The `db` container logs of these runs, with
 every checkpoint and its cause, are kept on the benchmark box.
+
+## Shared cache, plugin pin and resource sampling — 2026-10-27
+
+The baselines of issue 1b ([#151](https://github.com/HARBOR-Medical-AI/HARBOR-planning/issues/151),
+REPORT.md § 16): the shared cache on `chris-cache`, the broker on Dragonfly v2.0.2 as
+`chris-broker`, the envelope limits of both and of `worker-periodic` and `celery-scheduler`, the
+committed workload-plugin pin, and the resource sampler that reads every container each second.
+They are arm B of an A/B by commit against the old sampler (arm A, cb15830, the same commands,
+not archived); every run started on a fresh stack (`just bench-nuke`, `just bench-start`) at
+c575149 on a clean tree, with every envelope knob at its default, and records the sampler's
+settings under `sampler` in `environment.json` and its summary in each level row.
+
+| Run | Commit | Command (`just bench-run --tier ...`) | Result |
+|---|---|---|---|
+| `2026-10-27T001134Z` | c575149 | `smoke` | PASS, 10 levels |
+| `2026-10-27T001433Z` | c575149 | `full --topology linear --axis depth --cap 16 --repeat 1 --restart-on-fail` | PASS; 16 deep 66.40 s |
+| `2026-10-27T005643Z` | c575149 | same | PASS; 16 deep 68.57 s |
+| `2026-10-27T005959Z` | c575149 | same | PASS; 16 deep 67.59 s |
+| `2026-10-27T003342Z` | c575149 | `full --topology linear --axis feeds --cap 128 --repeat 1 --restart-on-fail` | FAIL at 128 (`cancelled:inst-1143`); 128 feeds 323.1 s, `main1` peak 92, `main2` peak 2,553 |
+| `2026-10-27T004515Z` | c575149 | `full --topology fanout_fanin --axis feeds --cap 64 --repeat 1 --restart-on-fail` | FAIL at 32 (`cancelled:inst-352`); 70.0 s, `main1` peak 107, `main2` peak 1,268 |
+
+These are the baselines for the four commands from here on. Runs archived before them have no
+`sampler` record: their sampler read each container about every 19 s, so their resource and
+queue peaks are lower bounds and short scenarios miss services (REPORT.md § 16.1); `bench-compare`
+reports `sampler` as "not recorded" against them, and a trend of a sampled metric says which runs
+were sampled which way. For what `db` wrote, `--metric db_counters.workload.cgroup_write_bytes`
+reads its cgroup counter in every run since 2026-10-13: in the 2026-10-14 table above, 30.68,
+18.92, 32.99 and 18.86 GB, where the sampled figures say 30.47, 18.91, 32.34 and 18.80. The arm A
+runs and the logs of both arms are kept on the benchmark box.
 
 ## Regenerating the archive
 
