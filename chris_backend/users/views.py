@@ -3,6 +3,7 @@ from django.contrib.auth.models import User, Group
 from django.shortcuts import get_object_or_404
 from django.conf import settings
 from rest_framework import generics, permissions, serializers
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.reverse import reverse
 from rest_framework.response import Response
 
@@ -21,9 +22,21 @@ class UserCreate(generics.ListCreateAPIView):
 
     def list(self, request, *args, **kwargs):
         """
-        Overriden to append a collection+json write template.
+        Overriden to return the paginated collection of all users to administrators
+        and to append a collection+json write template. Unauthenticated requests get
+        an empty collection (with the write template when account creation is
+        enabled) and other authenticated users are not allowed to list the users.
         """
-        response = services.get_list_response(self, [])
+        user = request.user
+        if not user.is_authenticated:
+            queryset = []
+        elif user.is_staff:
+            queryset = self.get_queryset().order_by('id')
+        else:
+            raise PermissionDenied(
+                'Only administrators are allowed to list the users.')
+
+        response = services.get_list_response(self, queryset)
 
         if settings.DISABLE_USER_ACCOUNT_CREATION:
             return response
