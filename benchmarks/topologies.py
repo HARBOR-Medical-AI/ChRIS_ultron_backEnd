@@ -119,6 +119,24 @@ def build_layered_diamond(branches: int, layers: int, file_count: int, file_size
                             "sleep_length": sleep_length})
 
 
+def max_width(topology: Topology) -> int:
+    """
+    The most nodes of one topology that can run at once: the largest number at one depth
+    (the longest path from the root). Every node of a depth here shares the parents of the
+    others, so no two depths overlap and this is the exact bound.
+    """
+    depth: dict[str, int] = {}
+
+    for node in topology.nodes:      # parents precede children
+        depth[node.key] = 1 + max((depth[p] for p in node.parents), default=-1)
+
+    widths: dict[int, int] = {}
+
+    for d in depth.values():
+        widths[d] = widths.get(d, 0) + 1
+    return max(widths.values(), default=0)
+
+
 def build(kind: str, params) -> Topology:
     """
     Dispatch to a builder by topology kind using a ``ScenarioParams``-like object.

@@ -22,7 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Callable
 
-from .broker import BrokerClient
+from .broker import STATUS_QUEUE, BrokerClient
 from .docker_client import (ContainerRef, DockerClient, StatsRead, counters_went_back,
                             resource_sample, short_window)
 from .metrics import MetricSink
@@ -295,4 +295,7 @@ class StatsSampler:
 
         now = time.time()
         for queue, depth in depths.items():
-            self._sink.record_queue(QueueSample(now, queue, depth))
+            # the status queue's wait tells its expired checks from pending ones
+            waited = (self._broker.oldest_wait(queue, now)
+                      if queue == STATUS_QUEUE and depth else None)
+            self._sink.record_queue(QueueSample(now, queue, depth, waited))

@@ -91,12 +91,14 @@ class FeedRef:
 @dataclass(frozen=True)
 class InstanceRef:
     """
-    A created instance plus the logical node it came from (used to seed timelines).
+    A created instance plus the logical node it came from and the ids of its parents
+    (used to seed timelines).
     """
     instance_id: int
     feed_id: int
     node_key: str
     role: PluginRole
+    parent_ids: tuple[int, ...] = ()
 
 
 # --- measurement events ---------------------------------------------------------------
@@ -121,19 +123,30 @@ class StatusTimeline:
     """
     Client-observed status history for one plugin instance. CUBE keeps no
     transition history (start/end dates are overwritten), so the poller records the
-    wall-clock time each status was *first seen*; resolution = poll cadence.
+    wall-clock time each status was *first seen*, and in ``history`` each change of the
+    status it saw, in order (a status seen again after another is there twice);
+    resolution = poll cadence. The feed and the parents are those the harness created it
+    with (unknown for an unexpected one); ``error_code`` is the one the last read showed
+    (CUBE's ``CODEnn``, blank for none).
     """
     instance_id: int
     node_key: str
     role: Optional[PluginRole]  # None for instances the poller didn't expect
     first_seen: dict[str, float] = field(default_factory=dict)
     final_status: Optional[str] = None
+    feed_id: Optional[int] = None
+    parent_ids: tuple[int, ...] = ()
+    error_code: str = ""
+    history: list[tuple[str, float]] = field(default_factory=list)
 
-    def observe(self, status: str, t: float) -> None:
+    def observe(self, status: str, t: float, error_code: str = "") -> None:
         if status and status not in self.first_seen:
             self.first_seen[status] = t
         if status:
+            if not self.history or self.history[-1][0] != status:
+                self.history.append((status, t))
             self.final_status = status
+            self.error_code = error_code
 
 
 @dataclass(frozen=True)
@@ -210,11 +223,15 @@ def describe_sampler(record: dict) -> str:
 @dataclass(frozen=True)
 class QueueSample:
     """
-    Depth of one Celery broker queue at time ``t`` (backpressure indicator).
+    Depth of one Celery broker queue at time ``t`` (backpressure indicator), and for the
+    ``status`` queue how long its oldest message had waited (``waited_s``: 0 when a worker
+    took its last message between the two reads, ``None`` when the queue was empty or the
+    message had no stamp of when CUBE published it).
     """
     t: float
     queue: str
     depth: int
+    waited_s: Optional[float] = None
 
 
 # --- scenario parameterization & results ----------------------------------------------
@@ -284,6 +301,11 @@ class ScenarioResult:
     # Postgres and db-container counter deltas per window (pg_stats.counter_windows)
     db_counters: dict = field(default_factory=dict)
     sampler: Optional[SamplerSummary] = None
+    # what the services' logs show from the scenario's start to its cleanup's end
+    # (run_bench.log_evidence); {} when Docker could not tell
+    logs: dict = field(default_factory=dict)
+    # the cancellations only a lost update explains (metrics.cancel_evidence)
+    cancels: dict = field(default_factory=dict)
 
 
 @dataclass

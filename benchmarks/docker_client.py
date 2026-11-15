@@ -101,12 +101,16 @@ class DockerClient:
             return {"label": f"com.docker.compose.project={self.project}"}
         return {"label": "com.docker.compose.service"}
 
-    def service_containers(self) -> list:
+    def service_containers(self, all_states: bool = False) -> list:
+        """
+        The stack's service containers that are running, or with ``all_states`` those
+        that have stopped too (a worker that exited still has its log).
+        """
         if not self._docker:
             return []
 
         # a container removed while the listing inspects it is left out, not an error
-        listed = self._docker.containers.list(filters=self._service_filter(),
+        listed = self._docker.containers.list(all=all_states, filters=self._service_filter(),
                                               ignore_removed=True)
         return [c for c in listed
                 if c.labels.get("com.docker.compose.service") not in self.exclude_services]
@@ -198,6 +202,29 @@ class DockerClient:
         except Exception as exc:                       # noqa: BLE001 - best effort
             return f"<could not read logs: {exc}>"
 
+    def log_volume(self, container, since: float, needle: bytes | None = None,
+                   ) -> tuple[int, list[bytes]]:
+        """
+        How many bytes the container logged since the epoch time ``since``, and the lines
+        of those in which ``needle`` occurs, read as a stream so that a log of gigabytes
+        is never held whole. Raises when the engine cannot give the log.
+        """
+        size = 0
+        matches = []
+        tail = b""        # an unfinished last line, kept until its end arrives
+
+        for chunk in container.logs(stream=True, follow=False, since=since):
+            size += len(chunk)
+
+            if needle:
+                lines = (tail + chunk).split(b"\n")
+                tail = lines.pop()
+                matches += [line for line in lines if needle in line]
+
+        if needle and needle in tail:
+            matches.append(tail)
+        return size, matches
+
     def reap_jobs(self) -> int:
         removed = 0
         for c in self.job_containers(all_states=True):
@@ -247,13 +274,26 @@ class DockerClient:
 
         for container in self.service_containers():
             host = container.attrs.get("HostConfig", {}) or {}
-            service = container.labels.get("com.docker.compose.service", container.name)
+            service = service_name(container)
 
             limits[service] = {"cpus": _cpus(host),
                                "mem_limit": host.get("Memory") or None,
                                "memswap_limit": host.get("MemorySwap") or None,
                                "shm_size": host.get("ShmSize") or None}
         return limits
+
+    #: the services whose command line a run records: CUBE's Celery workers and beat
+    CELERY_SERVICE_PREFIXES = ("worker-", "celery-")
+
+    def service_commands(self) -> dict:
+        """
+        The command line each running Celery service container was started with (its
+        concurrency and its queues), as the engine applied it rather than as an
+        environment variable asked.
+        """
+        return {service_name(c): (c.attrs.get("Config", {}) or {}).get("Cmd")
+                for c in self.service_containers()
+                if service_name(c).startswith(self.CELERY_SERVICE_PREFIXES)}
 
     def service_env(self, service: str) -> dict:
         """
@@ -303,6 +343,13 @@ class DockerClient:
             return None
         except Exception as exc:                       # noqa: BLE001 - reported, not raised
             return {"error": str(exc)}
+
+
+def service_name(container) -> str:
+    """
+    The compose service a container runs, or else its own name.
+    """
+    return container.labels.get("com.docker.compose.service", container.name)
 
 
 def image_record(image) -> dict:

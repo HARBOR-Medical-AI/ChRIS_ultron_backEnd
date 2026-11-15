@@ -77,7 +77,8 @@ def poll_to_completion(api: ChrisApi, feed_ids: list[int], instances: list[Insta
                           final_status_counts={})
 
     timelines: dict[int, StatusTimeline] = {
-        ref.instance_id: StatusTimeline(ref.instance_id, ref.node_key, ref.role)
+        ref.instance_id: StatusTimeline(ref.instance_id, ref.node_key, ref.role,
+                                        feed_id=ref.feed_id, parent_ids=ref.parent_ids)
         for ref in instances
     }
     expected = len(timelines)
@@ -86,9 +87,10 @@ def poll_to_completion(api: ChrisApi, feed_ids: list[int], instances: list[Insta
     terminal = timed_out = no_progress = False
 
     while True:
-        statuses = _scan(api, feed_ids)
+        observed = _scan(api, feed_ids)
+        statuses = {iid: status for iid, (status, _) in observed.items()}
 
-        if _record(statuses, timelines):
+        if _record(observed, timelines):
             last_progress = time.monotonic()
         elif progress_probe is not None and progress_probe(statuses):
             last_progress = time.monotonic()
@@ -125,26 +127,31 @@ def poll_to_completion(api: ChrisApi, feed_ids: list[int], instances: list[Insta
     )
 
 
-def _scan(api: ChrisApi, feed_ids: list[int]) -> dict[int, str]:
-    statuses: dict[int, str] = {}
+def _scan(api: ChrisApi, feed_ids: list[int]) -> dict[int, tuple[str, str]]:
+    """
+    Each instance of the feeds with its status and error code (blank for none).
+    """
+    observed: dict[int, tuple[str, str]] = {}
 
     for fid in feed_ids:
         for item in api.get_feed_instances(fid):
             try:
-                statuses[int(item["id"])] = item.get("status") or ""
+                observed[int(item["id"])] = (item.get("status") or "",
+                                             item.get("error_code") or "")
             except (KeyError, ValueError, TypeError):
                 continue
-    return statuses
+    return observed
 
 
-def _record(statuses: dict[int, str], timelines: dict[int, StatusTimeline]) -> bool:
+def _record(observed: dict[int, tuple[str, str]],
+            timelines: dict[int, StatusTimeline]) -> bool:
     """
     Apply a status scan to the timelines; return True if anything advanced.
     """
     now = time.time()
     progressed = False
 
-    for iid, status in statuses.items():
+    for iid, (status, error_code) in observed.items():
         tl = timelines.get(iid)
 
         if tl is None:  # unexpected instance — track it anyway
@@ -154,7 +161,7 @@ def _record(statuses: dict[int, str], timelines: dict[int, StatusTimeline]) -> b
         if status and status not in tl.first_seen:
             progressed = True
 
-        tl.observe(status, now)
+        tl.observe(status, now, error_code)
     return progressed
 
 

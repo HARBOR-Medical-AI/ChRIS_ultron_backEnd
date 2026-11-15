@@ -125,6 +125,8 @@ def collect_environment(docker: DockerClient, *, env: os._Environ | dict | None 
         "envelope": envelope(env),
         # the CPU/memory knobs as the engine applied them, not as the env vars asked
         "limits": docker.service_limits(),
+        # the Celery services' command lines (concurrency, queues) as the engine ran them
+        "commands": docker.service_commands(),
         "postgres": postgres_settings(docker),
         "noise_floor": None,                       # filled by measure_noise_floor()
         "manual_fields": {

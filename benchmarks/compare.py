@@ -232,6 +232,7 @@ def check_comparability(base_env: dict, cand_env: dict) -> Comparability:
                           cand_env.get("envelope") or {}, WARNING, skip=("STORAGE_ENV",))
 
     diffs += _limits_diffs(base_env.get("limits") or {}, cand_env.get("limits") or {})
+    diffs += _commands_diffs(base_env.get("commands") or {}, cand_env.get("commands") or {})
     diffs += _sampler_diffs(base_env.get("sampler") or {}, cand_env.get("sampler") or {})
     diffs += _postgres_diffs(base_env.get("postgres") or {}, cand_env.get("postgres") or {})
 
@@ -333,6 +334,23 @@ def _limits_diffs(base: dict, cand: dict) -> list[FieldDiff]:
                 for name, value in (values or {}).items()}
 
     return _block_diffs("limits", flat(base), flat(cand), WARNING)
+
+
+def _commands_diffs(base: dict, cand: dict) -> list[FieldDiff]:
+    """
+    Cautions for Celery services started with other command lines (``commands.<service>``):
+    another concurrency, or other queues.
+    """
+    unrecorded = _unrecorded("commands", base, cand)
+
+    if unrecorded is not None:
+        return unrecorded
+
+    def joined(commands: dict) -> dict:
+        return {service: " ".join(cmd) if isinstance(cmd, list) else cmd
+                for service, cmd in commands.items()}
+
+    return _block_diffs("commands", joined(base), joined(cand), WARNING)
 
 
 def _sampler_diffs(base: dict, cand: dict) -> list[FieldDiff]:
