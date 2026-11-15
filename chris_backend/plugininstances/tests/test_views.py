@@ -19,7 +19,6 @@ from pfconclient import client as pfcon
 
 from core.models import ChrisFolder, ChrisInstance
 from core.celery import app as celery_app
-from core.celery import task_routes
 from core.storage import connect_storage
 from core.tests.query_counts import QueryCountAssertionsMixin
 from userfiles.models import UserFile
@@ -125,9 +124,8 @@ class TasksViewTests(QueryCountAssertionsMixin, TransactionTestCase):
         logging.disable(logging.WARNING)
         logging.getLogger('plugininstances.tasks').setLevel(logging.CRITICAL)
         super().setUpClass()
-        # route tasks to this worker by using the default 'celery' queue
-        # that is exclusively used for the automated tests
-        celery_app.conf.update(task_routes=None)
+        # the test runner routes every task to the default 'celery' queue that only
+        # the tests use (core/testrunner.py)
         # purge any stale messages from the default queue before starting
         # the worker, so leftover tasks from previous runs don't produce noise
         try:
@@ -144,8 +142,6 @@ class TasksViewTests(QueryCountAssertionsMixin, TransactionTestCase):
     def tearDownClass(cls):
         super().tearDownClass()
         cls.celery_worker.__exit__(None, None, None)
-        # reset routes to the original queues
-        celery_app.conf.update(task_routes=task_routes)
         logging.getLogger('plugininstances.tasks').setLevel(logging.NOTSET)
         logging.disable(logging.NOTSET)
 

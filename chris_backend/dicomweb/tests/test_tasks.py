@@ -154,9 +154,9 @@ class TaskImportSmokeTests(TestCase):
         self.assertEqual(t.name, 'dicomweb.tasks.index_pacs_instance')
 
     def test_task_routed_to_main2(self):
-        from core.celery import app as celery_app
-        routes = celery_app.conf.task_routes or {}
-        entry = routes.get('dicomweb.tasks.index_pacs_instance')
+        # the routing table itself: the test runner switches the app's routes off
+        from core.celery import task_routes
+        entry = task_routes.get('dicomweb.tasks.index_pacs_instance')
         self.assertIsNotNone(entry)
         self.assertEqual(entry.get('queue'), 'main2')
 

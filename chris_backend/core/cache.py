@@ -6,9 +6,9 @@ The shared cache and the coordination helpers built on it.
 evicts when it is full and starts empty after a restart so whatever it holds may go
 missing at any time. All coordination keys created by these helpers expire automatically.
 Do not call cache.clear(): it deletes every key in this cache's Redis logical database,
-not just keys with this application's prefix (Redis/Dragonfly FLUSHDB). A production
-deployment without ``CACHE_URL`` has a ``DummyCache`` instead: nothing is cached, and the
-helpers go ahead without a server.
+not just keys with this application's prefix (Redis/Dragonfly FLUSHDB). The settings take
+the server from a URL (``CACHE_URL`` in production) and move its credentials into
+``OPTIONS`` with ``split_credentials``.
 
 The helpers, all safe to call from any thread or process:
 
@@ -19,11 +19,11 @@ The helpers, all safe to call from any thread or process:
 
 They fail open. When the cache does not answer or refuses a command they go ahead as if
 it had granted it, so whatever a lock or marker guards must stay correct when it runs
-twice. When it does not answer they also log the degraded mode once and stop trying for a
-few seconds, after which one call tries it while the others go on skipping it. A
-release or a clear that cannot reach the cache is kept and the process's next helper calls
-after the cache answers again replay it, a bounded batch each; a process that makes no
-further call leaves it to its TTL.
+twice. When it does not answer they also log the degraded mode, again every few minutes
+while it lasts, and stop trying for a few seconds, after which one call tries it while the
+others go on skipping it. A release or a clear that cannot reach the cache is kept and the
+process's next helper calls after the cache answers again replay it, a bounded batch each;
+a process that makes no further call leaves it to its TTL.
 """
 
 import contextlib
@@ -36,11 +36,11 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit
 
 import redis
 from redis.commands.core import Script
 from django.core.cache import caches
-from django.core.cache.backends.dummy import DummyCache
 from django.core.cache.backends.redis import RedisCache, RedisCacheClient
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import setting_changed
@@ -103,9 +103,9 @@ class Lease:
 
     ``degraded`` is true when the cache did not answer the acquire or refused it so
     the caller goes ahead without the guarantee. ``token`` is None when the acquire
-    sent nothing, the helpers being in their pause after a failure or no cache being
-    configured; otherwise the release removes the lease by its token which also covers
-    a write the server applied after its reply timed out.
+    sent nothing, the helpers being in their pause after a failure; otherwise the
+    release removes the lease by its token which also covers a write the server applied
+    after its reply timed out.
     """
     kind: str  # 'lock' or 'slot'
     key: str
@@ -189,6 +189,73 @@ def release_slot(lease):
     Release a slot ``acquire_slot`` returned. Returns whether this call freed it.
     """
     return _release(lease, 'slot')
+
+
+#: the query-string parameters of a cache URL that redis-py takes as credentials
+CREDENTIAL_PARAMETERS = ('username', 'password', 'ssl_password')
+
+
+def split_credentials(location):
+    """
+    A cache ``LOCATION`` (one URL or several, split at ``;`` and ``,`` as ``RedisCache``
+    splits them) without its credentials, and those credentials as the ``OPTIONS`` that
+    redis-py takes them from when the URL has none: ``username`` and ``password`` from the
+    URL's user part, and the credentials redis-py also reads from its query string, read
+    as it reads them (the first of a repeated parameter, decoded twice).
+
+    Celery's settings dump (``celery report``, ``inspect conf``) masks the value of a key
+    named like a password, such as ``OPTIONS['password']``, but not a password inside the
+    cache's ``LOCATION``; a user name shows either way. Raises ``ImproperlyConfigured``
+    when a URL cannot be parsed, without quoting it, and when the servers have different
+    credentials: one ``OPTIONS`` serves them all.
+    """
+    servers, found = [], set()
+
+    for server in re.split('[;,]', location):
+        try:
+            parts = urlsplit(server)
+        except ValueError:
+            # Python's message quotes the URL's network location, password included
+            raise ImproperlyConfigured(
+                "CACHES['default'] LOCATION is no URL CUBE can parse (percent-encode the "
+                "characters of its credentials)") from None
+
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        credentials = {name: unquote(values[0])
+                       for name, values in parse_qs(parts.query).items()
+                       if name in CREDENTIAL_PARAMETERS}
+
+        # the user part wins over the query string, as in redis-py
+        if parts.username:
+            credentials['username'] = unquote(parts.username)
+        if parts.password:
+            credentials['password'] = unquote(parts.password)
+
+        found.add(tuple(sorted(credentials.items())))
+        rest = [(k, v) for k, v in query if k not in CREDENTIAL_PARAMETERS]
+
+        if '@' in parts.netloc or len(rest) < len(query):
+            # by hand: urlunsplit drops the // of a unix:// URL whose netloc is now empty
+            server = (f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}{parts.path}"
+                      f"{'?' + urlencode(rest) if rest else ''}"
+                      f"{'#' + parts.fragment if parts.fragment else ''}")
+        servers.append(server)
+
+    if len(found) > 1:
+        raise ImproperlyConfigured(
+            "CACHES['default'] LOCATION names servers with different credentials: one "
+            "OPTIONS gives them all the same ones")
+
+    return ','.join(servers), dict(found.pop())
+
+
+def set_location(cache_settings, location):
+    """
+    Point ``cache_settings`` (an entry of ``CACHES``) at ``location``, with the URL's
+    credentials moved into its ``OPTIONS`` (``split_credentials``).
+    """
+    cache_settings['LOCATION'], credentials = split_credentials(location)
+    cache_settings['OPTIONS'] = {**cache_settings.get('OPTIONS', {}), **credentials}
 
 
 def verify_cache_connection(cache_settings, broker_url=None):
@@ -365,6 +432,8 @@ class _CacheHealth:
 
     #: seconds the helpers stop trying after the cache failed to answer
     RETRY_AFTER = 5.0
+    #: seconds between two WARNING lines while the cache stays down
+    REPEAT_WARNING_AFTER = 300.0
     #: releases and clears kept for replay; beyond that the oldest are left to their TTL
     MAX_PENDING = 4096
     #: releases and clears one helper call replays, in one pipeline
@@ -380,9 +449,9 @@ class _CacheHealth:
         self._pending = deque(maxlen=self.MAX_PENDING)
         self._down_since = None
         self._tripped_at = 0.0
+        self._warned_at = 0.0
         self._failed_open = 0
         self._refusals_logged = {}
-        self._no_server_logged = False
 
     def available(self):
         """
@@ -410,6 +479,11 @@ class _CacheHealth:
             self._failed_open += 1
 
     def failed(self, op, error):
+        """
+        A call found the cache not answering: the first of an outage says so, and then one
+        every REPEAT_WARNING_AFTER while it lasts (only one call per RETRY_AFTER tries the
+        cache meanwhile, so this sees the outage at that pace whatever the load).
+        """
         with self._lock:
             now = time.monotonic()
             self._tripped_at = now
@@ -418,10 +492,19 @@ class _CacheHealth:
             if first:
                 self._down_since = now
 
+            repeat = not first and now - self._warned_at >= self.REPEAT_WARNING_AFTER
+            if first or repeat:
+                self._warned_at = now
+            outage, failed_open = now - self._down_since, self._failed_open
+
         if first:
             logger.warning('The shared cache does not answer (%s during %s): CUBE goes '
                            'ahead without its locks, markers and slots until it does',
                            error, op)
+        elif repeat:
+            logger.warning('The shared cache still does not answer after %.0f s (%s '
+                           'during %s): %d calls went ahead without it so far',
+                           outage, error, op, failed_open)
 
     def succeeded(self, started):
         if self._down_since is None:
@@ -461,23 +544,6 @@ class _CacheHealth:
 
         if started is not None:
             self.succeeded(started)
-
-    def no_server(self, op):
-        """
-        No cache is configured (no ``CACHE_URL``): no outage, and nothing will answer, so
-        this says so once per process and only when something first asks for the cache.
-        """
-        if self._no_server_logged:
-            return
-
-        with self._lock:
-            first = not self._no_server_logged
-            self._no_server_logged = True
-
-        if first:
-            logger.warning('No shared cache is configured (no CACHE_URL): %s and the '
-                           'calls after it go ahead without its locks, markers and slots',
-                           op)
 
     def defer(self, release):
         self._pending.append(release)
@@ -560,11 +626,6 @@ def _call(op, command, defer=None):
     the cache is not tried and ``_FAILED`` when it does not answer or refuses. ``defer``
     is a release to replay later when it cannot reach the cache now.
     """
-    # no CACHE_URL: nothing to try, and nothing to keep for later
-    if isinstance(_cache(), DummyCache):
-        _health.no_server(op)
-        return _SKIPPED
-
     if not _health.available():
         _health.skipped()
 
