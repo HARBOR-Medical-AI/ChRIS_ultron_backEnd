@@ -568,7 +568,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
         files_from_json = set([os.path.join(job_output_path, p) for p in
                                json_file_content['rel_file_paths']])
 
-        for i in range(60):  # check for 60 seconds at 1-sec intervals
+        for i in range(60):  # list until every file is there, 60 times at most, 1 s apart
             try:
                 files_in_storage = set(self.storage_manager.ls(job_output_path))
             except Exception as e:
@@ -577,15 +577,16 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 self.c_plugin_inst.error_code = 'CODE15'
                 raise
 
-            if not files_from_json.issubset(files_in_storage):
-                if i == 59:
-                    nmissing = len(files_from_json.difference(files_in_storage))
-                    err_msg = f'Missing {nmissing} files in storage'
-                    logger.error(f'[CODE14,{job_id}]: Inconsistency between received '
-                                 f'JSON file and storage, detail: {err_msg}')
-                    self.c_plugin_inst.error_code = 'CODE14'
-                    raise ValueError(err_msg)
-                time.sleep(1)
+            if files_from_json.issubset(files_in_storage):
+                break
+            if i == 59:
+                nmissing = len(files_from_json.difference(files_in_storage))
+                err_msg = f'Missing {nmissing} files in storage'
+                logger.error(f'[CODE14,{job_id}]: Inconsistency between received '
+                             f'JSON file and storage, detail: {err_msg}')
+                self.c_plugin_inst.error_code = 'CODE14'
+                raise ValueError(err_msg)
+            time.sleep(1)
         self.plugin_inst_output_files = files_from_json
 
     def _handle_unextpath_parameters(self, unextpath_parameters_dict):

@@ -123,6 +123,59 @@ class PluginInstanceAppJobTests(TestCase):
             pluginjobs.PluginInstanceAppJob._assemble_exec(None, 'rust_is_better_than_python', None)
         )
 
+    def _files_check_job(self, *listings):
+        """
+        An app job whose output in a mocked storage lists ``listings`` one after another
+        (the last one from then on), and a job JSON listing 'a.txt' and 'sub/b.txt' in it.
+        """
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        pl_inst = PluginInstance.objects.create(
+            plugin=plugin, owner=user, compute_resource=plugin.compute_resources.all()[0])
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        output = pl_inst.get_output_path()
+        listings = [[f'{output}/{name}' for name in names] for names in listings]
+        job.storage_manager = mock.Mock()
+        job.storage_manager.ls.side_effect = lambda path: (
+            listings.pop(0) if len(listings) > 1 else listings[0])
+        content = {'job_output_path': output, 'rel_file_paths': ['a.txt', 'sub/b.txt']}
+        return job, content
+
+    def test_the_files_check_lists_the_output_once_when_every_file_is_there(self):
+        job, content = self._files_check_job(['a.txt', 'sub/b.txt', 'c.txt'])
+
+        with mock.patch.object(pluginjobs.time, 'sleep') as sleep:
+            job.check_files_from_json_exist(content)
+
+        job.storage_manager.ls.assert_called_once_with(content['job_output_path'])
+        sleep.assert_not_called()
+        self.assertEqual(job.plugin_inst_output_files,
+                         {f"{content['job_output_path']}/a.txt",
+                          f"{content['job_output_path']}/sub/b.txt"})
+
+    def test_the_files_check_lists_again_a_second_later_until_every_file_is_there(self):
+        job, content = self._files_check_job(['a.txt'], ['a.txt'], ['a.txt', 'sub/b.txt'])
+
+        with mock.patch.object(pluginjobs.time, 'sleep') as sleep:
+            job.check_files_from_json_exist(content)
+
+        self.assertEqual(job.storage_manager.ls.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1)] * 2)
+        self.assertEqual(len(job.plugin_inst_output_files), 2)
+
+    def test_the_files_check_fails_with_code14_after_60_listings_a_file_missed(self):
+        job, content = self._files_check_job(['a.txt'])
+
+        with mock.patch.object(pluginjobs.time, 'sleep') as sleep, \
+                self.assertLogs('plugininstances', 'ERROR') as logs, \
+                self.assertRaisesRegex(ValueError, 'Missing 1 files in storage'):
+            job.check_files_from_json_exist(content)
+
+        self.assertIn('[CODE14,', logs.output[0])
+        self.assertEqual(job.storage_manager.ls.call_count, 60)
+        self.assertEqual(sleep.call_count, 59)
+        self.assertEqual(job.c_plugin_inst.error_code, 'CODE14')
+
     def test_plugin_job_can_run_registered_plugin_app(self):
         """
         Test whether the plugin job can run an already registered plugin app.
