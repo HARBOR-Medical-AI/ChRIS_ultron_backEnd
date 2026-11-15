@@ -115,31 +115,46 @@ test-unit-coverage: start-ancillary
 #
 # List the issues Codacy would report as new on this branch.
 [group('(3) development')]
-lint *args: (lint-run 'check' args)
+lint *args: (run-script 'lint.py' 'check' args)
 
 # Ruff fixes unused imports and f-strings without placeholders, with `--unsafe` unused
 # variables too, only where `lint` reports them as new and never on an older issue's line.
 #
 # Fix the new issues Ruff can fix then list what is left.
 [group('(3) development')]
-lint-fix *args: (lint-run 'fix' args)
+lint-fix *args: (run-script 'lint.py' 'fix' args)
 
-# Test scripts/lint.py (scripts/test_lint.py) in the dev image.
+# Ruff's default style on the lines changed since the merge-base with origin/master
+# (uncommitted ones included) and the statements they are in, and on the whole of files
+# new to git; `--base` names another branch. Reformatting a line that carries an older
+# issue makes it new to Codacy: `just lint` comes after. See scripts/reformat.py.
+#
+# Format with Ruff the lines of Python this branch changed.
+[group('(3) development')]
+format *args: (run-script 'reformat.py' 'format' args)
+
+# Print as a diff what `format` would change, and exit 1 if anything.
+[group('(3) development')]
+format-check *args: (run-script 'reformat.py' 'check' args)
+
+# Test the scripts lint.py, reformat.py and repo.py (scripts/test_*.py) in the dev image.
 [group('(3) development')]
 lint-test:
     @just storage={{ storage }} docker-compose --profile=cube run --rm --no-deps -T \
         -v '{{ justfile_directory() }}:/w:z' -w /w -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
         chris python -m unittest discover -s scripts -p 'test_*.py'
 
-# Run scripts/lint.py in the dev image with the repository mounted at /w, and the host's
-# global git excludes (core.excludesFile) so that the files they ignore stay ignored.
+# The repository is mounted at /w, with the host's global git excludes (core.excludesFile)
+# so that the files they ignore stay ignored.
+#
+# Run a script of scripts/ in the dev image.
 [group('helper function')]
-lint-run command *args:
+run-script script command *args:
     @excludes="$(git config --path --get core.excludesFile || echo "${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore")"; \
     just storage={{ storage }} docker-compose --profile=cube run --rm --no-deps -T \
         -v '{{ justfile_directory() }}:/w:z' -w /w -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
         $([ -f "$excludes" ] && echo "-v $excludes:/etc/git-excludes:ro -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=core.excludesFile -e GIT_CONFIG_VALUE_0=/etc/git-excludes") \
-        chris python scripts/lint.py {{ command }} {{ args }}
+        chris python scripts/{{ script }} {{ command }} {{ args }}
 
 # Start dependency services.
 [group('(1) start-up')]

@@ -43,7 +43,10 @@ just lint [--all] [--base REF]  # issues Codacy would call new: files changed si
                           #   with origin/master, uncommitted included; exit 1 on any, 2 if a tool
                           #   failed (scripts/lint.py); advisories marked ? may still be new to Codacy
 just lint-fix [--unsafe]  # Ruff's fixes for the new pyflakes issues only, then lint again
-just lint-test            # scripts/test_lint.py, in the dev image (no stack)
+just format [--base REF]  # Ruff's default style on the lines changed since the merge-base (and
+                          #   the statements they are in), files new to git whole
+                          #   (scripts/reformat.py); `just format-check` prints the diff, exit 1
+just lint-test            # scripts/test_*.py, in the dev image (no stack)
 
 just lock                 # re-resolve both uv.lock files after editing a pyproject.toml
 just lock-upgrade <pkg>   # bump one dependency

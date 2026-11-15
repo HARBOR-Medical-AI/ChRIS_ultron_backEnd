@@ -186,7 +186,9 @@ just lint                 # new issues on this branch, uncommitted changes inclu
 just lint --all           # every issue in the changed files
 just lint-fix             # let Ruff fix new unused imports and f-strings without placeholders
 just lint-fix --unsafe    # ... and unused variables
-just lint-test            # the tests of scripts/lint.py
+just format               # Ruff's default style on the lines this branch changed, new files whole
+just format-check         # what `just format` would change, as a diff
+just lint-test            # the tests of scripts/lint.py, scripts/reformat.py and scripts/repo.py
 ```
 
 An image built before these tools were added says so and needs `just build` first. `just lint`
