@@ -18,7 +18,7 @@ from core.storage import connect_storage
 from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter
 from plugininstances.models import PluginInstance, PathParameter, ComputeResource
-from plugininstances.services import copyjobs
+from plugininstances.services import copyjobs, pluginjobs
 
 
 COMPUTE_RESOURCE_URL = settings.COMPUTE_RESOURCE_URL
@@ -151,6 +151,31 @@ class PluginInstanceCopyJobTests(TestCase):
             copy_job.get_job_status_summary.assert_called_once()
             json_zip2str_mock.assert_called_once()
 
+    def test_run_submit_error_for_a_job_the_remote_has_is_a_submission(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='copying',
+            compute_resource=plugin.compute_resources.all()[0])
+        pl_param = plugin.parameters.all()[0]
+        PathParameter.objects.get_or_create(plugin_inst=pl_inst, plugin_param=pl_param,
+                                            value=self.username)
+        copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
+        # another task submitted it at once: the remote refused the second container
+        copy_job.pfcon_client.submit_job = mock.Mock(
+            side_effect=PfconRequestException('Internal Server Error', code=500))
+        copy_job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'started', 'logs': ''}})
+        copy_job.enqueue_run = mock.Mock()
+
+        with self.assertLogs('plugininstances.services.copyjobs', 'ERROR'):
+            copy_job.run()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.copy_retry_count, db_inst.error_code),
+                         ('copying', 0, ''))
+        copy_job.pfcon_client.submit_job.assert_called_once()
+
     def test_run_skips_when_cancelled(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
@@ -243,12 +268,16 @@ class PluginInstanceCopyJobTests(TestCase):
             plugin=plugin, owner=user, status='copying',
             compute_resource=plugin.compute_resources.all()[0])
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
-        copy_job.schedule_remote_cleanup = mock.Mock()
+        copy_job.enqueue_run = mock.Mock()
 
-        copy_job.cancel_exec()
+        copy_job.cancel_exec('CODE13')
 
+        pl_inst.refresh_from_db()
         self.assertEqual(pl_inst.status, 'cancelled')
-        copy_job.schedule_remote_cleanup.assert_called_once()
+        self.assertEqual(pl_inst.error_code, 'CODE13')
+        # the remote cleanup is armed with the cancellation, and its first job submitted
+        self.assertEqual(pl_inst.remote_cleanup_status, 'deletingData')
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_delete_success(self):
         user = User.objects.get(username=self.username)
@@ -284,17 +313,15 @@ class PluginInstanceCopyJobTests(TestCase):
             plugin=plugin, owner=user, status='copying',
             compute_resource=plugin.compute_resources.all()[0])
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
+        copy_job.enqueue_run = mock.Mock()
 
-        with mock.patch.object(copyjobs, 'PluginInstanceAppJob') as mock_app_job_class:
-            mock_app_job_instance = mock_app_job_class.return_value
-            mock_app_job_instance.run = mock.Mock()
+        copy_job.handle_finished_successfully_status()
 
-            copy_job.handle_finished_successfully_status()
-
-            self.assertEqual(pl_inst.status, 'scheduled')
-            self.assertTrue(pl_inst.summary['pushPath']['status'])
-            mock_app_job_class.assert_called_once_with(pl_inst)
-            mock_app_job_instance.run.assert_called_once()
+        pl_inst.refresh_from_db()
+        self.assertEqual(pl_inst.status, 'scheduled')
+        self.assertTrue(pl_inst.summary['pushPath']['status'])
+        # a status check never submits the app job itself
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob')
 
     def test_handle_finished_with_error_status(self):
         user = User.objects.get(username=self.username)
@@ -303,13 +330,14 @@ class PluginInstanceCopyJobTests(TestCase):
             plugin=plugin, owner=user, status='copying',
             compute_resource=plugin.compute_resources.all()[0])
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
-        copy_job.schedule_remote_cleanup = mock.Mock()
+        copy_job.enqueue_run = mock.Mock()
 
         copy_job.handle_finished_with_error_status()
 
+        pl_inst.refresh_from_db()
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE18')
-        copy_job.schedule_remote_cleanup.assert_called_once()
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_handle_undefined_status_retries(self):
         user = User.objects.get(username=self.username)
@@ -320,12 +348,13 @@ class PluginInstanceCopyJobTests(TestCase):
         pl_inst.copy_retry_count = 0
         pl_inst.save(update_fields=['copy_retry_count'])
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
-        copy_job.run = mock.Mock()
+        copy_job.enqueue_run = mock.Mock()
 
         copy_job.handle_undefined_status()
 
         self.assertEqual(pl_inst.copy_retry_count, 1)
-        copy_job.run.assert_called_once()
+        # submitted again by a task of its own
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceCopyJob')
 
     def test_handle_undefined_status_gives_up(self):
         user = User.objects.get(username=self.username)
@@ -336,13 +365,14 @@ class PluginInstanceCopyJobTests(TestCase):
         pl_inst.copy_retry_count = PluginInstance.MAX_COPY_RETRIES + 1
         pl_inst.save(update_fields=['copy_retry_count'])
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
-        copy_job.schedule_remote_cleanup = mock.Mock()
+        copy_job.enqueue_run = mock.Mock()
 
         copy_job.handle_undefined_status()
 
+        pl_inst.refresh_from_db()
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE18')
-        copy_job.schedule_remote_cleanup.assert_called_once()
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     @tag('integration')
     def test_integration_copy_job_can_run_and_check_exec_status(self):
@@ -368,22 +398,28 @@ class PluginInstanceCopyJobTests(TestCase):
 
         # run the copy job (pfcon downloads input files from swift storage)
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
+        copy_job.enqueue_run = mock.Mock()  # no worker consumes the tests' queue here
         copy_job.run()
         self.assertEqual(pl_inst.status, 'copying')
 
-        # poll copy job status until the copy finishes and the app job is auto-started
+        # poll copy job status until the copy finishes and the app job is scheduled
         maxLoopTries = 10
         currentLoop = 1
         time.sleep(5)
         while currentLoop <= maxLoopTries:
             copy_job.check_exec_status()
-            if pl_inst.status == 'started':
+            if pl_inst.status != 'copying':
                 break
             time.sleep(5)
             currentLoop += 1
         if pl_inst.status == 'cancelled':
             self.storage_manager.delete_obj(user_space_path + 'test.txt')
-            self.skipTest('Copy job failed to transition to started - likely pfcon Docker issue')
+            self.skipTest('Copy job failed to transition to scheduled - likely pfcon Docker issue')
+        self.assertEqual(pl_inst.status, 'scheduled')
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob')
+
+        # the task the status check enqueued submits the app job
+        pluginjobs.PluginInstanceAppJob(pl_inst).run()
         self.assertEqual(pl_inst.status, 'started')
 
         # delete files from storage
@@ -415,13 +451,13 @@ class PluginInstanceCopyJobTests(TestCase):
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
         copy_job.run()
 
-        # cancel the copy job (mock schedule_remote_cleanup to prevent Celery tasks
-        # from being dispatched in a TestCase without a running worker)
-        copy_job.schedule_remote_cleanup = mock.Mock()
+        # cancel the copy job (mock enqueue_run to prevent Celery tasks from being
+        # dispatched in a TestCase without a running worker)
+        copy_job.enqueue_run = mock.Mock()
         copy_job.cancel_exec()
 
         self.assertEqual(pl_inst.status, 'cancelled')
-        copy_job.schedule_remote_cleanup.assert_called_once()
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
         # delete files from storage
         self.storage_manager.delete_obj(user_space_path + 'test.txt')
@@ -451,6 +487,7 @@ class PluginInstanceCopyJobTests(TestCase):
         # run the copy job and poll until the copy finishes (status transitions away
         # from 'copying')
         copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
+        copy_job.enqueue_run = mock.Mock()  # no worker consumes the tests' queue here
         copy_job.run()
         maxLoopTries = 10
         currentLoop = 1

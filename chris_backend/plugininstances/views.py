@@ -15,8 +15,8 @@ from .serializers import (PARAMETER_SERIALIZERS, GenericParameterSerializer,
                           PluginInstanceSplitSerializer, PluginInstanceSerializer)
 from .permissions import (IsOwnerOrChrisOrHasFeedPermissionReadOnlyOrPublicFeedReadOnly,
                           IsNotDeleteFSPluginInstance)
-from .tasks import cancel_plugin_instance_job, delete_plugin_instance
-from .utils import run_if_ready
+from .tasks import delete_plugin_instance
+from .utils import cancel_plugin_instance_tree, cancel_plugin_instances, run_if_ready
 
 
 @extend_schema_view(
@@ -189,18 +189,13 @@ class PluginInstanceDetail(generics.RetrieveUpdateDestroyAPIView):
         """
         Overriden to cancel this plugin instance and all its descendants' execution.
         """
-        if 'status' in self.request.data:
-            instance = self.get_object()
+        if serializer.validated_data.get('status') == 'cancelled':
+            cancelled = cancel_plugin_instance_tree(serializer.instance)
 
-            if instance.status != 'cancelled':
-                descendants = instance.get_descendant_instances()
-
-                if instance.status in ACTIVE_STATUSES:
-                    cancel_plugin_instance_job.delay(instance.id)  # call async task
-
-                PluginInstance.objects.filter(
-                    pk__in=[inst.id for inst in descendants]
-                ).update(status='cancelled')
+            if not cancelled and cancelled.status != 'cancelled':
+                # it ended otherwise since the request read it
+                raise ValidationError({'status': [f"Can not change status from "
+                                                  f"'{cancelled.status}' to 'cancelled'."]})
 
         super(PluginInstanceDetail, self).perform_update(serializer)
 
@@ -212,17 +207,16 @@ class PluginInstanceDetail(generics.RetrieveUpdateDestroyAPIView):
         from storage.
         """
         instance = self.get_object()
-        descendants = instance.get_descendant_instances()
+        cancelled = (cancel_plugin_instance_tree(instance)
+                     if instance.status in ACTIVE_STATUSES else None)
 
-        if instance.status in ACTIVE_STATUSES:
-            cancel_plugin_instance_job(instance.id)
-
-        plg_inst_ids = []
-        for plg_inst in descendants:
-            if plg_inst.status in ACTIVE_STATUSES:
-                plg_inst_ids.append(plg_inst.id)
-
-        PluginInstance.objects.filter(pk__in=plg_inst_ids).update(status='cancelled')
+        if not cancelled and getattr(cancelled, 'status', None) != 'cancelled':
+            # it had ended, or ended meanwhile, and keeps the status it ended with: its
+            # descendants still running go too, from an active status only (the list
+            # holds the instance itself too, as the request read it)
+            cancel_plugin_instances([inst for inst in instance.get_descendant_instances()
+                                     if inst.id != instance.id
+                                     and inst.status in ACTIVE_STATUSES], ACTIVE_STATUSES)
 
         if instance.mark_deletion_pending():
             delete_plugin_instance.delay(instance.id)  # async task

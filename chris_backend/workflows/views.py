@@ -10,8 +10,7 @@ from collectionjson import services
 from pipelines.models import Pipeline
 from plugininstances.models import PluginInstance, PARAMETER_MODELS
 from plugininstances.serializers import PluginInstanceSerializer
-from plugininstances.utils import run_if_ready
-from plugininstances.tasks import cancel_plugin_instance_job
+from plugininstances.utils import cancel_plugin_instances, run_if_ready
 from ._types import (GivenNodeInfo, WorkflowPluginInstanceTemplateFactory,
                      WorkflowPluginInstanceTemplate, PipingId)
 from .models import Workflow, WorkflowFilter
@@ -250,13 +249,7 @@ class WorkflowDetail(generics.RetrieveUpdateDestroyAPIView):
         delete the workflow.
         """
         workflow = self.get_object()
-
-        for plg_inst in workflow.plugin_instances.all():
-            if plg_inst.status == 'started':
-                cancel_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceAppJob')  # call async task
-            
-            plg_inst.status = 'cancelled'
-            plg_inst.save()
+        cancel_plugin_instances(workflow.plugin_instances.all())
         return super(WorkflowDetail, self).destroy(request, *args, **kwargs)
 
 

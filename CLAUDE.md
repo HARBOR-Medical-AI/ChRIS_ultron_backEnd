@@ -193,9 +193,20 @@ Python tools are dev dependencies for `just lint`.
   checked by the permission classes in `plugininstances/permissions.py`.
 - Status state machine in `plugininstances/enums.py` (`created → waiting → copying → scheduled →
   started → uploading → registeringFiles → finishedSuccessfully | finishedWithError |
-  cancelled`). `plugininstances.utils.run_if_ready` decides whether a new instance runs now or
-  waits on its parents; the `periodic` beat tasks in `plugininstances/tasks.py` advance waiting
-  instances, poll running ones, and cancel stuck ones.
+  cancelled`); a cancel through the API (PUT, or the DELETE of an active instance) cancels
+  its descendants too, finished ones included (`plugininstances.utils.
+  cancel_plugin_instance_tree`), while a job or task that cancels an instance leaves its
+  waiting children to the beat, which cancels them. `plugininstances.utils.run_if_ready`
+  decides whether a new instance runs now or waits on its parents; the `periodic` beat tasks in
+  `plugininstances/tasks.py` advance waiting instances, poll running ones, and cancel stuck
+  ones. Several tasks can act on one instance at once, so only `PluginInstance.transition`
+  (and the queryset's `transition`, and `cancel`, which arms the remote cleanup in the same
+  UPDATE when the row is in a status with a remote job, `REMOTE_JOB_STATUSES`) writes
+  `status`: a conditional UPDATE from the statuses the writer expects, after
+  which only the winner does what follows (a guard test in
+  `plugininstances/tests/test_transitions.py` refuses the other writes it can see). Other
+  fields go through `update_if_status`, the remote cleanup through
+  `move_remote_cleanup`/`arm_remote_cleanup`; never save an instance whole.
 - Remote execution goes through pfcon via `plugininstances/services/`: `abstractjobs.
   PluginInstanceJob` handles auth-token refresh and job id prefixing; `PluginInstanceAppJob`,
   `PluginInstanceCopyJob`, `PluginInstanceUploadJob`, `PluginInstanceDeleteJob` are the

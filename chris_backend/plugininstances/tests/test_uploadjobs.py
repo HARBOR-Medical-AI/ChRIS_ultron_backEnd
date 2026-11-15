@@ -8,7 +8,6 @@ from unittest import mock
 from django.test import TestCase, tag
 from django.contrib.auth.models import User
 from django.conf import settings
-from django.db.utils import IntegrityError
 
 from pfconclient import client as pfcon
 from pfconclient.client import JobType
@@ -19,6 +18,7 @@ from core.storage import connect_storage
 from plugins.models import PluginMeta, Plugin, PluginParameter
 from plugininstances.models import PluginInstance, PathParameter, ComputeResource
 from plugininstances.services import uploadjobs
+from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
 
 
@@ -150,13 +150,14 @@ class PluginInstanceUploadJobTests(TestCase):
         pl_inst.save(update_fields=['upload_retry_count'])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
         upload_job._submit = mock.Mock(side_effect=PfconRequestException('test error'))
-        upload_job.schedule_remote_cleanup = mock.Mock()
+        upload_job.job_exists = mock.Mock(return_value=None)  # nor did it create the job
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.run()
 
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE01')
-        upload_job.schedule_remote_cleanup.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_check_exec_status_finished_successfully(self):
         user = User.objects.get(username=self.username)
@@ -237,12 +238,12 @@ class PluginInstanceUploadJobTests(TestCase):
             plugin=plugin, owner=user, status='uploading',
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job.schedule_remote_cleanup = mock.Mock()
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.cancel_exec()
 
         self.assertEqual(pl_inst.status, 'cancelled')
-        upload_job.schedule_remote_cleanup.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_delete_success(self):
         user = User.objects.get(username=self.username)
@@ -271,7 +272,7 @@ class PluginInstanceUploadJobTests(TestCase):
 
         self.assertEqual(pl_inst.error_code, 'CODE12')
 
-    def test_handle_finished_successfully_status_acquires_lock(self):
+    def test_handle_finished_successfully_status_registers_the_files(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
@@ -283,28 +284,28 @@ class PluginInstanceUploadJobTests(TestCase):
 
         with mock.patch('plugininstances.services.pluginjobs.PluginInstanceAppJob') as mock_cls:
             mock_app_job = mock_cls.return_value
-            mock_app_job.register_output_files_on_success = mock.Mock()
 
             upload_job.handle_finished_successfully_status()
 
             self.assertEqual(pl_inst.status, 'registeringFiles')
             mock_cls.assert_called_once_with(pl_inst)
-            mock_app_job.register_output_files_on_success.assert_called_once()
+            mock_app_job.register_output.assert_called_once_with('finishedSuccessfully')
 
-    def test_handle_finished_successfully_status_lock_already_held(self):
+    def test_handle_finished_successfully_status_moved_on_by_another_task(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
             plugin=plugin, owner=user, status='uploading',
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
+        upload_job._get_status = mock.Mock()
+        # an overlapping status check got there first
+        PluginInstance.objects.filter(pk=pl_inst.pk).transition('registeringFiles',
+                                                                'uploading')
 
-        with mock.patch.object(uploadjobs.PluginInstanceLock, 'save',
-                               side_effect=IntegrityError()):
-            upload_job.handle_finished_successfully_status()
+        upload_job.handle_finished_successfully_status()
 
-        pl_inst.refresh_from_db()
-        self.assertEqual(pl_inst.status, 'registeringFiles')
+        upload_job._get_status.assert_not_called()  # nothing registered twice
 
     def test_handle_finished_successfully_status_pfcon_error_on_plugin_status(self):
         user = User.objects.get(username=self.username)
@@ -314,13 +315,13 @@ class PluginInstanceUploadJobTests(TestCase):
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
         upload_job._get_status = mock.Mock(side_effect=PfconRequestException('test error'))
-        upload_job.schedule_remote_cleanup = mock.Mock()
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.handle_finished_successfully_status()
 
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE02')
-        upload_job.schedule_remote_cleanup.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_handle_finished_with_error_status(self):
         user = User.objects.get(username=self.username)
@@ -329,13 +330,13 @@ class PluginInstanceUploadJobTests(TestCase):
             plugin=plugin, owner=user, status='uploading',
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job.schedule_remote_cleanup = mock.Mock()
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.handle_finished_with_error_status()
 
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE18')
-        upload_job.schedule_remote_cleanup.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_handle_undefined_status_retries(self):
         user = User.objects.get(username=self.username)
@@ -346,12 +347,12 @@ class PluginInstanceUploadJobTests(TestCase):
         pl_inst.upload_retry_count = 0
         pl_inst.save(update_fields=['upload_retry_count'])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job.run = mock.Mock()
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.handle_undefined_status()
 
         self.assertEqual(pl_inst.upload_retry_count, 1)
-        upload_job.run.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceUploadJob')
 
     def test_handle_undefined_status_gives_up(self):
         user = User.objects.get(username=self.username)
@@ -362,13 +363,13 @@ class PluginInstanceUploadJobTests(TestCase):
         pl_inst.upload_retry_count = PluginInstance.MAX_UPLOAD_RETRIES + 1
         pl_inst.save(update_fields=['upload_retry_count'])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job.schedule_remote_cleanup = mock.Mock()
+        upload_job.enqueue_run = mock.Mock()
 
         upload_job.handle_undefined_status()
 
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE18')
-        upload_job.schedule_remote_cleanup.assert_called_once()
+        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     @tag('integration')
     def test_integration_upload_job_can_run_and_check_exec_status(self):
@@ -391,14 +392,19 @@ class PluginInstanceUploadJobTests(TestCase):
         PathParameter.objects.create(plugin_inst=pl_inst, plugin_param=pl_param,
                                      value=user_space_path)
 
-        # run the plugin app job; when it finishes at pfcon,
-        # handle_finished_successfully_status auto-calls upload_job.run()
-        # (because compute_requires_upload_job=True) and sets status='uploading'
+        # run the plugin app job; when it finishes at pfcon its status check sets
+        # status='uploading' (because compute_requires_upload_job=True) and enqueues the
+        # upload job
+        # no worker consumes the tests' queue here: the test submits each job itself, as
+        # the task that a status check enqueues would
+        enqueue = mock.patch.object(PluginInstanceJob, 'enqueue_run')
+        enqueue.start()
+        self.addCleanup(enqueue.stop)
         app_job = PluginInstanceAppJob(pl_inst)
         app_job.run()
 
         # poll app job until pfcon reports finishedSuccessfully (which transitions
-        # status to 'uploading' and auto-submits the upload job)
+        # status to 'uploading')
         for _ in range(20):
             time.sleep(5)
             str_status = app_job.check_exec_status()
@@ -410,6 +416,7 @@ class PluginInstanceUploadJobTests(TestCase):
 
         # poll the upload job until the plugin instance reaches 'finishedSuccessfully'
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
+        upload_job.run()
         for _ in range(20):
             time.sleep(5)
             upload_job.check_exec_status()
@@ -441,8 +448,13 @@ class PluginInstanceUploadJobTests(TestCase):
         PathParameter.objects.create(plugin_inst=pl_inst, plugin_param=pl_param,
                                      value=user_space_path)
 
-        # run the plugin app job; handle_finished_successfully_status auto-submits
-        # the upload job (compute_requires_upload_job=True) → status='uploading'
+        # run the plugin app job; its status check moves it to 'uploading'
+        # (compute_requires_upload_job=True)
+        # no worker consumes the tests' queue here: the test submits each job itself, as
+        # the task that a status check enqueues would
+        enqueue = mock.patch.object(PluginInstanceJob, 'enqueue_run')
+        enqueue.start()
+        self.addCleanup(enqueue.stop)
         app_job = PluginInstanceAppJob(pl_inst)
         app_job.run()
 
@@ -457,6 +469,7 @@ class PluginInstanceUploadJobTests(TestCase):
 
         # poll the upload job until it finishes (transitions away from 'uploading')
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
+        upload_job.run()
         for _ in range(20):
             time.sleep(5)
             upload_job.check_exec_status()

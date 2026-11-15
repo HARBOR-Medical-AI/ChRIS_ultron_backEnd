@@ -11,6 +11,7 @@ from django.contrib.auth.models import User
 from django.conf import settings
 
 from pfconclient import client as pfcon
+from pfconclient.exceptions import PfconRequestException
 
 from core.models import ChrisInstance, ChrisFolder, ChrisLinkFile
 from core.storage import connect_storage
@@ -18,6 +19,7 @@ from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter
 from plugininstances.models import PluginInstance, PathParameter, ComputeResource
 from plugininstances.services import pluginjobs, copyjobs
+from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.uploadjobs import PluginInstanceUploadJob
 
 
@@ -231,28 +233,36 @@ class PluginInstanceAppJobTests(TestCase):
         PathParameter.objects.get_or_create(plugin_inst=pl_inst, plugin_param=pl_param,
                                             value=user_space_path)
 
+        # no worker consumes the tests' queue here: the test submits each job itself, as
+        # the task that a status check enqueues would
+        enqueue = mock.patch.object(PluginInstanceJob, 'enqueue_run')
+        enqueue.start()
+        self.addCleanup(enqueue.stop)
+
         # run the copy job
         plg_inst_copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
         plg_inst_copy_job.run()
         self.assertEqual(pl_inst.status, 'copying')
 
-        # poll copy job status until it finishes and auto-transitions to app job
+        # poll copy job status until it finishes and the app job is scheduled
         maxLoopTries = 10
         currentLoop = 1
         time.sleep(5)
         while currentLoop <= maxLoopTries:
             plg_inst_copy_job.check_exec_status()
-            if pl_inst.status == 'started':
+            if pl_inst.status != 'copying':
                 break
             time.sleep(5)
             currentLoop += 1
         if pl_inst.status == 'cancelled':
             self.storage_manager.delete_obj(user_space_path + 'test.txt')
-            self.skipTest('Copy job failed to transition to started - likely pfcon Docker issue')
-        self.assertEqual(pl_inst.status, 'started')
+            self.skipTest('Copy job failed to transition to scheduled - likely pfcon Docker issue')
+        self.assertEqual(pl_inst.status, 'scheduled')
 
-        # poll app job until it finishes or transitions to uploading
+        # run the app job and poll it until it finishes or transitions to uploading
         plg_inst_app_job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        plg_inst_app_job.run()
+        self.assertEqual(pl_inst.status, 'started')
         maxLoopTries = 10
         currentLoop = 1
         b_checkAgain = True
@@ -271,6 +281,7 @@ class PluginInstanceAppJobTests(TestCase):
         # poll the upload job until finishedSuccessfully
         if pl_inst.status == 'uploading':
             upload_job = PluginInstanceUploadJob(pl_inst)
+            upload_job.run()
             maxLoopTries = 10
             currentLoop = 1
             time.sleep(5)
@@ -351,67 +362,152 @@ class PluginInstanceAppJobTests(TestCase):
         # delete files from storage
         self.storage_manager.delete_path(outputdir)
 
-    def _create_started_plugin_inst(self):
+    def _create_plugin_inst(self, status='registeringFiles'):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
-            plugin=plugin, owner=user, status='started',
+            plugin=plugin, owner=user, status=status,
             compute_resource=plugin.compute_resources.all()[0])
         return pl_inst
 
-    def test_register_output_files_on_success_persists_size(self):
+    def _registering_job(self, pl_inst, size):
+        """
+        An app job for ``pl_inst`` whose remote fetch is bypassed and whose registration
+        finds ``size`` bytes.
+        """
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job._get_job_zip_data = mock.Mock(return_value=b'')
+        job._get_job_json_data = mock.Mock(return_value={})
+        job.unpack_zip_file = mock.Mock()
+        job.check_files_from_json_exist = mock.Mock()
+        job.enqueue_run = mock.Mock()
+        job._register_output_files = mock.Mock(
+            side_effect=lambda: setattr(pl_inst, 'size', pl_inst.size + size))
+        return job
+
+    def test_register_output_on_success_persists_size(self):
         """
         Test whether the size accumulated while registering output files is saved
         to the DB. Regression test: 'size' was missing from the closing save's
         update_fields, so every instance reported size=0 through the API.
         """
-        pl_inst = self._create_started_plugin_inst()
-        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 1024)
 
-        # bypass the remote fetch and cleanup; exercise registration -> final save
-        job._get_job_zip_data = mock.Mock(return_value=b'')
-        job._get_job_json_data = mock.Mock(return_value={})
-        job.unpack_zip_file = mock.Mock()
-        job.check_files_from_json_exist = mock.Mock()
-        job.schedule_remote_cleanup = mock.Mock()
-        job._register_output_files = mock.Mock(
-            side_effect=lambda: setattr(pl_inst, 'size', pl_inst.size + 1024))
-
-        job.register_output_files_on_success()
+        job.register_output('finishedSuccessfully')
 
         self.assertEqual(pl_inst.status, 'finishedSuccessfully')
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)   # fresh DB fetch
         self.assertEqual(db_inst.status, 'finishedSuccessfully')
         self.assertEqual(db_inst.size, 1024)
+        # the remote cleanup is armed with the final status
+        self.assertEqual(db_inst.remote_cleanup_status, 'deletingData')
+        job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
-    def test_register_output_files_on_error_persists_size(self):
+    def test_register_output_on_error_persists_size(self):
         """
         Same regression as above for the error path: files registered before the
         job is marked finishedWithError must still have their size persisted.
         """
-        pl_inst = self._create_started_plugin_inst()
-        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 512)
 
-        job._get_job_zip_data = mock.Mock(return_value=b'')
-        job._get_job_json_data = mock.Mock(return_value={})
-        job.unpack_zip_file = mock.Mock()
-        job.check_files_from_json_exist = mock.Mock()
-        job.schedule_remote_cleanup = mock.Mock()
-        job._register_output_files = mock.Mock(
-            side_effect=lambda: setattr(pl_inst, 'size', pl_inst.size + 512))
-
-        job.register_output_files_on_error()
+        job.register_output('finishedWithError')
 
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)
         self.assertEqual(db_inst.status, 'finishedWithError')
         self.assertEqual(db_inst.size, 512)
+
+    def test_register_output_of_a_job_that_did_not_end_cancels_with_code10(self):
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 1)
+
+        with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR') as logs:
+            job.register_output('started')
+
+        self.assertIn('[CODE10,', logs.output[0])
+        db_inst = PluginInstance.objects.get(pk=pl_inst.id)
+        self.assertEqual((db_inst.status, db_inst.error_code), ('cancelled', 'CODE10'))
+        job._register_output_files.assert_not_called()
+
+    def test_a_cancel_that_lands_during_registration_survives_its_final_write(self):
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 64)
+
+        def cancelled_meanwhile():
+            pl_inst.size += 64
+            # the API cancels the instance while its files are being registered
+            PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled',
+                                                                    'registeringFiles')
+        job._register_output_files = mock.Mock(side_effect=cancelled_meanwhile)
+
+        job.register_output('finishedSuccessfully')
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.id)
+        self.assertEqual(db_inst.status, 'cancelled')
+        self.assertEqual(db_inst.size, 0)  # the registration that lost wrote nothing
+        job.enqueue_run.assert_not_called()  # nor scheduled the cleanup
+
+    def test_a_stale_started_object_cannot_move_a_cancelled_instance_on(self):
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)   # holds 'started'
+        job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'finishedSuccessfully', 'logs': ''}})
+        job.register_output = mock.Mock()
+        job.enqueue_run = mock.Mock()
+        PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled', 'started')
+
+        status = job.check_exec_status()
+
+        self.assertEqual(status, 'cancelled')
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).status, 'cancelled')
+        job.register_output.assert_not_called()
+        job.enqueue_run.assert_not_called()
+
+    def test_submitting_a_job_another_task_submitted_does_not_cancel_it(self):
+        pl_inst = self._create_plugin_inst('scheduled')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        # the remote refused a second container for the job, which exists
+        job.pfcon_client.submit_job = mock.Mock(
+            side_effect=PfconRequestException('Internal Server Error', code=500))
+        job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'started', 'logs': ''}})
+        job.get_cmd_args = mock.Mock(return_value=[])
+        job.enqueue_run = mock.Mock()
+
+        # the refused submission is logged (with a traceback here: this compute resource
+        # takes the legacy path, which retries with a new token)
+        with self.assertLogs('plugininstances.services', 'ERROR'):
+            job.run()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.error_code), ('started', ''))
+        job.enqueue_run.assert_not_called()
+
+    def test_a_job_submitted_after_its_instance_was_cancelled_gets_cleaned_up(self):
+        pl_inst = self._create_plugin_inst('scheduled')
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            status='cancelled', remote_cleanup_status='complete')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)   # holds 'scheduled'
+        job.pfcon_client.submit_job = mock.Mock(return_value={
+            'compute': {'status': 'started', 'logs': ''}})
+        job.get_cmd_args = mock.Mock(return_value=[])
+        job.enqueue_run = mock.Mock()
+
+        job.run()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual(db_inst.status, 'cancelled')
+        # a cleanup that completed before the job existed is started again
+        self.assertEqual(db_inst.remote_cleanup_status, 'deletingData')
+        job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_create_chris_link_file_refuses_unauthorized_path(self):
         """
         Test whether _create_chris_link_file refuses to create a link file to a
         path the plugin instance owner is not allowed to access.
         """
-        pl_inst = self._create_started_plugin_inst()
+        pl_inst = self._create_plugin_inst('started')
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
 
         other = User.objects.create_user(username='other', password='other-pass')
@@ -436,7 +532,7 @@ class PluginInstanceAppJobTests(TestCase):
         Test whether find_all_storage_object_paths refuses to follow a ChRIS link
         file pointing to a path the plugin instance owner is not allowed to access.
         """
-        pl_inst = self._create_started_plugin_inst()
+        pl_inst = self._create_plugin_inst('started')
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
 
         other = User.objects.create_user(username='other', password='other-pass')
@@ -469,7 +565,7 @@ class PluginInstanceAppJobTests(TestCase):
         pointing to a path the plugin instance owner is allowed to access.
         """
         user = User.objects.get(username=self.username)
-        pl_inst = self._create_started_plugin_inst()
+        pl_inst = self._create_plugin_inst('started')
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
 
         linked_path = 'home/%s/uploads' % self.username
@@ -548,7 +644,7 @@ class PluginInstanceAppJobTests(TestCase):
         propagates the exception) when a refused remote link file cannot be
         deleted from storage.
         """
-        pl_inst = self._create_started_plugin_inst()
+        pl_inst = self._create_plugin_inst('started')
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
         outputdir = pl_inst.get_output_path()
 

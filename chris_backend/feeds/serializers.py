@@ -124,6 +124,8 @@ class FeedSerializer(serializers.HyperlinkedModelSerializer):
                   'deletion_status', 'deletion_requested_at', 'deletion_error', 'folder',
                   'note', 'group_permissions', 'user_permissions', 'tags', 'taggings',
                   'comments', 'plugin_instances', 'owner')
+        # the deletion's state is the deletion tasks' to write
+        read_only_fields = ('deletion_status', 'deletion_requested_at', 'deletion_error')
 
     def update(self, instance, validated_data):
         """

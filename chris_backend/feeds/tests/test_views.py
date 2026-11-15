@@ -400,6 +400,20 @@ class FeedDetailViewTests(TasksViewTests):
         self.assertTrue(feed.public)
         feed.remove_public_access()
 
+    def test_feed_update_leaves_the_deletion_state_alone(self):
+        put = json.dumps({"template": {"data": [
+            {"name": "name", "value": "Updated"},
+            {"name": "deletion_status", "value": "pending"},
+            {"name": "deletion_error", "value": "forged"}]}})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        feed = Feed.objects.get(name="Updated")
+        self.assertEqual((feed.deletion_status, feed.deletion_error), ('inactive', ''))
+
     def test_feed_update_failure_unauthenticated(self):
         response = self.client.put(self.read_update_delete_url, data=self.put,
                                    content_type=self.content_type)

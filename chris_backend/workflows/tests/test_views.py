@@ -161,7 +161,7 @@ class WorkflowListViewTests(ViewTests):
                                             "compute_resource_name": "host"}])}]}})
 
         plg_instances_count = PluginInstance.objects.count()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job'):
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(self.create_read_url, data=post,
                                         content_type=self.content_type)
@@ -202,7 +202,7 @@ class WorkflowListViewTests(ViewTests):
                                          "title": "Inst_ts",
                                          "compute_resource_name": "host"}])}]}})
 
-        with mock.patch('plugininstances.utils.run_plugin_instance_job'):
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job'):
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(self.create_read_url, data=post,
                                         content_type=self.content_type)
@@ -285,6 +285,7 @@ class WorkflowDetailViewTests(ViewTests):
         owner = User.objects.get(username=self.username)
         (workflow, tf) = Workflow.objects.get_or_create(
             title='Workflow2', pipeline=pipeline, owner=owner)
+        self.workflow = workflow
         self.read_update_delete_url = reverse("workflow-detail",
                                               kwargs={"pk": workflow.id})
 
@@ -328,6 +329,28 @@ class WorkflowDetailViewTests(ViewTests):
         response = self.client.delete(self.read_update_delete_url)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(Workflow.objects.count(), 0)
+
+    def test_workflow_delete_cancels_its_instances_and_arms_their_remote_cleanup(self):
+        owner = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        instances = {}
+        for status_ in ('started', 'finishedSuccessfully'):
+            inst = PluginInstance.objects.create(
+                plugin=plugin, owner=owner, workflow=self.workflow, title=status_,
+                compute_resource=self.compute_resource)
+            PluginInstance.objects.filter(pk=inst.pk).update(status=status_)
+            instances[status_] = inst.pk
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.delete(self.read_update_delete_url)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        rows = dict((pk, (s, c)) for pk, s, c in PluginInstance.objects.filter(
+            pk__in=instances.values()).values_list('pk', 'status', 'remote_cleanup_status'))
+        # the one that had a job in the remote gets its cleanup armed in the same UPDATE
+        self.assertEqual(rows, {instances['started']: ('cancelled', 'deletingData'),
+                                instances['finishedSuccessfully']: ('cancelled',
+                                                                    'notStarted')})
 
     def test_workflow_delete_failure_unauthenticated(self):
         response = self.client.delete(self.read_update_delete_url)

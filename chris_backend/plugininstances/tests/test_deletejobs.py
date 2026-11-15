@@ -19,6 +19,7 @@ from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter
 from plugininstances.models import PluginInstance, PathParameter, ComputeResource
 from plugininstances.services import deletejobs
+from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.copyjobs import PluginInstanceCopyJob
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
 from plugininstances.services.uploadjobs import PluginInstanceUploadJob
@@ -126,14 +127,55 @@ class PluginInstanceDeleteJobTests(TestCase):
             pl_inst.save(update_fields=['remote_cleanup_status'])
             delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
             delete_job.get_job_status_summary = mock.Mock(return_value='summary')
-            delete_job.pfcon_client.submit_job = mock.Mock(return_value='dictionary')
+            delete_job.pfcon_client.submit_job = mock.Mock(
+                return_value={'compute': {'status': 'notStarted'}})
 
             delete_job.run()
 
+            pl_inst.refresh_from_db()
             self.assertEqual(pl_inst.summary, 'summary')
             self.assertEqual(pl_inst.raw, 'raw')
+            self.assertEqual(pl_inst.remote_cleanup_status, 'deletingData')
             delete_job.pfcon_client.submit_job.assert_called_once()
             json_zip2str_mock.assert_called_once()
+
+    def test_run_that_pfcon_skips_moves_on_to_the_containers(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='finishedSuccessfully',
+            compute_resource=plugin.compute_resources.all()[0])
+        pl_inst.remote_cleanup_status = 'deletingData'
+        pl_inst.save(update_fields=['remote_cleanup_status'])
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        # with no data of the job's left pfcon creates no container: today's code then
+        # polled a job that does not exist, and submitted it again every minute
+        delete_job.pfcon_client.submit_job = mock.Mock(return_value={'compute': {
+            'status': 'finishedSuccessfully', 'message': 'deleteSkipped', 'logs': ''}})
+        delete_job.handle_finished_successfully_status = mock.Mock()
+
+        delete_job.run()
+
+        delete_job.handle_finished_successfully_status.assert_called_once()
+
+    def test_run_refused_while_a_job_still_runs_waits_without_a_retry(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='cancelled',
+            compute_resource=plugin.compute_resources.all()[0])
+        pl_inst.remote_cleanup_status = 'deletingData'
+        pl_inst.save(update_fields=['remote_cleanup_status'])
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        delete_job.pfcon_client.submit_job = mock.Mock(side_effect=PfconRequestException(
+            'The plugin job is still active', code=409))
+
+        for _ in range(PluginInstance.MAX_REMOTE_CLEANUP_RETRIES + 2):
+            delete_job.run()
+
+        pl_inst.refresh_from_db()
+        self.assertEqual(pl_inst.remote_cleanup_retry_count, 0)
+        self.assertEqual(pl_inst.remote_cleanup_status, 'deletingData')
 
     def test_run_skips_when_not_deleting_data(self):
         user = User.objects.get(username=self.username)
@@ -161,11 +203,13 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.save(update_fields=['remote_cleanup_status', 'remote_cleanup_retry_count'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.pfcon_client.submit_job = mock.Mock(side_effect=PfconRequestException('test error'))
-        delete_job._increment_retry_or_fail = mock.Mock()
+        delete_job._count_failure = mock.Mock(return_value=False)
 
         delete_job.run()
 
-        delete_job._increment_retry_or_fail.assert_called_once()
+        # counted, and left to the periodic task rather than submitted again at once
+        delete_job._count_failure.assert_called_once()
+        delete_job.pfcon_client.submit_job.assert_called_once()
 
     def test_check_exec_status_finished_successfully(self):
         user = User.objects.get(username=self.username)
@@ -250,6 +294,88 @@ class PluginInstanceDeleteJobTests(TestCase):
 
         delete_job.run.assert_called_once()
 
+    def test_without_copy_jobs_a_404_or_409_is_raised_with_no_token_refresh(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='cancelled',
+            compute_resource=plugin.compute_resources.all()[0])
+        job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        job.pfcon_client.requires_copy_job = False  # the legacy path
+        job._refresh_compute_resource_auth_token = mock.Mock()
+        job_id = job.str_job_id
+        calls = {'submit_job': lambda: job._submit(JobType.DELETE, job_id, {}),
+                 'get_job_status': lambda: job._get_status(JobType.DELETE, job_id),
+                 'delete_job': lambda: job._delete(JobType.DELETE, job_id)}
+
+        for method, call in calls.items():
+            for code in (404, 409):
+                with self.subTest(method=method, code=code):
+                    client = mock.Mock(side_effect=PfconRequestException('x', code=code))
+                    setattr(job.pfcon_client, method, client)
+
+                    with self.assertRaises(PfconRequestException):
+                        call()
+                    client.assert_called_once()  # pfcon took the token: no retry
+
+        job._refresh_compute_resource_auth_token.assert_not_called()
+
+        # an aborted connection, with no answer, may still hide a stale token
+        job.pfcon_client.get_job_status = mock.Mock(side_effect=[
+            PfconRequestException('Connection aborted'), {'compute': {}}])
+        with self.assertLogs('plugininstances.services.abstractjobs', 'ERROR'):
+            self.assertEqual(calls['get_job_status'](), {'compute': {}})
+        job._refresh_compute_resource_auth_token.assert_called_once_with()
+
+    def test_a_delete_job_not_submitted_yet_is_submitted_without_an_error(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='cancelled',
+            compute_resource=plugin.compute_resources.all()[0])
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            remote_cleanup_status='deletingData')
+        pl_inst.refresh_from_db()
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        delete_job._get_status = mock.Mock(
+            side_effect=PfconRequestException('Not Found', code=404))
+        delete_job.run = mock.Mock()
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, logging.WARNING)
+
+        with self.assertLogs('plugininstances.services.deletejobs', 'INFO') as logs:
+            delete_job.check_exec_status()
+
+        self.assertNotIn('ERROR', [r.levelname for r in logs.records])
+        self.assertIn('not submitted yet', logs.output[-1])
+        delete_job.run.assert_called_once()
+
+    def test_a_completion_stopped_in_its_work_leaves_the_cleanup_running(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='cancelled',
+            compute_resource=plugin.compute_resources.all()[0])
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            remote_cleanup_status='deletingContainers')
+        pl_inst.refresh_from_db()
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        delete_job._plugin_job_active = mock.Mock(return_value=False)
+        delete_job._cleanup_plugin_instance_output_dir = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock(side_effect=RuntimeError('killed'))
+
+        with self.assertRaises(RuntimeError):
+            delete_job.complete('complete')
+        # the periodic task still sees it running, and ends it at its next pass
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).remote_cleanup_status,
+                         'deletingContainers')
+
+        delete_job._grant_feed_permissions.side_effect = None
+        self.assertTrue(delete_job.complete('complete'))
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).remote_cleanup_status,
+                         'complete')
+        self.assertEqual(delete_job._cleanup_plugin_instance_output_dir.call_count, 2)
+
     def test_cancel_exec(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
@@ -303,12 +429,16 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.save(update_fields=['remote_cleanup_status'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.delete_all_remote_containers = mock.Mock(return_value=True)
-        delete_job.save_plugin_instance_final_status = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock()
+        delete_job._cleanup_plugin_instance_output_dir = mock.Mock()
 
         delete_job.handle_finished_successfully_status()
 
+        pl_inst.refresh_from_db()
         self.assertEqual(pl_inst.remote_cleanup_status, 'complete')
-        delete_job.save_plugin_instance_final_status.assert_called_once()
+        self.assertEqual(pl_inst.status, 'finishedSuccessfully')
+        delete_job._grant_feed_permissions.assert_called_once()
+        delete_job._cleanup_plugin_instance_output_dir.assert_not_called()
 
     def test_handle_finished_successfully_status_cancelled_cleans_output(self):
         user = User.objects.get(username=self.username)
@@ -321,11 +451,56 @@ class PluginInstanceDeleteJobTests(TestCase):
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.delete_all_remote_containers = mock.Mock(return_value=True)
         delete_job._cleanup_plugin_instance_output_dir = mock.Mock()
-        delete_job.save_plugin_instance_final_status = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock()
+        delete_job._get_status = mock.Mock(
+            side_effect=PfconRequestException('not found', code=404))
 
         delete_job.handle_finished_successfully_status()
 
         delete_job._cleanup_plugin_instance_output_dir.assert_called_once()
+
+    def test_the_output_of_a_cancelled_job_that_still_runs_stays(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='cancelled',
+            compute_resource=plugin.compute_resources.all()[0])
+        pl_inst.remote_cleanup_status = 'deletingContainers'
+        pl_inst.save(update_fields=['remote_cleanup_status'])
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        delete_job._cleanup_plugin_instance_output_dir = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock()
+
+        for answer in ({'compute': {'status': 'started'}},
+                       PfconRequestException('timed out')):
+            with self.subTest(answer=answer):
+                delete_job._get_status = mock.Mock(
+                    **({'side_effect': answer} if isinstance(answer, Exception)
+                       else {'return_value': answer}))
+                PluginInstance.objects.filter(pk=pl_inst.pk).update(
+                    remote_cleanup_status='deletingContainers')
+
+                self.assertTrue(delete_job.complete('failed'))
+
+                delete_job._cleanup_plugin_instance_output_dir.assert_not_called()
+
+    def test_a_cleanup_ends_once(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='finishedSuccessfully',
+            compute_resource=plugin.compute_resources.all()[0])
+        pl_inst.remote_cleanup_status = 'deletingContainers'
+        pl_inst.save(update_fields=['remote_cleanup_status'])
+        # the status check and the periodic container deletion, each with its own object
+        jobs = [deletejobs.PluginInstanceDeleteJob(PluginInstance.objects.get(pk=pl_inst.pk))
+                for _ in range(2)]
+        for job in jobs:
+            job._grant_feed_permissions = mock.Mock()
+
+        self.assertEqual([job.complete('complete') for job in jobs], [True, False])
+
+        jobs[1]._grant_feed_permissions.assert_not_called()
 
     def test_handle_finished_successfully_status_container_delete_fails(self):
         user = User.objects.get(username=self.username)
@@ -351,11 +526,13 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.remote_cleanup_status = 'deletingData'
         pl_inst.save(update_fields=['remote_cleanup_status'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
-        delete_job._increment_retry_or_fail = mock.Mock()
+        delete_job._count_failure = mock.Mock(return_value=False)
+        delete_job.run = mock.Mock()
 
         delete_job.handle_finished_with_error_status()
 
-        delete_job._increment_retry_or_fail.assert_called_once()
+        delete_job._count_failure.assert_called_once()
+        delete_job.run.assert_called_once()
 
     def test_handle_undefined_status(self):
         user = User.objects.get(username=self.username)
@@ -366,13 +543,15 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.remote_cleanup_status = 'deletingData'
         pl_inst.save(update_fields=['remote_cleanup_status'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
-        delete_job._increment_retry_or_fail = mock.Mock()
+        delete_job._count_failure = mock.Mock(return_value=True)  # the last retry
+        delete_job.run = mock.Mock()
 
         delete_job.handle_undefined_status()
 
-        delete_job._increment_retry_or_fail.assert_called_once()
+        delete_job._count_failure.assert_called_once()
+        delete_job.run.assert_not_called()
 
-    def test_increment_retry_or_fail_retries(self):
+    def test_count_failure_counts(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
@@ -384,12 +563,12 @@ class PluginInstanceDeleteJobTests(TestCase):
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.run = mock.Mock()
 
-        delete_job._increment_retry_or_fail()
+        self.assertFalse(delete_job._count_failure())
 
         self.assertEqual(pl_inst.remote_cleanup_retry_count, 1)
-        delete_job.run.assert_called_once()
+        delete_job.run.assert_not_called()  # never submitted again at once
 
-    def test_increment_retry_or_fail_gives_up(self):
+    def test_count_failure_gives_up(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
@@ -399,14 +578,16 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.remote_cleanup_retry_count = PluginInstance.MAX_REMOTE_CLEANUP_RETRIES + 1
         pl_inst.save(update_fields=['remote_cleanup_status', 'remote_cleanup_retry_count'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
-        delete_job.save_plugin_instance_final_status = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock()
 
-        delete_job._increment_retry_or_fail()
+        self.assertTrue(delete_job._count_failure())
 
+        pl_inst.refresh_from_db()
         self.assertEqual(pl_inst.remote_cleanup_status, 'failed')
-        delete_job.save_plugin_instance_final_status.assert_called_once()
+        self.assertEqual(pl_inst.status, 'finishedSuccessfully')
+        delete_job._grant_feed_permissions.assert_called_once()
 
-    def test_increment_retry_or_fail_cancelled_cleans_output(self):
+    def test_count_failure_gives_up_and_cleans_the_output_of_a_cancelled_job(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
@@ -417,13 +598,15 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.save(update_fields=['remote_cleanup_status', 'remote_cleanup_retry_count'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job._cleanup_plugin_instance_output_dir = mock.Mock()
-        delete_job.save_plugin_instance_final_status = mock.Mock()
+        delete_job._grant_feed_permissions = mock.Mock()
+        delete_job._get_status = mock.Mock(
+            return_value={'compute': {'status': 'finishedWithError'}})
 
-        delete_job._increment_retry_or_fail()
+        delete_job._count_failure()
 
         delete_job._cleanup_plugin_instance_output_dir.assert_called_once()
 
-    def test_save_plugin_instance_final_status(self):
+    def test_grant_feed_permissions(self):
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
         (pl_inst, tf) = PluginInstance.objects.get_or_create(
@@ -441,7 +624,7 @@ class PluginInstanceDeleteJobTests(TestCase):
         with mock.patch.object(ChrisFolder, 'grant_group_permission') as mock_ggp, \
              mock.patch.object(ChrisFolder, 'grant_user_permission') as mock_gup, \
              mock.patch.object(ChrisFolder, 'grant_public_access') as mock_gpa:
-            delete_job.save_plugin_instance_final_status()
+            delete_job._grant_feed_permissions()
 
             mock_ggp.assert_called_once_with(group, 'w')
             mock_gup.assert_called_once_with(other_user, 'w')
@@ -623,54 +806,62 @@ class PluginInstanceDeleteJobTests(TestCase):
     def _run_to_finished_successfully(self, pl_inst):
         """
         Helper method to run through the full copy job + app job flow until the
-        plugin instance reaches 'finishedSuccessfully' status.
+        plugin instance reaches 'finishedSuccessfully' status. No worker consumes the
+        tests' queue here, so it submits each job itself, as the task that a status check
+        enqueues would.
         """
-        # run the copy job
-        copy_job = PluginInstanceCopyJob(pl_inst)
-        copy_job.run()
+        with mock.patch.object(PluginInstanceJob, 'enqueue_run'):
+            # run the copy job
+            copy_job = PluginInstanceCopyJob(pl_inst)
+            copy_job.run()
 
-        # poll copy job status until the copy finishes and the app job auto-starts
-        maxLoopTries = 10
-        currentLoop = 1
-        time.sleep(5)
-        while currentLoop <= maxLoopTries:
-            copy_job.check_exec_status()
-            if pl_inst.status == 'started':
-                break
-            time.sleep(5)
-            currentLoop += 1
-        if pl_inst.status == 'cancelled':
-            self.skipTest('Copy job failed to transition to started - likely pfcon Docker issue')
-        self.assertEqual(pl_inst.status, 'started')
-
-        # poll app job status until it finishes or transitions to uploading
-        app_job = PluginInstanceAppJob(pl_inst)
-        maxLoopTries = 10
-        currentLoop = 1
-        b_checkAgain = True
-        time.sleep(10)
-        while b_checkAgain:
-            str_responseStatus = app_job.check_exec_status()
-            if str_responseStatus in ('finishedSuccessfully', 'uploading'):
-                b_checkAgain = False
-            elif currentLoop < maxLoopTries:
-                time.sleep(10)
-            if currentLoop == maxLoopTries:
-                b_checkAgain = False
-            currentLoop += 1
-
-        # if compute_requires_upload_job=True the app job transitions to 'uploading';
-        # poll the upload job until finishedSuccessfully
-        if pl_inst.status == 'uploading':
-            upload_job = PluginInstanceUploadJob(pl_inst)
+            # poll copy job status until the copy finishes and the app job is scheduled
             maxLoopTries = 10
             currentLoop = 1
             time.sleep(5)
             while currentLoop <= maxLoopTries:
-                upload_job.check_exec_status()
-                if pl_inst.status == 'finishedSuccessfully':
+                copy_job.check_exec_status()
+                if pl_inst.status != 'copying':
                     break
-                time.sleep(10)
+                time.sleep(5)
                 currentLoop += 1
+            if pl_inst.status == 'cancelled':
+                self.skipTest('Copy job failed to transition to scheduled - likely pfcon '
+                              'Docker issue')
+            self.assertEqual(pl_inst.status, 'scheduled')
+
+            # run the app job and poll its status until it finishes or transitions to
+            # uploading
+            app_job = PluginInstanceAppJob(pl_inst)
+            app_job.run()
+            self.assertEqual(pl_inst.status, 'started')
+            maxLoopTries = 10
+            currentLoop = 1
+            b_checkAgain = True
+            time.sleep(10)
+            while b_checkAgain:
+                str_responseStatus = app_job.check_exec_status()
+                if str_responseStatus in ('finishedSuccessfully', 'uploading'):
+                    b_checkAgain = False
+                elif currentLoop < maxLoopTries:
+                    time.sleep(10)
+                if currentLoop == maxLoopTries:
+                    b_checkAgain = False
+                currentLoop += 1
+
+            # if compute_requires_upload_job=True the app job transitions to 'uploading';
+            # run the upload job and poll it until finishedSuccessfully
+            if pl_inst.status == 'uploading':
+                upload_job = PluginInstanceUploadJob(pl_inst)
+                upload_job.run()
+                maxLoopTries = 10
+                currentLoop = 1
+                time.sleep(5)
+                while currentLoop <= maxLoopTries:
+                    upload_job.check_exec_status()
+                    if pl_inst.status == 'finishedSuccessfully':
+                        break
+                    time.sleep(10)
+                    currentLoop += 1
 
         self.assertEqual(pl_inst.status, 'finishedSuccessfully')

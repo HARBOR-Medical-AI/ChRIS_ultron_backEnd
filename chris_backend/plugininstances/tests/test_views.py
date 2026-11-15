@@ -251,7 +251,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         # first test 'fs' plugin instance (has no previous plugin instance)
 
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             # make API request
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(self.create_read_url, data=self.post,
@@ -272,7 +272,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         previous_plg_inst.status = 'finishedSuccessfully'
         previous_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -284,7 +284,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         previous_plg_inst.status = 'started'
         previous_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -296,7 +296,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         previous_plg_inst.status = 'finishedWithError'
         previous_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -336,7 +336,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         parent_plg_inst.status = 'finishedSuccessfully'
         parent_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -348,7 +348,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         parent_plg_inst.status = 'started'
         parent_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -360,7 +360,7 @@ class PluginInstanceListViewTests(TasksViewTests):
 
         parent_plg_inst.status = 'finishedWithError'
         parent_plg_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(create_read_url, data=post,
                                         content_type=self.content_type)
@@ -938,12 +938,169 @@ class PluginInstanceDetailViewTests(TasksViewTests):
                                   {"name": "status", "value": "cancelled"}]}})
 
         self.client.login(username=self.username, password=self.password)
-        with mock.patch.object(views.cancel_plugin_instance_job, 'delay',
-                               return_value=None):
-            response = self.client.put(self.read_update_delete_url, data=put,
-                                       content_type=self.content_type)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
         self.assertContains(response, "Test instance")
         self.assertContains(response, "cancelled")
+        self.pl_inst.refresh_from_db()
+        self.assertEqual((self.pl_inst.title, self.pl_inst.status),
+                         ('Test instance', 'cancelled'))
+
+    def test_plugin_instance_update_of_the_title_writes_nothing_else(self):
+        put = json.dumps({
+            "template": {"data": [{"name": "title", "value": "Test instance"}]}})
+        self.client.login(username=self.username, password=self.password)
+        original = views.PluginInstanceDetail.perform_update
+
+        def moved_on_meanwhile(view, serializer):
+            # a task moves the instance on after the request read it
+            PluginInstance.objects.filter(pk=self.pl_inst.pk).update(status='started')
+            original(view, serializer)
+
+        with mock.patch.object(views.PluginInstanceDetail, 'perform_update',
+                               moved_on_meanwhile):
+            response = self.client.put(self.read_update_delete_url, data=put,
+                                       content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.pl_inst.refresh_from_db()
+        self.assertEqual((self.pl_inst.title, self.pl_inst.status),
+                         ('Test instance', 'started'))
+
+    def test_plugin_instance_cancel_cancels_every_descendant_and_their_remote_jobs(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name="mri_convert")
+        children = {}
+        for status_ in ('waiting', 'started', 'finishedSuccessfully', 'cancelled'):
+            (child, tf) = PluginInstance.objects.get_or_create(
+                plugin=plugin, owner=user, previous=self.pl_inst, title=status_,
+                compute_resource=plugin.compute_resources.all()[0])
+            PluginInstance.objects.filter(pk=child.pk).update(status=status_)
+            children[status_] = child
+        PluginInstance.objects.filter(pk=self.pl_inst.pk).update(status='started')
+        put = json.dumps({"template": {"data": [{"name": "status", "value": "cancelled"}]}})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rows = dict(PluginInstance.objects.filter(
+            pk__in=[self.pl_inst.pk] + [c.pk for c in children.values()]
+        ).values_list('pk', 'status'))
+        self.assertEqual(set(rows.values()), {'cancelled'})
+        # the remote cleanup armed in the cancel's UPDATE for each that had a job
+        armed = set(PluginInstance.objects.filter(
+            pk__in=rows, remote_cleanup_status='deletingData').values_list('pk', flat=True))
+        self.assertEqual(armed, {self.pl_inst.pk, children['started'].pk})
+
+    def test_plugin_instance_cancel_arms_the_cleanup_of_a_job_submitted_since_the_read(self):
+        PluginInstance.objects.filter(pk=self.pl_inst.pk).update(status='waiting')
+        put = json.dumps({"template": {"data": [{"name": "status", "value": "cancelled"}]}})
+        original = views.PluginInstanceDetail.perform_update
+
+        def copying_meanwhile(view, serializer):
+            # the request read 'waiting'; a task then submitted the copy job
+            PluginInstance.objects.filter(pk=self.pl_inst.pk).update(status='copying')
+            original(view, serializer)
+
+        self.client.login(username=self.username, password=self.password)
+        with mock.patch.object(views.PluginInstanceDetail, 'perform_update',
+                               copying_meanwhile):
+            response = self.client.put(self.read_update_delete_url, data=put,
+                                       content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.pl_inst.refresh_from_db()
+        self.assertEqual((self.pl_inst.status, self.pl_inst.remote_cleanup_status),
+                         ('cancelled', 'deletingData'))
+
+    def test_plugin_instance_delete_of_a_root_that_finished_meanwhile_cancels_its_children(
+            self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name="mri_convert")
+        compute_resource = plugin.compute_resources.all()[0]
+        root = PluginInstance.objects.create(plugin=plugin, owner=user,
+                                             previous=self.pl_inst, title='root',
+                                             compute_resource=compute_resource)
+        child = PluginInstance.objects.create(plugin=plugin, owner=user, previous=root,
+                                              title='child',
+                                              compute_resource=compute_resource)
+        PluginInstance.objects.filter(pk=child.pk).update(status='waiting')
+        PluginInstance.objects.filter(pk=root.pk).update(status='started')
+        original = views.cancel_plugin_instance_tree
+
+        def finished_meanwhile(inst):
+            PluginInstance.objects.filter(pk=inst.pk).update(status='finishedSuccessfully')
+            return original(inst)
+
+        self.client.login(username=self.username, password=self.password)
+        with mock.patch.object(views, 'cancel_plugin_instance_tree', finished_meanwhile), \
+                mock.patch.object(views.delete_plugin_instance, 'delay'):
+            response = self.client.delete(reverse("plugininstance-detail",
+                                                  kwargs={"pk": root.pk}))
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(PluginInstance.objects.get(pk=child.pk).status, 'cancelled')
+        # the root keeps the status it ended with
+        self.assertEqual(PluginInstance.objects.get(pk=root.pk).status,
+                         'finishedSuccessfully')
+
+    def test_plugin_instance_cancel_of_a_cancelled_instance_cancels_its_descendants(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name="mri_convert")
+        (child, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, previous=self.pl_inst, title='child',
+            compute_resource=plugin.compute_resources.all()[0])
+        PluginInstance.objects.filter(pk=child.pk).update(status='started')
+        PluginInstance.objects.filter(pk=self.pl_inst.pk).update(status='cancelled')
+        put = json.dumps({"template": {"data": [{"name": "status", "value": "cancelled"}]}})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'cancelled')
+        child.refresh_from_db()
+        self.assertEqual((child.status, child.remote_cleanup_status),
+                         ('cancelled', 'deletingData'))
+
+    def test_plugin_instance_update_ignores_the_fields_it_does_not_change(self):
+        put = json.dumps({"template": {"data": [
+            {"name": "title", "value": "renamed"},
+            {"name": "compute_resource_name", "value": "elsewhere"},
+            {"name": "deletion_status", "value": "pending"},
+            {"name": "deletion_error", "value": "forged"}]}})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.pl_inst.refresh_from_db()
+        self.assertEqual((self.pl_inst.title, self.pl_inst.compute_resource.name,
+                          self.pl_inst.deletion_status, self.pl_inst.deletion_error),
+                         ('renamed', 'host', 'inactive', ''))
+
+    def test_plugin_instance_cancel_of_an_instance_that_finished_meanwhile_is_refused(self):
+        put = json.dumps({"template": {"data": [{"name": "status", "value": "cancelled"}]}})
+        self.client.login(username=self.username, password=self.password)
+        original = views.PluginInstanceDetail.perform_update
+
+        def finished_meanwhile(view, serializer):
+            PluginInstance.objects.filter(pk=self.pl_inst.pk).update(
+                status='finishedSuccessfully')
+            original(view, serializer)
+
+        with mock.patch.object(views.PluginInstanceDetail, 'perform_update',
+                               finished_meanwhile):
+            response = self.client.put(self.read_update_delete_url, data=put,
+                                       content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.pl_inst.refresh_from_db()
+        self.assertEqual(self.pl_inst.status, 'finishedSuccessfully')
 
     def test_plugin_instance_update_failure_current_status_is_finishedSuccessfully_or_finishedWithError(self):
         put = json.dumps({
@@ -1004,14 +1161,13 @@ class PluginInstanceDetailViewTests(TasksViewTests):
 
         self.client.login(username=self.username, password=self.password)
 
-        with mock.patch.object(views, 'cancel_plugin_instance_job'):
-            with mock.patch.object(views.delete_plugin_instance, 'delay',
-                                   return_value=None) as delay_mock:
-                response = self.client.delete(url)
-                self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        with mock.patch.object(views.delete_plugin_instance, 'delay',
+                               return_value=None) as delay_mock:
+            response = self.client.delete(url)
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
-                # check that the delete_plugin_instance task was called with appropriate args
-                delay_mock.assert_called_with(ds_inst.id)
+            # check that the delete_plugin_instance task was called with appropriate args
+            delay_mock.assert_called_with(ds_inst.id)
 
     @tag('integration')
     def test_integration_plugin_instance_delete_success(self):
@@ -1277,7 +1433,7 @@ class PluginInstanceSplitListViewTests(ViewTests):
 
         self.fs_inst.status = 'finishedSuccessfully'
         self.fs_inst.save()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job') as run_job_mock:
 
             response = self.client.post(self.create_read_url, data=post,
                                         content_type=self.content_type)

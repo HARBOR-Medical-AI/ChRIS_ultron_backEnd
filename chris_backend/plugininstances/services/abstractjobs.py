@@ -1,7 +1,16 @@
 """
-Abstract job manager module that provides the base interface for submitting 
-and checking the execution status of jobs running in a remote compute 
+Abstract job manager module that provides the base interface for submitting
+and checking the execution status of jobs running in a remote compute
 environment (ChRIS / pfcon interface) as well as deleting them when finished.
+
+Several tasks can act on one plugin instance at once (overlapping status checks, a cancel
+from the API, a redelivered task). Thus the job classes never save an instance whole:
+every write of its status is a transition (``PluginInstance.transition``) from the
+statuses the writer expects, its other fields are written while it is in the status the
+writer expects (``update_if_status``) but for the retry counters, and the remote cleanup
+moves on only from the step it expects (``move_remote_cleanup``). Only the task that won
+a transition does what follows it (submit the next job, the remote cleanup's first one);
+a cancel that lost to another task's end makes sure the cleanup is scheduled.
 """
 
 import logging
@@ -18,6 +27,7 @@ from django.utils import timezone
 
 from core.storage import connect_storage
 from core.models import ChrisInstance
+from plugininstances.enums import ARM_REMOTE_CLEANUP, INACTIVE_STATUSES
 
 
 logger = logging.getLogger(__name__)
@@ -25,13 +35,17 @@ logger = logging.getLogger(__name__)
 
 class PluginInstanceJob(abc.ABC):
     """
-    ``PluginInstanceJob`` provides an interface for managing remote jobs related to a 
+    ``PluginInstanceJob`` provides an interface for managing remote jobs related to a
     plugin instance.
 
-    ``PluginInstanceJob`` methods implement helper functions for submitting and checking 
-    the status of jobs required during the full flow of running a plugin instance's app 
+    ``PluginInstanceJob`` methods implement helper functions for submitting and checking
+    the status of jobs required during the full flow of running a plugin instance's app
     on a remote compute environment.
     """
+
+    #: the status a plugin instance is in while this job runs; None for a job that runs
+    #: after the instance's terminal status
+    status = None
 
     def __init__(self, plugin_instance: ChrisInstance):
 
@@ -65,13 +79,91 @@ class PluginInstanceJob(abc.ABC):
         """
         ...
  
-    @abc.abstractmethod
-    def cancel_exec(self):
+    def cancel_exec(self, error_code='', source=None):
         """
-        Cancel the job's execution. It connects to the remote compute service
-        to cancel the job.
+        Cancel the plugin instance from the statuses ``source`` (any active one by
+        default; a status check gives the one it checked), with ``error_code`` when given,
+        and make sure its remote cleanup is scheduled: ``PluginInstance.cancel`` arms it
+        in the same UPDATE when the instance may have a job in the remote compute, and
+        this then submits the cleanup's first job. An instance that another writer has
+        already ended only gets its cleanup scheduled, if nothing did. Returns the
+        ``StatusWrite``.
         """
-        ...
+        fields = {'error_code': error_code} if error_code else {}
+        ended = self.c_plugin_inst.cancel(source, **fields)
+
+        if ended:
+            if self.c_plugin_inst.remote_cleanup_status == 'deletingData':
+                self._submit_remote_cleanup()
+        elif ended.status in INACTIVE_STATUSES:
+            self.schedule_remote_cleanup()
+        return ended
+
+    def end(self, to, source, error_code='', **fields):
+        """
+        Move the plugin instance from the statuses ``source`` to the terminal status
+        ``to``, with ``error_code`` when given and ``fields``, and its remote cleanup armed
+        in the same UPDATE; the winner then submits the cleanup's first job. Returns the
+        ``StatusWrite``.
+        """
+        if error_code:
+            fields['error_code'] = error_code
+
+        ended = self.c_plugin_inst.transition(to, source, **fields, **ARM_REMOTE_CLEANUP)
+
+        if ended:
+            self._submit_remote_cleanup()
+        return ended
+
+    def is_runnable(self):
+        """
+        Whether the plugin instance is in the status this job runs in: a task for one that
+        another task has moved on, or cancelled, submits nothing.
+        """
+        if self.c_plugin_inst.status == self.status:
+            return True
+
+        logger.info(f'Not running {type(self).__name__} {self.str_job_id}: the plugin '
+                    f'instance is {self.c_plugin_inst.status}, not {self.status}')
+        return False
+
+    def submitted(self, to=None, **fields):
+        """
+        Record what a successful submission returned (``fields``), moving the plugin
+        instance to the status ``to`` when given, as long as it is still in this job's
+        status. When it is not and it was cancelled meanwhile, the job just submitted may
+        be the only one left in the remote, so its cleanup is scheduled again, also after it
+        completed; another status means another task got there first, and nothing is left
+        to do. Returns the ``StatusWrite``.
+        """
+        if to is None:
+            written = self.c_plugin_inst.update_if_status(self.status, **fields)
+        else:
+            written = self.c_plugin_inst.transition(to, self.status, **fields)
+
+        if not written and written.status == 'cancelled':
+            self.schedule_remote_cleanup(rearm=True)
+        return written
+
+    def enqueue_run(self, job_class_name):
+        """
+        Have a task submit the job of the class named ``job_class_name`` for the plugin
+        instance: a status check never submits a job itself.
+        """
+        from plugininstances.tasks import run_plugin_instance_job
+
+        run_plugin_instance_job.delay(self.c_plugin_inst.id, job_class_name)
+
+    def job_exists(self, job_type: JobType) -> dict | None:
+        """
+        The remote's status response for this job, or None when it has none (or does not
+        answer): a submission that failed may still have created the job, as when two
+        tasks submitted it at once and the remote refused only the second container.
+        """
+        try:
+            return self._get_status(job_type, self.str_job_id)
+        except PfconRequestException:
+            return None
 
     @abc.abstractmethod
     def delete(self):
@@ -132,23 +224,23 @@ class PluginInstanceJob(abc.ABC):
                 d_jobStatusSummary['compute']['return']['job_logs'] = logs[-1800:]
         return d_jobStatusSummary
 
-    def schedule_remote_cleanup(self):
+    def schedule_remote_cleanup(self, rearm=False):
         """
         Schedule a remote cleanup operation to delete storeBase data and all containers
-        from the remote compute environment. This sets the remote_cleanup_status to
-        'deletingData' and schedules a PluginInstanceDeleteJob celery task.
+        from the remote compute environment, for a plugin instance in a terminal status
+        whose cleanup has not started (or, with ``rearm``, has ended: a job submitted after
+        it). Sets the remote_cleanup_status to 'deletingData' and submits the first
+        PluginInstanceDeleteJob. Returns whether this call scheduled it.
         """
-        from plugininstances.tasks import run_plugin_instance_job
+        if not self.c_plugin_inst.arm_remote_cleanup(rearm=rearm):
+            return False
 
-        job_id = self.str_job_id
-        logger.info(f'Scheduling remote cleanup for job {job_id}')
+        self._submit_remote_cleanup()
+        return True
 
-        self.c_plugin_inst.remote_cleanup_status = 'deletingData'
-        self.c_plugin_inst.remote_cleanup_retry_count = 0
-        self.c_plugin_inst.save(update_fields=['remote_cleanup_status',
-                                               'remote_cleanup_retry_count'])
-        run_plugin_instance_job.delay(self.c_plugin_inst.id,
-                                      'PluginInstanceDeleteJob')
+    def _submit_remote_cleanup(self):
+        logger.info(f'Scheduling remote cleanup for job {self.str_job_id}')
+        self.enqueue_run('PluginInstanceDeleteJob')
 
     def delete_all_remote_containers(self) -> bool:
         """
@@ -180,6 +272,12 @@ class PluginInstanceJob(abc.ABC):
                 all_succeeded = False
         return all_succeeded
     
+    #: what pfcon answers only once it has accepted a request's token (it checks the
+    #: token before any job endpoint and refuses a bad one with 401,
+    #: ``PfconRequestInvalidTokenException``): no such job, or one that must wait for
+    #: another of the instance. Refreshing the token cannot change those answers.
+    ANSWERS_AFTER_AUTH = (404, 409)
+
     def _refresh_compute_resource_auth_token(self):
         """
         Get a new auth token from a remote pfcon service and update the DB.
@@ -189,7 +287,7 @@ class PluginInstanceJob(abc.ABC):
                                             cr.compute_password)
         self.pfcon_client.set_auth_token(token)
         cr.compute_auth_token = token
-        cr.save()
+        cr.save(update_fields=['compute_auth_token'])
 
     def _submit(self, job_type: JobType, job_id: str, job_descriptors: dict, 
                 dfile: io.BytesIO | None = None, timeout: int = 200) -> dict:
@@ -205,8 +303,8 @@ class PluginInstanceJob(abc.ABC):
             self._refresh_compute_resource_auth_token()
             d_resp = self.pfcon_client.submit_job(job_type, job_id, job_descriptors, 
                                                   dfile, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK
@@ -237,8 +335,8 @@ class PluginInstanceJob(abc.ABC):
                         f'{job_id} from pfcon url -->{self.pfcon_client.url}<--')
             self._refresh_compute_resource_auth_token()
             d_resp = self.pfcon_client.get_job_status(job_type, job_id, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK
@@ -263,8 +361,8 @@ class PluginInstanceJob(abc.ABC):
                         f'job {job_id} from pfcon url -->{self.pfcon_client.url}<--')
             self._refresh_compute_resource_auth_token()
             self.pfcon_client.delete_job(job_type, job_id, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK (for legacy storage)
