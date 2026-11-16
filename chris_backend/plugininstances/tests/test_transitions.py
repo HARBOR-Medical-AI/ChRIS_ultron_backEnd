@@ -4,19 +4,28 @@ transitions, what follows them only for the task that won, and the tasks that ra
 """
 
 import ast
+import contextlib
+import io
 import logging
 import threading
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import connection
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
-from plugins.models import PluginMeta, Plugin, ComputeResource
+from core.cache import acquire_lock, release_lock
+from core.celery import app
+from plugins.models import PluginMeta, Plugin, PluginParameter, ComputeResource
 from plugininstances import tasks
-from plugininstances.models import PluginInstance, StatusWrite
+from plugininstances.models import (PluginInstance, PluginInstanceLock, StatusWrite,
+                                    StrParameter)
 from plugininstances.services.copyjobs import PluginInstanceCopyJob
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
 
@@ -24,6 +33,9 @@ from plugininstances.services.pluginjobs import PluginInstanceAppJob
 COMPUTE_RESOURCE_URL = settings.COMPUTE_RESOURCE_URL
 
 FINISHED = {'compute': {'status': 'finishedSuccessfully', 'logs': '', 'jid': 'x'}}
+
+# the claim of a newer run of a registration
+NEWER_RUN = 'f' * 32
 
 
 class PluginInstanceFixture:
@@ -187,8 +199,9 @@ class TransitionTests(PluginInstanceFixture, TestCase):
         for name, args, calls in (
                 ('plugininstances.tasks.run_plugin_instance_job',
                  (inst.pk, 'PluginInstanceAppJob'), 1),
-                ('plugininstances.tasks.run_plugin_instance_job',
-                 (inst.pk, 'PluginInstanceDeleteJob'), 0),
+                ('plugininstances.tasks.register_plugin_instance_output', (inst.pk,), 1),
+                ('plugininstances.tasks.register_large_plugin_instance_output',
+                 (inst.pk,), 1),
                 ('plugininstances.tasks.check_plugin_instance_job_exec_status',
                  (inst.pk, 'PluginInstanceAppJob'), 0),
                 # a failed cancel tries again by itself, a few times
@@ -313,6 +326,422 @@ class TransitionTests(PluginInstanceFixture, TestCase):
         self.assertEqual((inst.status, inst.error_code, inst.remote_cleanup_status),
                          ('finishedSuccessfully', '', 'deletingData'))
         job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
+
+
+class RegistrationTaskTests(PluginInstanceFixture, TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.task = app.tasks['plugininstances.tasks.register_plugin_instance_output']
+        self.large = app.tasks['plugininstances.tasks.register_large_plugin_instance_output']
+
+    def test_an_instance_no_longer_registering_files_or_gone_is_left_alone(self):
+        inst = self.instance('cancelled')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob,
+                               'registers_at_most') as count, \
+                mock.patch.object(tasks.PluginInstanceAppJob,
+                                  'register_output') as register, \
+                mock.patch.object(tasks.register_large_plugin_instance_output,
+                                  'delay') as large:
+            tasks.register_plugin_instance_output(inst.pk)
+            tasks.register_large_plugin_instance_output(inst.pk)
+            with self.assertLogs('plugininstances.tasks', 'ERROR') as gone:
+                tasks.register_large_plugin_instance_output(inst.pk + 1000)
+
+        count.assert_not_called()
+        register.assert_not_called()
+        large.assert_not_called()
+        self.assertIn('not found when registering its output files', gone.output[0])
+
+    def test_a_soft_time_limit_runs_it_again_then_cancels_with_code13(self):
+        inst = self.instance('registeringFiles')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob,
+                               'registers_at_most') as count, \
+                mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
+                                  side_effect=SoftTimeLimitExceeded()), \
+                mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run'), \
+                mock.patch.object(type(self.large), 'retry', return_value=Retry()) as retry:
+            with self.assertLogs('plugininstances.tasks', 'ERROR') as first, \
+                    self.assertRaises(Retry):
+                tasks.register_large_plugin_instance_output(inst.pk)
+            self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status,
+                             'registeringFiles')
+
+            last = SimpleNamespace(retries=tasks.REGISTRATION_RETRIES)
+            with mock.patch.object(type(self.large), 'request',
+                                   new_callable=mock.PropertyMock, return_value=last), \
+                    self.assertLogs('plugininstances.tasks', 'ERROR') as final:
+                tasks.register_large_plugin_instance_output(inst.pk)
+
+        count.assert_not_called()  # the large queue's task counts nothing
+        self.assertIn('reached its time limit (attempt 1)', first.output[0])
+        self.assertIn(f'(attempt {tasks.REGISTRATION_RETRIES + 1})', final.output[0])
+        retry.assert_called_once_with(countdown=0, max_retries=tasks.REGISTRATION_RETRIES)
+        inst.refresh_from_db()
+        self.assertEqual((inst.status, inst.error_code), ('cancelled', 'CODE13'))
+
+    def test_a_soft_time_limit_on_the_register_queue_sends_it_on_as_its_next_attempt(self):
+        inst = self.instance('registeringFiles')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                               return_value=True), \
+                mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
+                                  side_effect=SoftTimeLimitExceeded()), \
+                mock.patch.object(type(self.task), 'retry') as retry, \
+                mock.patch.object(tasks.register_large_plugin_instance_output,
+                                  'apply_async') as large, \
+                self.assertLogs('plugininstances.tasks', 'ERROR') as logs:
+            tasks.register_plugin_instance_output(inst.pk)
+
+        retry.assert_not_called()
+        large.assert_called_once_with((inst.pk,), retries=1)
+        self.assertIn('reached its time limit (attempt 1)', logs.output[0])
+        self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'registeringFiles')
+
+    def test_a_registration_of_few_files_runs_in_the_task_it_was_sent_to(self):
+        inst = self.instance('registeringFiles')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                               return_value=True) as count, \
+                mock.patch.object(tasks.PluginInstanceAppJob,
+                                  'register_output') as register, \
+                mock.patch.object(tasks.register_large_plugin_instance_output,
+                                  'delay') as large:
+            tasks.register_plugin_instance_output(inst.pk)
+
+        count.assert_called_once_with(tasks.REGISTER_FAST_MAX_FILES)
+        register.assert_called_once_with()
+        large.assert_not_called()
+
+    def test_any_other_registration_goes_on_and_the_log_says_why(self):
+        inst = self.instance('registeringFiles')
+        logging.disable(logging.NOTSET)  # the lines asserted below
+        cases = (
+            ({'return_value': False}, ['INFO'],
+             f'more than {tasks.REGISTER_FAST_MAX_FILES} files'),
+            ({'side_effect': OSError('no storage')}, ['WARNING', 'INFO'],
+             'its files could not be counted'),
+            ({'side_effect': SoftTimeLimitExceeded()}, ['WARNING', 'INFO'],
+             'its files could not be counted'),
+            (None, ['INFO'], 'the remote sends its output as a zip'))
+
+        for answer, levels, why in cases:
+            if answer is None:  # the real count, of an out-of-network remote's output
+                ComputeResource.objects.filter(pk=self.compute_resource.pk).update(
+                    compute_innetwork=False)
+                count = contextlib.nullcontext()
+            else:
+                count = mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                                          **answer)
+            with self.subTest(why=why, levels=levels), count, \
+                    mock.patch.object(tasks.PluginInstanceAppJob,
+                                      'register_output') as register, \
+                    mock.patch.object(tasks.register_large_plugin_instance_output,
+                                      'delay') as large, \
+                    self.assertLogs('plugininstances.tasks', 'INFO') as logs:
+                tasks.register_plugin_instance_output(inst.pk)
+
+            register.assert_not_called()
+            large.assert_called_once_with(inst.pk)
+            self.assertEqual([record.levelname for record in logs.records], levels)
+            self.assertIn(f'on to the register_large queue: {why}', logs.output[-1])
+
+    def test_a_run_a_newer_one_took_over_gives_up_nothing(self):
+        inst = self.instance('registeringFiles')
+        job = PluginInstanceAppJob(inst)
+        job.enqueue_run = mock.Mock()
+        job._registration_token = job._claim_registration()
+        PluginInstanceLock.objects.filter(plugin_inst_id=inst.pk).update(owner_token=NEWER_RUN)
+
+        self.assertIsNone(job.give_up_registration('CODE13'))
+        self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'registeringFiles')
+
+        job._registration_token = NEWER_RUN  # the run that owns it gives up
+        self.assertTrue(job.give_up_registration('CODE13'))
+        inst.refresh_from_db()
+        self.assertEqual((inst.status, inst.error_code), ('cancelled', 'CODE13'))
+
+    def test_a_run_a_newer_one_took_over_while_it_asked_the_remote_fetches_nothing(self):
+        inst = self.instance('registeringFiles')
+        job = PluginInstanceAppJob(inst)
+        job.enqueue_run = mock.Mock()
+        job._get_job_json_data = mock.Mock()
+
+        def claimed_meanwhile(job_type, job_id):
+            PluginInstanceLock.objects.filter(plugin_inst_id=inst.pk).update(
+                owner_token=NEWER_RUN)
+            return {'compute': {'status': 'finishedSuccessfully'}}
+
+        job._get_status = mock.Mock(side_effect=claimed_meanwhile)
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs('plugininstances.services', 'INFO') as logs:
+            job.register_output()
+
+        job._get_job_json_data.assert_not_called()
+        self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'registeringFiles')
+        self.assertIn('owns it: this one writes nothing', logs.output[-1])
+
+    def test_the_soft_time_limit_in_a_step_is_no_failure_of_that_step(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('out.txt', 'data')
+
+        for step, call in (
+                ('ls', lambda job: job.check_files_from_json_exist(
+                    {'job_output_path': output, 'rel_file_paths': ['out.txt']})),
+                ('upload_obj', lambda job: job.unpack_zip_file(archive.getvalue()))):
+            with self.subTest(step=step):
+                job = PluginInstanceAppJob(PluginInstance.objects.get(pk=inst.pk))
+                job.storage_manager = mock.Mock(**{
+                    f'{step}.side_effect': SoftTimeLimitExceeded()})
+                logging.disable(logging.NOTSET)
+
+                with self.assertRaises(SoftTimeLimitExceeded), \
+                        self.assertNoLogs('plugininstances.services', 'ERROR'):
+                    call(job)
+                self.assertEqual(job.c_plugin_inst.error_code, '')
+
+
+class FollowerSchedulingTests(PluginInstanceFixture, TestCase):
+    """
+    A registration that ends its instance 'finishedSuccessfully' schedules the instances of
+    its feed that are ready at once, rather than leaving them to the beat's next pass.
+    """
+
+    def ts_instance(self, previous, parents):
+        """
+        A waiting 'ts' instance after ``previous`` whose 'plugininstances' are ``parents``.
+        """
+        (meta, _) = PluginMeta.objects.get_or_create(name='pl-topologicalcopy', type='ts')
+        (ts_plugin, _) = Plugin.objects.get_or_create(meta=meta, version='0.1')
+        ts_plugin.compute_resources.set([self.compute_resource])
+        inst = PluginInstance.objects.create(plugin=ts_plugin, owner=self.user,
+                                             previous=previous,
+                                             compute_resource=self.compute_resource)
+        (param, _) = PluginParameter.objects.get_or_create(
+            plugin=ts_plugin, name='plugininstances', flag='--plugininstances')
+        StrParameter.objects.create(plugin_inst=inst, plugin_param=param,
+                                    value=','.join(str(p.pk) for p in parents))
+        PluginInstance.objects.filter(pk=inst.pk).update(status='waiting')
+        return inst
+
+    def register(self, inst, final):
+        """
+        Run the register queue's task for ``inst``, whose registration ends it ``final``
+        (None: a newer run owns it), and return the mocked submission of jobs.
+        """
+        def register_output(job):
+            if final:
+                job.c_plugin_inst.transition(final, 'registeringFiles')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                               return_value=True), \
+                mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
+                                  autospec=True, side_effect=register_output), \
+                mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit:
+            tasks.register_plugin_instance_output(inst.pk)
+        return submit
+
+    def status(self, inst):
+        return PluginInstance.objects.get(pk=inst.pk).status
+
+    def test_a_successful_registration_schedules_the_ready_instances_of_its_feed(self):
+        root = self.instance('finishedSuccessfully')
+        parent = self.instance('registeringFiles', previous=root)
+        child = self.instance('waiting', previous=parent)
+        sibling = self.instance('started', previous=root)
+        merge = self.ts_instance(parent, (parent, sibling))  # waits on the sibling
+        elsewhere = self.instance('waiting', previous=self.instance('finishedSuccessfully'))
+
+        submit = self.register(parent, 'finishedSuccessfully')
+
+        submit.assert_called_once_with(child.pk, 'PluginInstanceCopyJob')
+        self.assertEqual(self.status(child), 'copying')
+        self.assertEqual(self.status(merge), 'waiting')
+        self.assertEqual(self.status(elsewhere), 'waiting')  # another feed's: the beat's
+
+    def test_the_last_parent_of_a_merge_to_finish_schedules_it_whichever_it_is(self):
+        root = self.instance('finishedSuccessfully')
+        first = self.instance('finishedSuccessfully', previous=root)
+        last = self.instance('registeringFiles', previous=root)
+        merge = self.ts_instance(first, (first, last))  # not after the one that finishes
+
+        submit = self.register(last, 'finishedSuccessfully')
+
+        submit.assert_called_once_with(merge.pk, 'PluginInstanceCopyJob')
+
+    def test_any_other_end_of_a_registration_schedules_nothing(self):
+        for final in ('finishedWithError', 'cancelled', None):
+            with self.subTest(final=final):
+                root = self.instance('finishedSuccessfully')
+                parent = self.instance('registeringFiles', previous=root)
+                ready = self.instance('waiting', previous=root)  # the beat's to schedule
+
+                submit = self.register(parent, final)
+
+                submit.assert_not_called()
+                self.assertEqual(self.status(ready), 'waiting')
+
+    def test_a_real_successful_registration_schedules_the_child(self):
+        parent = self.instance('registeringFiles')
+        child = self.instance('waiting', previous=parent)
+        storage = PluginInstanceAppJob(parent).storage_manager
+        name = f'{parent.get_output_path()}/a.txt'
+        self.addCleanup(storage.delete_path, parent.get_output_path())
+        storage.upload_obj(name, b'x')
+
+        def files_found(job, content):
+            job.plugin_inst_output_files = {name}
+
+        job_class = tasks.PluginInstanceAppJob
+        with mock.patch.object(job_class, '_get_status', return_value=FINISHED), \
+                mock.patch.object(job_class, '_get_job_json_data', return_value={}), \
+                mock.patch.object(job_class, 'check_files_from_json_exist',
+                                  autospec=True, side_effect=files_found), \
+                mock.patch.object(job_class, 'enqueue_run'), \
+                mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit:
+            tasks.register_plugin_instance_output(parent.pk)
+
+        self.assertEqual(self.status(parent), 'finishedSuccessfully')
+        submit.assert_called_once_with(child.pk, 'PluginInstanceCopyJob')
+
+    def test_a_failure_to_schedule_them_is_logged_and_left_to_the_beat(self):
+        parent = self.instance('registeringFiles')
+        child = self.instance('waiting', previous=parent)
+
+        with mock.patch.object(tasks, 'schedule_ready_plugin_instances',
+                               side_effect=RuntimeError('no database')), \
+                self.assertLogs('plugininstances.tasks', 'ERROR') as logs:
+            self.register(parent, 'finishedSuccessfully')
+
+        self.assertIn('the beat schedules those still waiting', logs.output[0])
+        self.assertEqual(self.status(parent), 'finishedSuccessfully')
+        self.assertEqual(self.status(child), 'waiting')
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit:
+            tasks.schedule_waiting_plugin_instances()
+        submit.assert_called_once_with(child.pk, 'PluginInstanceCopyJob')
+
+    def test_an_instance_that_cannot_be_scheduled_stops_no_other(self):
+        root = self.instance('finishedSuccessfully')
+        broken, ready = (self.instance('waiting', previous=root) for _ in range(2))
+        PluginInstance.objects.filter(pk=broken.pk).update(compute_resource=None)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit, \
+                self.assertLogs('plugininstances.tasks', 'ERROR') as logs:
+            tasks.schedule_ready_plugin_instances(feed_id=root.feed_id)
+
+        submit.assert_called_once_with(ready.pk, 'PluginInstanceCopyJob')
+        self.assertIn(f'Could not schedule plugin instance {broken.pk}', logs.output[0])
+        self.assertEqual(self.status(broken), 'waiting')
+
+    def test_the_beat_schedules_the_ready_instances_of_every_feed(self):
+        children = [self.instance('waiting', previous=self.instance('finishedSuccessfully'))
+                    for _ in range(2)]
+        merge = self.ts_instance(children[0].previous, (children[0].previous,))
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit:
+            tasks.schedule_waiting_plugin_instances()
+
+        self.assertEqual(sorted(c.args[0] for c in submit.call_args_list),
+                         sorted([children[0].pk, children[1].pk, merge.pk]))
+
+
+class CleanupTaskTests(PluginInstanceFixture, TestCase):
+    """
+    The remote cleanup's tasks: the delete job of its data and the deletion of the
+    containers, which the periodic task drives phase by phase.
+    """
+
+    def cleaning(self, phase):
+        inst = self.instance('cancelled')
+        PluginInstance.objects.filter(pk=inst.pk).update(remote_cleanup_status=phase)
+        return PluginInstance.objects.get(pk=inst.pk)
+
+    def test_the_periodic_task_publishes_one_check_of_each_phase(self):
+        data, containers = self.cleaning('deletingData'), self.cleaning('deletingContainers')
+        self.cleaning('complete')
+
+        with mock.patch.object(tasks.check_plugin_instance_cleanup_job,
+                               'enqueue_once') as check, \
+                mock.patch.object(tasks.delete_plugin_instance_containers_from_remote,
+                                  'enqueue_once') as delete:
+            tasks.handle_remote_cleanup()
+
+        check.assert_called_once_with(data.pk)
+        delete.assert_called_once_with(containers.pk)
+
+    def test_the_cleanup_s_first_job_goes_out_from_a_task_of_its_own(self):
+        inst = self.cleaning('deletingData')
+        job = PluginInstanceCopyJob(inst)
+
+        with mock.patch.object(tasks.run_plugin_instance_cleanup_job, 'delay') as cleanup, \
+                mock.patch.object(tasks.run_plugin_instance_job, 'delay') as run:
+            job.enqueue_run('PluginInstanceDeleteJob')
+
+        cleanup.assert_called_once_with(inst.pk)
+        run.assert_not_called()
+
+    def test_the_cleanup_tasks_run_the_delete_job(self):
+        inst = self.cleaning('deletingData')
+
+        with mock.patch.object(tasks.PluginInstanceDeleteJob, 'run') as run, \
+                mock.patch.object(tasks.PluginInstanceDeleteJob,
+                                  'check_exec_status') as check:
+            tasks.run_plugin_instance_cleanup_job(inst.pk)
+            tasks.check_plugin_instance_cleanup_job(inst.pk)
+            with self.assertLogs('plugininstances.tasks', 'ERROR') as logs:
+                tasks.run_plugin_instance_cleanup_job(10 ** 9)  # gone: logged, nothing run
+
+        run.assert_called_once_with()
+        check.assert_called_once_with()
+        self.assertIn('not found when running its remote cleanup', logs.output[0])
+
+    def test_deleting_the_containers_counts_its_failures_and_fails_past_the_retries(self):
+        inst = self.cleaning('deletingContainers')
+        delete = mock.patch.object(tasks.PluginInstanceDeleteJob,
+                                   'delete_all_remote_containers', return_value=False)
+
+        with delete, mock.patch.object(tasks.PluginInstanceDeleteJob, 'complete') as complete:
+            tasks.delete_plugin_instance_containers_from_remote(inst.pk)
+            complete.assert_not_called()
+            self.assertEqual(PluginInstance.objects.get(pk=inst.pk)
+                             .remote_cleanup_retry_count, 1)
+
+            PluginInstance.objects.filter(pk=inst.pk).update(
+                remote_cleanup_retry_count=PluginInstance.MAX_REMOTE_CLEANUP_RETRIES)
+            tasks.delete_plugin_instance_containers_from_remote(inst.pk)
+            complete.assert_called_once_with('failed')
+
+    def test_deleting_the_containers_skips_while_another_run_deletes_them(self):
+        inst, other = self.cleaning('deletingContainers'), self.cleaning('deletingContainers')
+        name = 'plugininstances.tasks.delete_plugin_instance_containers_from_remote'
+        held = acquire_lock(f'{name}:{inst.pk}', 60)
+        self.addCleanup(release_lock, held)
+
+        with mock.patch.object(tasks.PluginInstanceDeleteJob,
+                               'delete_all_remote_containers',
+                               return_value=False) as delete:
+            tasks.delete_plugin_instance_containers_from_remote(inst.pk)
+            tasks.delete_plugin_instance_containers_from_remote(other.pk)
+
+        delete.assert_called_once_with()  # the other instance's alone
+        self.assertEqual(PluginInstance.objects.get(pk=inst.pk).remote_cleanup_retry_count, 0)
+        self.assertEqual(tasks.CONTAINER_DELETION_LOCK_TTL,
+                         app.tasks[name].time_limit)
+
+    def test_deleting_the_containers_of_a_cleanup_in_another_phase_does_nothing(self):
+        inst = self.cleaning('deletingData')
+
+        with mock.patch.object(tasks.PluginInstanceDeleteJob,
+                               'delete_all_remote_containers') as delete:
+            tasks.delete_plugin_instance_containers_from_remote(inst.pk)
+
+        delete.assert_not_called()
 
 
 class TwoStatusChecksTests(PluginInstanceFixture, TestCase):

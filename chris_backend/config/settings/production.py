@@ -188,17 +188,8 @@ PFDCM_ADDRESS = get_secret('PFDCM_ADDRESS')
 
 # CELERY SETTINGS
 # ------------------------------------------------------------------------------
+# (the rest in common.py)
 CELERY_BROKER_URL = get_secret('CELERY_BROKER_URL')
-
-#: Only add pickle to this list if your broker is secured
-#: from unwanted access (see userguide/security.html)
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-
-# Worker settings
-# messages to prefetch at a time multiplied by the number of concurrent processes
-# default is 4 (four messages for each process)
-CELERYD_PREFETCH_MULTIPLIER = 2
 
 
 # CACHE SETTINGS (see common.py)

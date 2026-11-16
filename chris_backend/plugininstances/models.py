@@ -488,9 +488,14 @@ class PluginInstanceFilter(FilterSet):
 
 
 class PluginInstanceLock(models.Model):
+    """
+    The registration of a plugin instance's output files: when it first started, and
+    the token of the run that owns it, the newest (PluginInstanceAppJob.register_output).
+    """
     plugin_inst = models.OneToOneField(PluginInstance, on_delete=models.CASCADE,
                                        related_name='lock')
     start_date = models.DateTimeField(auto_now_add=True)
+    owner_token = models.CharField(max_length=32, blank=True)
 
     def __str__(self):
         return str(self.plugin_inst.id)

@@ -13,7 +13,7 @@ from celery.contrib.testing.worker import start_worker
 from core.celery import app as celery_app
 
 from plugins.models import PluginMeta, Plugin, ComputeResource
-from plugininstances.models import PluginInstance, PluginInstanceLock
+from plugininstances.models import PluginInstance
 
 from plugininstances import tasks
 
@@ -98,12 +98,12 @@ class PluginInstanceTasksTests(TasksTests):
             cancel_mock.assert_called_with('CODE13')
 
     def test_task_check_running_plugin_instances_exec_status(self):
-        with mock.patch.object(tasks.check_plugin_instance_job_exec_status, 'delay',
-                               return_value=None) as delay_mock:
+        with mock.patch.object(tasks.check_plugin_instance_job_exec_status, 'enqueue_once',
+                               return_value=None) as enqueue_mock:
             tasks.check_running_plugin_instances_exec_status()
 
             # check that the check_plugin_instance_job_exec_status task was called with appropriate args
-            delay_mock.assert_called_with(self.plg_inst.id, 'PluginInstanceAppJob')
+            enqueue_mock.assert_called_with(self.plg_inst.id, 'PluginInstanceAppJob')
             self.assertEqual(self.plg_inst.status, 'started')
 
 
@@ -243,13 +243,11 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
 
     @tag('integration')
     def test_task_cancel_plugin_instances_stuck_in_lock_during_async_run(self):
+        # registering files since the transition stamped end_date, 241 minutes ago
+        # (hardcoded cutoff delta in tasks.py), whether or not a registration started
         self.plg_inst.status = 'registeringFiles'
-        self.plg_inst.save(update_fields=['status'])
-
-        plg_inst_lock = PluginInstanceLock(plugin_inst=self.plg_inst)
-        plg_inst_lock.save()
-        plg_inst_lock.start_date = timezone.now() - timedelta(minutes=241)  # hardcoded cutoff delta in tasks.py
-        plg_inst_lock.save(update_fields=['start_date'])
+        self.plg_inst.end_date = timezone.now() - timedelta(minutes=241)
+        self.plg_inst.save(update_fields=['status', 'end_date'])
 
         with mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run',
                                return_value=None):

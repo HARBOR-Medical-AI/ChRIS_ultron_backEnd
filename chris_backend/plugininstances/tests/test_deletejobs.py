@@ -810,7 +810,10 @@ class PluginInstanceDeleteJobTests(TestCase):
         tests' queue here, so it submits each job itself, as the task that a status check
         enqueues would.
         """
-        with mock.patch.object(PluginInstanceJob, 'enqueue_run'):
+        with mock.patch.object(PluginInstanceJob, 'enqueue_run'), \
+                mock.patch.object(PluginInstanceJob, 'enqueue_registration',
+                                  lambda job: PluginInstanceAppJob(
+                                      job.c_plugin_inst).register_output()):
             # run the copy job
             copy_job = PluginInstanceCopyJob(pl_inst)
             copy_job.run()

@@ -8,10 +8,13 @@ import logging
 import os
 import re
 import io
+import secrets
 import time
 import json
 import zipfile
 from typing import List, Optional
+
+from celery.exceptions import SoftTimeLimitExceeded
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import (PfconRequestException,
@@ -19,6 +22,7 @@ from pfconclient.exceptions import (PfconRequestException,
 
 from django.utils import timezone
 from django.conf import settings
+from django.db import IntegrityError, transaction
 from rest_framework.authtoken.models import Token
 
 from core.utils import json_zip2str
@@ -26,7 +30,7 @@ from core.models import (ChrisFolder, ChrisFile, ChrisLinkFile, PathAccessError,
                           validate_path_access)
 from plugininstances.models import PluginInstance, PluginInstanceLock
 from userfiles.models import UserFile
-from .abstractjobs import PluginInstanceJob
+from .abstractjobs import ARM_REMOTE_CLEANUP, PluginInstanceJob
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,9 @@ class PluginInstanceAppJob(PluginInstanceJob):
     def __init__(self, plugin_instance):
         super().__init__(plugin_instance)
         self.l_plugin_inst_param_instances = self.c_plugin_inst.get_parameter_instances()
+        # the token of the registration this object runs, and the link files it wrote
+        self._registration_token = None
+        self._links_written = set()
 
     def run(self):
         """
@@ -183,9 +190,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
         """
         Check a plugin instance app job's execution status. If the job has timed out then
         the job is cancelled. Otherwise the job's execution status is fetched from the
-        remote and if finished (with or without errors) then the job's  file is
-        downloaded and the output files registered with the DB. Finally a delete request 
-        is made to remove the job from the remote environment.
+        remote and, once the job has ended (with or without errors), the instance moves
+        on: an upload job, or a task of its own that registers the output files.
         """
         if self.c_plugin_inst.status == 'started':
             job_id = self.str_job_id
@@ -314,17 +320,12 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 path_parameters_dict[param.flag] = value
         return unextpath_parameters_dict, path_parameters_dict
 
-    def get_ts_plugin_instance_input_objs(self):
+    def get_ts_plugin_instance_parameters(self):
         """
-        Get a tuple whose first element is a dictionary with keys that are the ids of
-        each input plugin instance to this 'ts' plugin instance. The values of
-        this dictionary are also dictionaries containing the output dir of the plugin
-        instances and the list of all the objects under the output dir that match a
-        regular expression. The second element of the tuple indicates the value of the
-        'groupByInstance' flag for this 'ts' plugin instance.
+        Get the 'ts' plugin's special parameters in a tuple: the ids of its input plugin
+        instances, the regular expressions that filter their objects and the
+        'groupByInstance' flag (no ids, no expressions and False for another plugin).
         """
-        job_id = self.str_job_id
-        # extract the 'ts' plugin's special parameters from the DB
         plg_inst_ids = regexs = []
         group_by_instance = False
 
@@ -338,6 +339,19 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     regexs = param_inst.value.split(',') if param_inst.value else []
                 elif param_inst.plugin_param.name == 'groupByInstance':
                     group_by_instance = param_inst.value
+        return plg_inst_ids, regexs, group_by_instance
+
+    def get_ts_plugin_instance_input_objs(self):
+        """
+        Get a tuple whose first element is a dictionary with keys that are the ids of
+        each input plugin instance to this 'ts' plugin instance. The values of
+        this dictionary are also dictionaries containing the output dir of the plugin
+        instances and the list of all the objects under the output dir that match a
+        regular expression. The second element of the tuple indicates the value of the
+        'groupByInstance' flag for this 'ts' plugin instance.
+        """
+        job_id = self.str_job_id
+        plg_inst_ids, regexs, group_by_instance = self.get_ts_plugin_instance_parameters()
 
         d_objs = {}
         for i, inst_id in enumerate(plg_inst_ids):
@@ -513,13 +527,15 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     storage_fname = output_path + fname.lstrip('/')
                     try:
                         self.storage_manager.upload_obj(storage_fname, content)
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.error(f'[CODE07,{job_id}]: Error while uploading file '
                                      f'{storage_fname} to storage, detail: {str(e)}')
                         self.c_plugin_inst.error_code = 'CODE07'
                         raise ValueError(str(e))
                     self.plugin_inst_output_files.add(storage_fname)
-        except ValueError:
+        except (ValueError, SoftTimeLimitExceeded):
             raise
         except Exception as e:
             logger.error(f'[CODE04,{job_id}]: Received bad zip file from remote, '
@@ -549,6 +565,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
         for i in range(60):  # list until every file is there, 60 times at most, 1 s apart
             try:
                 files_in_storage = set(self.storage_manager.ls(job_output_path))
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.error(f'[CODE15,{job_id}]: Error while listing storage files '
                              f'in {job_output_path}, detail: {str(e)}')
@@ -614,18 +632,26 @@ class PluginInstanceAppJob(PluginInstanceJob):
         # authorized to access may be turned into output link files
         self._check_path_access(path)
 
+        # another link to the same path in the same folder (from two parents' outputs) is
+        # this one: written and counted once
+        if (path, parent_folder.path) in self._links_written:
+            return
+        self._links_written.add((path, parent_folder.path))
+
         str_source_trace_dir = path.replace('/', '_')
         try:
             ChrisFolder.objects.get(path=path)
         except ChrisFolder.DoesNotExist:
             try:
                 if self.storage_manager.obj_exists(path):  # path is a file
-                    link_file = ChrisLinkFile(path=path, owner=owner,
-                                              parent_folder=parent_folder)
+                    link_file = self._link_file(path, owner, parent_folder,
+                                                str_source_trace_dir)
                     link_file.save(name=str_source_trace_dir)
                     logger.info(f'Creating link file -->'
                                 f'{link_file.fname.name}<-- for job {job_id}')
                     self.c_plugin_inst.size += link_file.fname.size
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.error(f'[CODE09,{job_id}]: Error while creating link file '
                              f'to {path} from {parent_folder.path} in storage, '
@@ -634,18 +660,39 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 raise
         else:  # path is a folder
             try:
-                link_file = ChrisLinkFile(path=path, owner=owner,
-                                          parent_folder=parent_folder)
+                link_file = self._link_file(path, owner, parent_folder,
+                                            str_source_trace_dir)
                 link_file.save(name=str_source_trace_dir)
                 logger.info(f'Creating link file -->'
                             f'{link_file.fname.name}<-- for job {job_id}')
                 self.c_plugin_inst.size += link_file.fname.size
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.error(f'[CODE09,{job_id}]: Error while creating link file '
                              f'to {path} from {parent_folder.path} in storage, '
                              f'detail: {str(e)}')
                 self.c_plugin_inst.error_code = 'CODE09'
                 raise
+
+    @staticmethod
+    def _link_file(path, owner, parent_folder, name):
+        """
+        The link file named ``name`` in ``parent_folder`` to ``path``: the one an earlier
+        run of the registration created, whose storage object saving it writes again
+        (pfcon's fslink storage removes every link file from an output folder it lists),
+        or a new one. Raises when that name links another path: two paths whose names
+        come out the same.
+        """
+        fname = os.path.join(parent_folder.path, f'{name}.chrislink')
+        link_file = ChrisLinkFile.objects.filter(fname=fname).first()
+
+        if link_file is None:
+            return ChrisLinkFile(path=path, owner=owner, parent_folder=parent_folder)
+
+        if link_file.path != path:
+            raise ValueError(f'{fname} links {link_file.path}, not {path}')
+        return link_file
 
     def _handle_unextpath_parameters_innetwork_filesystem(self, unextpath_parameters_dict):
         """
@@ -669,6 +716,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
             for path in path_list:
                 try:
                     obj_list = self.storage_manager.ls(path)
+                except SoftTimeLimitExceeded:
+                    raise
                 except Exception as e:
                     logger.error(f'[CODE06,{job_id}]: Error while listing storage files '
                                  f'in {path}, detail: {str(e)}')
@@ -693,6 +742,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     try:
                         if not self.storage_manager.obj_exists(obj_output_path):
                             self.storage_manager.copy_obj(obj, obj_output_path)
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.error(f'[CODE09,{job_id}]: Error while copying file '
                                      f'from {obj} to {obj_output_path} in storage, '
@@ -726,6 +777,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 if obj.endswith('.chrislink'):
                     try:
                         path = self.storage_manager.download_obj(obj).decode().strip()
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.error(f'[CODE08,{job_id}]: Error while downloading file '
                                      f'{obj} from storage, detail: {str(e)}')
@@ -741,14 +794,14 @@ class PluginInstanceAppJob(PluginInstanceJob):
                             owner=owner)
                         link_folders[folder_path] = parent_folder
 
-                    try:
-                        ChrisLinkFile.objects.get(path=path, parent_folder=parent_folder)
-                    except ChrisLinkFile.DoesNotExist:
-                        self._create_chris_link_file(path, parent_folder)
+                    # also the one an earlier run created: the remote removed its file
+                    self._create_chris_link_file(path, parent_folder)
                 else:
                     try:
                         if not self.storage_manager.obj_exists(obj_output_path):
                             self.storage_manager.copy_obj(obj, obj_output_path)
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.error(f'[CODE09,{job_id}]: Error while copying file '
                                      f'from {obj} to {obj_output_path} in storage, '
@@ -761,19 +814,19 @@ class PluginInstanceAppJob(PluginInstanceJob):
         """
         Handle the 'finishedSuccessfully' status returned by the remote compute.
         """
-        self._job_ended('finishedSuccessfully')
+        self._job_ended()
 
     def handle_finished_with_error_status(self):
         """
         Handle the 'finishedWithError' status returned by the remote compute.
         """
-        self._job_ended('finishedWithError')
+        self._job_ended()
 
-    def _job_ended(self, remote_status):
+    def _job_ended(self):
         """
-        The remote job has ended with ``remote_status``: the task that moves the instance
-        on, out of 'started', has its output uploaded (an upload job, on the queue of
-        submissions) or registers it.
+        The remote job has ended, whichever way: the task that moves the instance on, out of
+        'started', has its output uploaded (an upload job, on the queue of submissions) or
+        registered (the registration asks the remote how the job ended).
         """
         now = timezone.now()
 
@@ -784,36 +837,184 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 self.enqueue_run('PluginInstanceUploadJob')
             return
 
+        # the task that moves it on has a task of its own register the files, on the
+        # queue of registrations
         if self.c_plugin_inst.transition('registeringFiles', 'started', end_date=now):
-            self.register_output(remote_status)
+            self.enqueue_registration()
 
-    def register_output(self, remote_status):
+    #: how many times the registration asks the remote how the job ended, a few seconds
+    #: apart, before it gives up
+    REMOTE_STATUS_TRIES = 3
+
+    def copies_unextpath_objects(self):
         """
-        Register the output files of a plugin instance in 'registeringFiles' whose remote
-        job ended with ``remote_status`` (the caller moved it there), then end it:
-        'finishedSuccessfully', 'finishedWithError' or, when that failed or the remote
-        status is neither of those, 'cancelled', as long as it is still registering files
-        (a cancel meanwhile wins), with its remote cleanup.
+        Whether registering the output copies into it every object under the paths of
+        the 'unextpath' parameters (an in-network remote with 'filesystem' storage) rather
+        than writing a link file per path.
         """
-        # a record of the registration's start, which a periodic task reads to cancel
-        # the instances stuck in it
-        PluginInstanceLock.objects.get_or_create(plugin_inst=self.c_plugin_inst)
-        # the total of what this registration finds, however often it runs
+        return self.pfcon_client.pfcon_innetwork and self.storage_env == 'filesystem'
+
+    def registers_at_most(self, max_files):
+        """
+        Whether registering the output registers ``max_files`` files at most, as far as
+        storage tells before the registration fetches anything from the remote. It
+        counts the files the plugin wrote (an in-network remote's are in storage already)
+        and those the registration adds to them (see register_output_files_on_success):
+        for each path of the 'unextpath' parameters, a copy of every object under it or
+        one link file (copies_unextpath_objects), and for a 'ts' plugin a copy of every
+        object of its input instances' outputs (its filters can only leave some out). It
+        counts objects, not bytes. Each listing asks for one object more than the count
+        has room for, so the answer costs a few requests whatever the output's size.
+        False when the remote sends the output as a zip, not in storage yet, and when a
+        'ts' input holds a link file, whose target the registration copies too.
+        """
+        if not self.pfcon_client.pfcon_innetwork:
+            return False
+
+        unextpath_parameters_dict, _ = self.get_plugin_instance_path_parameters()
+        unextpaths = [path for value in unextpath_parameters_dict.values()
+                      for path in value.split(',')]
+        plg_inst_ids, _, _ = self.get_ts_plugin_instance_parameters()
+        inputs = PluginInstance.objects.filter(
+            pk__in=[int(inst_id) for inst_id in plg_inst_ids]).select_related(
+            'output_folder')
+
+        count = 0
+        prefixes = [(self.c_plugin_inst.get_output_path(), False)]
+        if self.copies_unextpath_objects():
+            prefixes += [(path, False) for path in unextpaths]
+        else:
+            count += len(unextpaths)
+        prefixes += [(inst.get_output_path(), True) for inst in inputs]
+
+        for prefix, is_input in prefixes:
+            if count > max_files:
+                break
+            objs = self.storage_manager.ls(prefix, limit=max_files - count + 1)
+            if is_input and any(obj.endswith('.chrislink') for obj in objs):
+                return False
+            count += len(objs)
+        return count <= max_files
+
+    def register_output(self):
+        """
+        Register the output files of the plugin instance, which is in 'registeringFiles'
+        (a status check moved it there when its remote job ended), and end it:
+        'finishedSuccessfully' or 'finishedWithError' as the remote says the job ended
+        (the latter however far registering its files got), or 'cancelled' when
+        registering the files of a job that succeeded failed, or the remote does not say
+        the job ended, as long as it is still registering files (a cancel meanwhile
+        wins), with its remote cleanup.
+
+        It may run more than once, one after another (a task redelivered after its worker
+        died) or at once (redelivered while it ran): each run claims the registration with
+        a token of its own, the newest wins, and only the run that owns it writes the final
+        status. What a run writes before is the same whatever the runs: files already
+        registered are left as they are and link files are written again.
+        """
+        token = self._registration_token = self._claim_registration()
+        # the total of what this run registers: a run again counts every file again
         self.c_plugin_inst.size = 0
+        self._links_written = set()
+        remote_status = self._remote_job_status()
 
-        if remote_status == 'finishedSuccessfully':
+        if not self._owns_registration():
+            # a newer run or a cancel has taken it meanwhile: no fetch either (on fslink
+            # the remote's listing removes the link files of the output folder, which the
+            # other run writes)
+            final = 'cancelled'
+        elif remote_status == 'finishedSuccessfully':
             final = self.register_output_files_on_success()
         elif remote_status == 'finishedWithError':
             final = self.register_output_files_on_error()
         else:
-            logger.error(f'[CODE10,{self.str_job_id}]: Got {remote_status} status from '
-                         f'remote while registering files')
-            self.c_plugin_inst.error_code = 'CODE10'
+            if remote_status is not None:
+                logger.error(f'[CODE10,{self.str_job_id}]: Got {remote_status} status '
+                             f'from remote while registering files')
+                self.c_plugin_inst.error_code = 'CODE10'
             final = 'cancelled'
 
-        # 'size' is accumulated while registering output files or creating link files
-        self.end(final, 'registeringFiles', self.c_plugin_inst.error_code,
-                 size=self.c_plugin_inst.size)
+        self._end_registration(final, token)
+
+    def give_up_registration(self, error_code):
+        """
+        Cancel the instance, still registering files, with ``error_code``: its
+        registration cannot finish. A run that a newer one has taken over leaves the
+        instance to that one. Returns the ``StatusWrite``, or None when it left it.
+        """
+        token = self._registration_token
+        if token is not None and not PluginInstanceLock.objects.filter(
+                plugin_inst_id=self.c_plugin_inst.pk, owner_token=token).exists():
+            logger.info(f'A newer run of the registration of job {self.str_job_id} owns '
+                        f'it: this one cancels nothing')
+            return None
+        return self.cancel_exec(error_code, 'registeringFiles')
+
+    def _claim_registration(self):
+        """
+        Make this run the owner of the instance's registration, whose record keeps when
+        the first run started, and return the token that says so.
+        """
+        token = secrets.token_hex(16)
+        PluginInstanceLock.objects.update_or_create(plugin_inst_id=self.c_plugin_inst.pk,
+                                                    defaults={'owner_token': token})
+        return token
+
+    def _remote_job_status(self):
+        """
+        How the remote says the plugin job ended, or None (with CODE02) when it does not
+        answer after REMOTE_STATUS_TRIES tries.
+        """
+        job_id = self.str_job_id
+
+        for attempt in range(self.REMOTE_STATUS_TRIES):
+            try:
+                return self._get_status(JobType.PLUGIN, job_id)['compute']['status']
+            except PfconRequestException as e:
+                logger.error(f'[CODE02,{job_id}]: Error getting plugin job status at '
+                             f'pfcon url -->{self.pfcon_client.url}<-- while registering '
+                             f'files (try {attempt + 1}), detail: {str(e)}')
+                if attempt + 1 < self.REMOTE_STATUS_TRIES:
+                    time.sleep(5)
+
+        self.c_plugin_inst.error_code = 'CODE02'
+        return None
+
+    def _owns_registration(self):
+        """
+        Whether this run still owns the registration and the instance still registers
+        files: neither a newer run nor a cancel has taken it since its claim.
+        """
+        return PluginInstance.objects.filter(
+            pk=self.c_plugin_inst.pk, status='registeringFiles',
+            lock__owner_token=self._registration_token).exists()
+
+    def _end_registration(self, final, token):
+        """
+        End the instance with ``final``, its size and error code and its remote cleanup
+        armed, if this run still owns the registration and the instance is still
+        registering files; the remote cleanup's first job then goes out. When a cancel
+        won, its cleanup is armed again: it may have deleted the output folder before
+        this run inserted its files.
+        """
+        fields = {'size': self.c_plugin_inst.size, **ARM_REMOTE_CLEANUP}
+        if self.c_plugin_inst.error_code:
+            fields['error_code'] = self.c_plugin_inst.error_code
+
+        # the claim of a newer run waits for this lock, and this for its claim
+        with transaction.atomic():
+            owner = PluginInstanceLock.objects.select_for_update().filter(
+                plugin_inst_id=self.c_plugin_inst.pk, owner_token=token).first()
+            ended = (self.c_plugin_inst.transition(final, 'registeringFiles', **fields)
+                     if owner else None)
+
+        if owner is None:
+            logger.info(f'A newer run of the registration of job {self.str_job_id} owns '
+                        f'it: this one writes nothing')
+        elif ended:
+            self._submit_remote_cleanup()
+        elif ended.status == 'cancelled':
+            self.schedule_remote_cleanup(rearm=True)
 
     def register_output_files_on_success(self):
         """
@@ -854,8 +1055,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
             # upload files from unextracted path parameters
             d_unextpath_params, _ = self.get_plugin_instance_path_parameters()
             if d_unextpath_params:
-                if (self.pfcon_client.pfcon_innetwork and self.storage_env ==
-                        'filesystem'):
+                if self.copies_unextpath_objects():
                     self._handle_unextpath_parameters_innetwork_filesystem(
                         d_unextpath_params)
                 else:
@@ -867,6 +1067,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 self._handle_ts_unextracted_input_objs(d_ts_input_objs, tf)
 
             self._register_output_files()  # register output files in the DB
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             return 'cancelled'  # giving up
         return 'finishedSuccessfully'
@@ -944,6 +1146,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     self.unpack_zip_file(job_file_content)
 
                 self._register_output_files()  # register output files in the DB
+            except SoftTimeLimitExceeded:
+                raise
             except Exception:
                 pass  # giving up
         return 'finishedWithError'
@@ -993,6 +1197,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                                    f'deleting it from storage')
                     try:
                         self.storage_manager.delete_obj(obj_path)
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         # a non-deletable attacker-controlled link left in an
                         # output dir is a security-relevant state: fail the job
@@ -1017,10 +1223,32 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 plg_inst_file.fname.name = obj_path
                 files.append(plg_inst_file)
 
+        if self._registration_token and not self._owns_registration():
+            # a cancel's cleanup may be deleting the output: no rows for its files
+            logger.info(f'The registration of job {job_id} was cancelled or taken over: '
+                        f'this run registers no files')
+            self.plugin_inst_output_files = set()
+            return
+
         self.plugin_inst_output_files = {f.fname.name for f in files}
-        db_files = UserFile.objects.bulk_create(files)
+        db_files = self._insert_files(files)
 
         total_size = 0
         for plg_inst_file in db_files:
             total_size += plg_inst_file.fname.size
         self.c_plugin_inst.size += total_size
+
+    @staticmethod
+    def _insert_files(files):
+        """
+        Insert the rows of ``files`` and return them. A file that an earlier run of the
+        registration registered is left as it is: the INSERT fails at once on it and is
+        made again skipping the rows already there. The plain INSERT comes first because
+        one that skips conflicting rows checks every row before writing it, which makes
+        the insert of a large output about three-quarters longer.
+        """
+        try:
+            with transaction.atomic():
+                return UserFile.objects.bulk_create(files)
+        except IntegrityError:
+            return UserFile.objects.bulk_create(files, ignore_conflicts=True)

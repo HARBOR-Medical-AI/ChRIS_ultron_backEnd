@@ -3,11 +3,13 @@ import io
 import logging
 import time
 import uuid
+from datetime import timedelta
 from unittest import mock
 
 from django.test import TestCase, tag
 from django.contrib.auth.models import User
 from django.conf import settings
+from django.utils import timezone
 
 from pfconclient import client as pfcon
 from pfconclient.client import JobType
@@ -17,6 +19,7 @@ from core.models import ChrisInstance
 from core.storage import connect_storage
 from plugins.models import PluginMeta, Plugin, PluginParameter
 from plugininstances.models import PluginInstance, PathParameter, ComputeResource
+from plugininstances import tasks
 from plugininstances.services import uploadjobs
 from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
@@ -279,17 +282,32 @@ class PluginInstanceUploadJobTests(TestCase):
             plugin=plugin, owner=user, status='uploading',
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job._get_status = mock.Mock(
-            return_value={'compute': {'status': 'finishedSuccessfully', 'logs': ''}})
+        upload_job.enqueue_registration = mock.Mock()
 
-        with mock.patch('plugininstances.services.pluginjobs.PluginInstanceAppJob') as mock_cls:
-            mock_app_job = mock_cls.return_value
+        upload_job.handle_finished_successfully_status()
 
-            upload_job.handle_finished_successfully_status()
+        self.assertEqual(pl_inst.status, 'registeringFiles')
+        # by a task of its own, which asks the remote how the plugin job ended
+        upload_job.enqueue_registration.assert_called_once_with()
 
-            self.assertEqual(pl_inst.status, 'registeringFiles')
-            mock_cls.assert_called_once_with(pl_inst)
-            mock_app_job.register_output.assert_called_once_with('finishedSuccessfully')
+    def test_the_stuck_registration_sweep_counts_from_the_start_of_the_registration(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='uploading',
+            compute_resource=plugin.compute_resources.all()[0])
+        # the upload started, and end_date was stamped, five hours ago
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            end_date=timezone.now() - timedelta(hours=5))
+        pl_inst.refresh_from_db()
+        upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
+        upload_job.enqueue_registration = mock.Mock()
+
+        upload_job.handle_finished_successfully_status()
+        with mock.patch.object(tasks.cancel_plugin_instance_job, 'delay') as cancel:
+            tasks.cancel_plugin_instances_stuck_in_lock()
+
+        cancel.assert_not_called()
 
     def test_handle_finished_successfully_status_moved_on_by_another_task(self):
         user = User.objects.get(username=self.username)
@@ -298,30 +316,14 @@ class PluginInstanceUploadJobTests(TestCase):
             plugin=plugin, owner=user, status='uploading',
             compute_resource=plugin.compute_resources.all()[0])
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job._get_status = mock.Mock()
+        upload_job.enqueue_registration = mock.Mock()
         # an overlapping status check got there first
         PluginInstance.objects.filter(pk=pl_inst.pk).transition('registeringFiles',
                                                                 'uploading')
 
         upload_job.handle_finished_successfully_status()
 
-        upload_job._get_status.assert_not_called()  # nothing registered twice
-
-    def test_handle_finished_successfully_status_pfcon_error_on_plugin_status(self):
-        user = User.objects.get(username=self.username)
-        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
-        (pl_inst, tf) = PluginInstance.objects.get_or_create(
-            plugin=plugin, owner=user, status='uploading',
-            compute_resource=plugin.compute_resources.all()[0])
-        upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
-        upload_job._get_status = mock.Mock(side_effect=PfconRequestException('test error'))
-        upload_job.enqueue_run = mock.Mock()
-
-        upload_job.handle_finished_successfully_status()
-
-        self.assertEqual(pl_inst.status, 'cancelled')
-        self.assertEqual(pl_inst.error_code, 'CODE02')
-        upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
+        upload_job.enqueue_registration.assert_not_called()  # nothing registered twice
 
     def test_handle_finished_with_error_status(self):
         user = User.objects.get(username=self.username)
@@ -400,6 +402,11 @@ class PluginInstanceUploadJobTests(TestCase):
         enqueue = mock.patch.object(PluginInstanceJob, 'enqueue_run')
         enqueue.start()
         self.addCleanup(enqueue.stop)
+        register = mock.patch.object(PluginInstanceJob, 'enqueue_registration',
+                                     lambda job: PluginInstanceAppJob(
+                                         job.c_plugin_inst).register_output())
+        register.start()
+        self.addCleanup(register.stop)
         app_job = PluginInstanceAppJob(pl_inst)
         app_job.run()
 
@@ -455,6 +462,11 @@ class PluginInstanceUploadJobTests(TestCase):
         enqueue = mock.patch.object(PluginInstanceJob, 'enqueue_run')
         enqueue.start()
         self.addCleanup(enqueue.stop)
+        register = mock.patch.object(PluginInstanceJob, 'enqueue_registration',
+                                     lambda job: PluginInstanceAppJob(
+                                         job.c_plugin_inst).register_output())
+        register.start()
+        self.addCleanup(register.stop)
         app_job = PluginInstanceAppJob(pl_inst)
         app_job.run()
 

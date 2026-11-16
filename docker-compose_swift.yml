@@ -17,6 +17,27 @@ services:
       swift_service:
         condition: service_started
 
+  worker-register:
+    environment:
+      STORAGE_ENV: "swift"
+    depends_on:
+      swift_service:
+        condition: service_started
+
+  worker-heavy:
+    environment:
+      STORAGE_ENV: "swift"
+    depends_on:
+      swift_service:
+        condition: service_started
+
+  worker-background:
+    environment:
+      STORAGE_ENV: "swift"
+    depends_on:
+      swift_service:
+        condition: service_started
+
   worker-periodic:
     environment:
       STORAGE_ENV: "swift"

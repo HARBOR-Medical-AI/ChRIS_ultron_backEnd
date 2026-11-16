@@ -306,12 +306,17 @@ class DockerClient:
         env = container.attrs.get("Config", {}).get("Env", []) or []
         return dict(item.split("=", 1) for item in env if "=" in item)
 
+    #: seconds a restarted service has to stop before it is killed: above the soft shutdown
+    #: of the registration workers (docker-compose.yml worker-register and worker-heavy),
+    #: which gives the broker their running late-acknowledged tasks back
+    RESTART_TIMEOUT_S = 30
+
     def restart_service(self, service: str) -> bool:
         c = self.find_service(service)
         if c is None:
             return False
         try:
-            c.restart()
+            c.restart(timeout=self.RESTART_TIMEOUT_S)
             return True
         except Exception:                              # noqa: BLE001
             return False

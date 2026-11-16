@@ -29,7 +29,7 @@ from plugininstances.models import PathParameter, FloatParameter
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
 from plugininstances.services.copyjobs import PluginInstanceCopyJob
 from plugininstances.services.uploadjobs import PluginInstanceUploadJob
-from plugininstances import views
+from plugininstances import tasks, views
 from workflows.models import Workflow
 
 
@@ -371,7 +371,14 @@ class PluginInstanceListViewTests(TasksViewTests):
             self.assertEqual(response.data['status'], 'cancelled')
 
     @tag('integration')
+    @mock.patch.object(tasks, 'REGISTER_FAST_MAX_FILES', 0)
     def test_integration_plugin_instance_create_success(self):
+        # with no files allowed on the register queue its registration goes on to the
+        # register_large queue's task (the other integration tests register on register)
+        sent_on = mock.patch.object(tasks.register_large_plugin_instance_output, 'delay',
+                                    wraps=tasks.register_large_plugin_instance_output.delay)
+        large = sent_on.start()
+        self.addCleanup(sent_on.stop)
 
         # enable copy job flow for this integration test
         self.compute_resource.compute_requires_copy_job = True
@@ -458,7 +465,10 @@ class PluginInstanceListViewTests(TasksViewTests):
         b_checkAgain = True
         time.sleep(10)
         while b_checkAgain:
-            str_responseStatus = plg_inst_app_job.check_exec_status()
+            # the registration runs in the worker's task: its status is in the database
+            plg_inst_app_job.check_exec_status()
+            pl_inst.refresh_from_db()
+            str_responseStatus = pl_inst.status
             if str_responseStatus in ('finishedSuccessfully', 'uploading'):
                 b_checkAgain = False
             elif currentLoop < maxLoopTries:
@@ -474,10 +484,12 @@ class PluginInstanceListViewTests(TasksViewTests):
             for _ in range(10):
                 time.sleep(10)
                 upload_job.check_exec_status()
+                pl_inst.refresh_from_db()
                 if pl_inst.status == 'finishedSuccessfully':
                     break
 
         self.assertEqual(pl_inst.status, 'finishedSuccessfully')
+        large.assert_called_once_with(pl_inst.pk)
 
         # make sure output file was created in storage
         output_path = pl_inst.output_folder.path
@@ -569,7 +581,10 @@ class PluginInstanceListViewTests(TasksViewTests):
         b_checkAgain = True
         time.sleep(10)
         while b_checkAgain:
-            str_responseStatus = plg_inst_app_job.check_exec_status()
+            # the registration runs in the worker's task: its status is in the database
+            plg_inst_app_job.check_exec_status()
+            pl_inst.refresh_from_db()
+            str_responseStatus = pl_inst.status
             if str_responseStatus in ('finishedSuccessfully', 'uploading'):
                 b_checkAgain = False
             elif currentLoop < maxLoopTries:
@@ -583,6 +598,7 @@ class PluginInstanceListViewTests(TasksViewTests):
             for _ in range(10):
                 time.sleep(10)
                 upload_job.check_exec_status()
+                pl_inst.refresh_from_db()
                 if pl_inst.status == 'finishedSuccessfully':
                     break
 
@@ -715,7 +731,10 @@ class PluginInstanceListViewTests(TasksViewTests):
         b_checkAgain = True
         time.sleep(10)
         while b_checkAgain:
-            str_responseStatus = plg_inst_app_job.check_exec_status()
+            # the registration runs in the worker's task: its status is in the database
+            plg_inst_app_job.check_exec_status()
+            pl_inst.refresh_from_db()
+            str_responseStatus = pl_inst.status
             if str_responseStatus in ('finishedSuccessfully', 'uploading'):
                 b_checkAgain = False
             elif currentLoop < maxLoopTries:
@@ -729,6 +748,7 @@ class PluginInstanceListViewTests(TasksViewTests):
             for _ in range(10):
                 time.sleep(10)
                 upload_job.check_exec_status()
+                pl_inst.refresh_from_db()
                 if pl_inst.status == 'finishedSuccessfully':
                     break
 
@@ -917,6 +937,7 @@ class PluginInstanceDetailViewTests(TasksViewTests):
             for _ in range(10):
                 time.sleep(10)
                 upload_job.check_exec_status()
+                pl_inst.refresh_from_db()
                 if pl_inst.status == 'finishedSuccessfully':
                     break
             response = self.client.get(read_update_delete_url)

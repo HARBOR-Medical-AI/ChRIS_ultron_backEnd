@@ -8,7 +8,9 @@ Run via justfile:
     just test-unit
 """
 
+import os
 import tempfile
+from pathlib import Path
 
 from django.test import TestCase
 
@@ -201,6 +203,38 @@ class FilesystemManagerLargeOpsTests(TestCase):
             self.manager.upload_obj(f'test/bulk/{i:04d}.dat', b'x')
         result = self.manager.ls('test/bulk')
         self.assertEqual(len(result), count)
+
+    def test_ls_lists_its_limit_at_most(self):
+        names = {f'test/bulk/{i:04d}.dat' for i in range(5)}
+        for name in names:
+            self.manager.upload_obj(name, b'x')
+
+        some = self.manager.ls('test/bulk/', limit=3)
+
+        self.assertEqual(len(some), 3)
+        self.assertLessEqual(set(some), names)
+        self.assertEqual(set(self.manager.ls('test/bulk/', limit=10)), names)
+        self.assertEqual(self.manager.ls('test/bulk/0000.dat', limit=1),
+                         ['test/bulk/0000.dat'])  # a file's own path
+
+    def test_ls_with_a_limit_finds_the_files_it_finds_without(self):
+        base = Path(self._tmp.name)
+        for name in ('a.txt', 'sub/b.txt', 'sub/deeper/c.txt'):
+            self.manager.upload_obj(f'test/bulk/{name}', b'x')
+        self.manager.upload_obj('elsewhere/d.txt', b'x')
+        self.addCleanup(self.manager.delete_path, 'elsewhere')
+        os.symlink(base / 'elsewhere', base / 'test/bulk/to_a_dir')
+        os.symlink(base / 'test/bulk/a.txt', base / 'test/bulk/to_a_file')
+        os.symlink(base / 'nowhere', base / 'test/bulk/dangling')
+
+        everything = self.manager.ls('test/bulk')
+
+        self.assertEqual(sorted(everything), ['test/bulk/a.txt', 'test/bulk/sub/b.txt',
+                                              'test/bulk/sub/deeper/c.txt',
+                                              'test/bulk/to_a_file'])
+        self.assertEqual(sorted(self.manager.ls('test/bulk', limit=10)),
+                         sorted(everything))
+        self.assertEqual(self.manager.ls('test/nothing', limit=10), [])
 
     def test_bulk_delete(self):
         count = 25

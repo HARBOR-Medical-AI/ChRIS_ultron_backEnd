@@ -53,14 +53,15 @@ class SwiftManager(StorageManager):
             logger.error(str(e))
             raise
 
-    def ls(self, path):
+    def ls(self, path, limit=None):
         """
         Return a list of objects in the swift storage with the provided path
-        as a prefix.
+        as a prefix, of ``limit`` objects at most when given, in one request: Swift
+        refuses a limit above its listing limit (10,000 by default) with a 412.
         """
-        return self._ls(path, b_full_listing=True)
+        return self._ls(path, b_full_listing=limit is None, limit=limit)
 
-    def _ls(self, path, b_full_listing: bool):
+    def _ls(self, path, b_full_listing: bool, limit=None):
         """
         Note to developers: the body of ``_ls`` was originally the body of ``self.ls``,
         though it's been renamed to ``_ls`` so that ``self.ls``'s signature could be
@@ -71,9 +72,11 @@ class SwiftManager(StorageManager):
             conn = self.__get_connection()
             for i in range(5):
                 try:
-                    # get the full list of objects in Swift storage with given prefix
+                    # the objects in Swift storage with the given prefix: all of them,
+                    # or the first page, of ``limit`` objects at most when given
                     ld_obj = conn.get_container(self.container_name,
                                                 prefix=path,
+                                                limit=limit,
                                                 full_listing=b_full_listing)[1]
                 except ClientException as e:
                     logger.error(str(e))

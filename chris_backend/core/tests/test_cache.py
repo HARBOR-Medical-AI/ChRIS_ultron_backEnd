@@ -360,6 +360,19 @@ class MarkOnceTests(CacheTestCase):
         self.assertTrue(mark_once(key, 30))
         clear_mark(key)
 
+    def test_a_mark_with_a_token_is_cleared_by_that_token_alone(self):
+        key, mine, theirs = _name(), _name(), _name()
+        self.assertTrue(mark_once(key, 30, token=mine))
+
+        clear_mark(key, theirs)
+        self.assertFalse(mark_once(key, 30, token=theirs))  # still mine
+
+        clear_mark(key, mine)
+        self.assertTrue(mark_once(key, 30, token=theirs))
+        clear_mark(key)  # without a token: whosever it is
+        self.assertTrue(mark_once(key, 30))
+        clear_mark(key)
+
 
 class SlotTests(CacheTestCase):
 
@@ -624,6 +637,22 @@ class RefusalTests(CacheTestCase):
         self.assertEqual(_raw().exists(lock.key), 0)
         _raw().delete(mark)
 
+    def test_a_refused_replay_of_a_clear_with_a_token_is_named_clear_mark(self):
+        location = self.acl_user(caches['default'].make_key('lock:*'))
+        mark = _key('mark', _name())
+        _raw().set(mark, 'mine', px=30000)
+
+        with self.cache_at(location):
+            core_cache._health.defer(('mark', mark, 'mine'))
+
+            with self.assertLogs('core.cache', 'ERROR') as logs:
+                self.assertFalse(acquire_lock(_name(), 5).degraded)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn('refused clear_mark', logs.output[0])
+        self.assertEqual(_raw().exists(mark), 1)
+        _raw().delete(mark)
+
     def test_a_refused_script_exists_logs_its_whole_batch_and_leaves_it_to_the_ttls(self):
         # SCRIPT EXISTS goes ahead of the pipeline and raises, rather than returning
         location = self.acl_user(caches['default'].make_key('*'), commands=['-script'])
@@ -827,6 +856,23 @@ class DegradedModeTests(ProxiedCacheTestCase):
         self.assertTrue(mark_once(key, 30))
         release_slot(again)
         clear_mark(key)
+
+    def test_a_mark_cleared_with_its_token_during_an_outage_is_cleared_with_it(self):
+        mine, theirs = _name(), _name()
+        self.assertTrue(mark_once(mine, 30, 'mine'))  # a mark with a token
+        self.assertTrue(mark_once(theirs, 30, 'theirs'))
+        self.proxy.stop()
+        with self.assertLogs('core.cache', 'WARNING'):
+            clear_mark(mine, 'mine')
+            clear_mark(theirs, 'mine')  # a later caller's mark: it stays
+        self.proxy.start()
+        self.wait_for_retry()
+
+        with self.assertLogs('core.cache', 'INFO'):
+            self.assertTrue(mark_once(mine, 30))  # the replay went first
+        self.assertFalse(mark_once(theirs, 30))
+        clear_mark(mine)
+        clear_mark(theirs)
 
     def test_a_release_kept_through_a_second_failure_is_still_replayed(self):
         name = _name()

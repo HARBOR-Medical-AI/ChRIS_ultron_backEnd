@@ -10,6 +10,8 @@ import json
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
 
+from django.utils import timezone
+
 from core.utils import json_zip2str
 from plugininstances.models import PluginInstance
 from .abstractjobs import PluginInstanceJob
@@ -141,33 +143,16 @@ class PluginInstanceUploadJob(PluginInstanceJob):
     def handle_finished_successfully_status(self):
         """
         Handle the 'finishedSuccessfully' status returned by the remote compute: the task
-        that moves the instance on, to 'registeringFiles', asks the remote how its plugin
-        job ended and has PluginInstanceAppJob register the files it uploaded.
+        that moves the instance on, to 'registeringFiles', has a task of its own register
+        the files the upload job fetched (the registration asks the remote how the plugin
+        job ended).
         """
-        if not self.c_plugin_inst.transition('registeringFiles', 'uploading'):
-            return
-
-        job_id = self.str_job_id
-        logger.info(f'Successfully finished plugin instance upload job {job_id}')
-
-        pfcon_url = self.pfcon_client.url
-        logger.info(f'Sending job status request to pfcon url -->{pfcon_url}<-- for '
-                    f'plugin job {job_id}')
-        try:
-            d_resp = self._get_status(JobType.PLUGIN, job_id)
-        except PfconRequestException as e:
-            logger.error(f'[CODE02,{job_id}]: Error getting plugin job status at '
-                         f'pfcon url -->{pfcon_url}<-- while registering files, '
-                         f'detail: {str(e)}')
-            self.end('cancelled', 'registeringFiles', 'CODE02')
-            return
-
-        logger.info(f'Successful job status response from pfcon url '
-                    f'-->{pfcon_url}<-- for plugin job {job_id}: '
-                    f'{json.dumps(d_resp, indent=4)} while registering files')
-
-        from .pluginjobs import PluginInstanceAppJob
-        PluginInstanceAppJob(self.c_plugin_inst).register_output(d_resp['compute']['status'])
+        # the sweep of stuck registrations counts from end_date, so it starts here
+        if self.c_plugin_inst.transition('registeringFiles', 'uploading',
+                                         end_date=timezone.now()):
+            logger.info(f'Successfully finished plugin instance upload job '
+                        f'{self.str_job_id}')
+            self.enqueue_registration()
 
     def handle_finished_with_error_status(self):
         """

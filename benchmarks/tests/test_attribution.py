@@ -15,7 +15,7 @@ from unittest import mock
 
 import pytest
 
-from benchmarks.broker import BrokerClient, encode_command, parse_reply
+from benchmarks.broker import CELERY_QUEUES, BrokerClient, encode_command, parse_reply
 from benchmarks.docker_client import (CGROUP_COUNTERS_CMD, CONTAINER_START_KEY, DockerClient,
                                       parse_cgroup_counters)
 from benchmarks.environment import (ENVELOPE_KEYS, POSTGRES_SETTINGS, collect_environment,
@@ -56,18 +56,20 @@ def test_broker_unreachable_degrades_to_empty():
 def test_depths_send_the_llens_together_on_one_connection():
     """
     A one-connection-at-a-time RESP server: the PING of the constructor, then one
-    connection carrying the three LLENs.
+    connection carrying an LLEN per queue.
     """
     server = socket.create_server(("127.0.0.1", 0))
     received = []
+    lengths = b"".join(b":%d\r\n" % n for n in range(1, len(CELERY_QUEUES) + 1))
 
     def serve():
-        for reply in (b"+PONG\r\n", b":1\r\n:22\r\n:333\r\n"):
+        for reply in (b"+PONG\r\n", lengths):
             conn, _ = server.accept()
             with conn:
                 data = b""
                 # a PING is 3 lines of RESP, each LLEN 5
-                while data.count(b"\r\n") < (3 if reply == b"+PONG\r\n" else 15):
+                lines = 3 if reply == b"+PONG\r\n" else 5 * len(CELERY_QUEUES)
+                while data.count(b"\r\n") < lines:
                     data += conn.recv(4096)
                 received.append(data)
                 conn.sendall(reply)
@@ -79,9 +81,11 @@ def test_depths_send_the_llens_together_on_one_connection():
     thread.join(2)
     server.close()
 
-    assert depths == {"main1": 1, "main2": 22, "periodic": 333}  # nosec B101 - pytest assertion
+    expected = {q: n for n, q in enumerate(CELERY_QUEUES, 1)}
+    assert depths == expected  # nosec B101 - pytest assertion
     assert received[1] == b"".join(  # nosec B101 - pytest assertion
-        encode_command("LLEN", q) for q in ("main1", "main2", "periodic"))
+        encode_command("LLEN", q) for q in CELERY_QUEUES)
+    assert "status" in CELERY_QUEUES and "main2" not in CELERY_QUEUES  # nosec B101 - pytest assertion
 
 
 def _one_reply_server(reply):
@@ -214,6 +218,18 @@ def test_oldest_wait_asks_for_the_end_of_the_list_that_brpop_pops():
         client.oldest_wait("status", 1.0)
 
     pipeline.assert_called_once_with([("LINDEX", "status", "-1")])
+
+
+def test_restart_service_waits_its_timeout_and_never_raises():
+    container = mock.Mock()
+    client = DockerClient.__new__(DockerClient)
+    client.find_service = lambda service: container if service == "worker-mains" else None
+
+    assert client.restart_service("worker-mains") is True  # nosec B101 - pytest assertion
+    container.restart.assert_called_once_with(timeout=30)
+    assert client.restart_service("gone") is False  # nosec B101 - pytest assertion
+    container.restart.side_effect = RuntimeError("the engine timed out")
+    assert client.restart_service("worker-mains") is False  # nosec B101 - pytest assertion
 
 
 def test_queue_rollup_peak_and_mean():

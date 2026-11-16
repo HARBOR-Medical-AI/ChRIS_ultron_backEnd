@@ -197,10 +197,12 @@ Python tools are dev dependencies for `just lint`.
   its descendants too, finished ones included (`plugininstances.utils.
   cancel_plugin_instance_tree`), while a job or task that cancels an instance leaves its
   waiting children to the beat, which cancels them. `plugininstances.utils.run_if_ready`
-  decides whether a new instance runs now or waits on its parents; the `periodic` beat tasks in
-  `plugininstances/tasks.py` advance waiting instances, poll running ones, and cancel stuck
-  ones. Several tasks can act on one instance at once, so only `PluginInstance.transition`
-  (and the queryset's `transition`, and `cancel`, which arms the remote cleanup in the same
+  decides whether a new instance runs now or waits on its parents; a registration that ends an
+  instance `finishedSuccessfully` schedules the ready waiting instances of its feed at once,
+  and the `periodic` beat tasks in `plugininstances/tasks.py` advance the rest, poll running
+  ones, and cancel stuck ones. Several tasks can act on one instance at once, so only
+  `PluginInstance.transition` (and the queryset's `transition`, and `cancel`, which arms the
+  remote cleanup in the same
   UPDATE when the row is in a status with a remote job, `REMOTE_JOB_STATUSES`) writes
   `status`: a conditional UPDATE from the statuses the writer expects, after
   which only the winner does what follows (a guard test in
@@ -214,9 +216,22 @@ Python tools are dev dependencies for `just lint`.
   (`compute_innetwork`, `compute_requires_copy_job`, `compute_requires_upload_job`) select which
   jobs run. Post-terminal cleanup is tracked separately in `remote_cleanup_status`. Errors are
   logged and stored as `CODEnn` codes on the instance.
-- Celery: queues `main1`, `main2`, `periodic` with explicit `task_routes` and the beat schedule in
-  `core/celery.py` (`CUBE_CELERY_POLL_INTERVAL` env var). Compose runs `worker-mains`,
-  `worker-periodic`, and `celery-scheduler` (django-celery-beat DatabaseScheduler).
+- Celery: one queue per class of task (`submit`, `status`, `register`, `register_large`,
+  `delete`, `cleanup`, `pacs`, `periodic`) in one table in `core/celery.py` (`TASK_QUEUES`),
+  which also sets each class's time limits (`CUBE_CELERY_TIME_LIMITS_<QUEUE>`), the late
+  acknowledgement of the registrations under the broker's visibility timeout, and the beat
+  schedule (`CUBE_CELERY_POLL_INTERVAL`). Route a task there, never with `queue=` at a call
+  site: the test run's `task_routes=None` cannot send such a task to `celery`, so it reaches
+  the real queue (a running stack consumes it), and the test runner fails the run only if a
+  test publishes it. Compose runs `worker-mains` (`submit,status`), `worker-register`
+  (`register`), `worker-heavy` (`register_large,delete`), `worker-background`
+  (`cleanup,pacs`), `worker-periodic` and `celery-scheduler` (django-celery-beat
+  DatabaseScheduler); oxidicom publishes to `pacs` (`OXIDICOM_QUEUE_NAME`). The status checks
+  go out through `core.tasks.DedupedTask.enqueue_once` (one pending per instance), a
+  registration is a task of its own (`register_plugin_instance_output`), which sends one of
+  more than `CUBE_CELERY_REGISTER_FAST_MAX_FILES` files (counted by bounded listings,
+  `PluginInstanceAppJob.registers_at_most`), or one that reaches its 5-minute soft time
+  limit, on to `register_large`, and `manage.py queuestats` shows the backlog.
 - Deletion of feeds, folders, plugin instances, and PACS series is asynchronous:
   `AsyncDeletableModel.mark_deletion_pending()` then a `delete_*` task; the tasks are idempotent
   and record failures in `deletion_status`/`deletion_error`.

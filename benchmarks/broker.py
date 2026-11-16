@@ -1,7 +1,7 @@
 """
 Celery queue-depth sampling against the Redis-protocol broker (Dragonfly).
 
-Queue depth is the earliest place backpressure shows: a growing ``main2`` list means
+Queue depth is the earliest place backpressure shows: a growing ``status`` list means
 status checks are produced faster than the worker slots consume them, long before
 CPU graphs make that obvious. Celery queues are plain Redis lists named after the
 queue so a depth sample is one ``LLEN`` per queue.
@@ -19,7 +19,9 @@ import socket
 from typing import Optional
 
 
-CELERY_QUEUES = ("main1", "main2", "periodic")
+#: CUBE's Celery queues (chris_backend/core/celery.py QUEUES)
+CELERY_QUEUES = ("submit", "status", "register", "register_large", "delete", "cleanup",
+                 "pacs", "periodic")
 
 #: the queue of the status checks, at most one pending per running instance
 STATUS_QUEUE = "status"
@@ -31,7 +33,7 @@ PUBLISHED_AT_HEADER = "cube_published_at"
 
 def encode_command(*args: str) -> bytes:
     """
-    RESP array of bulk strings, e.g. LLEN main1.
+    RESP array of bulk strings, e.g. LLEN status.
     """
     out = f"*{len(args)}\r\n".encode()
     for arg in args:

@@ -9,18 +9,41 @@ docker-compose_swift.yml.
 Run via justfile:
     just set-storage swift
     just test-integration
+
+SwiftManagerListingTests checks what ``ls`` asks a mocked connection, and runs in every
+mode.
 """
 
 import unittest
+from unittest import mock
 
 from django.conf import settings
-from django.test import TestCase, tag
+from django.test import SimpleTestCase, TestCase, tag
 
 from core.storage.swiftmanager import SwiftManager
 
 
 def _get_manager():
     return SwiftManager(settings.SWIFT_CONTAINER_NAME, settings.SWIFT_CONNECTION_PARAMS)
+
+
+class SwiftManagerListingTests(SimpleTestCase):
+    """
+    What ``SwiftManager.ls`` asks its connection, a mock: no Swift service needed.
+    """
+
+    def test_a_limit_asks_for_one_page_of_that_many_objects_and_none_for_all(self):
+        manager = SwiftManager('container', {})
+        manager._conn = mock.Mock()
+        manager._conn.get_container.return_value = (
+            {}, [{'name': 'a/1'}, {'name': 'a/2'}])
+
+        self.assertEqual(manager.ls('a/', limit=2), ['a/1', 'a/2'])
+        manager.ls('a/')
+
+        self.assertEqual(manager._conn.get_container.call_args_list, [
+            mock.call('container', prefix='a/', limit=2, full_listing=False),
+            mock.call('container', prefix='a/', limit=None, full_listing=True)])
 
 
 @tag('integration')
@@ -202,6 +225,17 @@ class SwiftManagerLargeOpsTests(TestCase):
             self.manager.upload_obj(f'test/bulk/{i:04d}.dat', b'x')
         result = self.manager.ls('test/bulk/')
         self.assertEqual(len(result), count)
+
+    def test_ls_lists_its_limit_at_most(self):
+        names = {f'test/bulk/{i:04d}.dat' for i in range(5)}
+        for name in names:
+            self.manager.upload_obj(name, b'x')
+
+        some = self.manager.ls('test/bulk/', limit=3)
+
+        self.assertEqual(len(some), 3)
+        self.assertLessEqual(set(some), names)
+        self.assertEqual(set(self.manager.ls('test/bulk/', limit=10)), names)
 
     def test_bulk_delete(self):
         count = 25

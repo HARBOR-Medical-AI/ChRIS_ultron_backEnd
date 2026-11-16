@@ -139,28 +139,30 @@ def release_lock(lease):
     return _release(lease, 'lock')
 
 
-def mark_once(key, ttl):
+def mark_once(key, ttl, token=None):
     """
     Whether this is the first call for ``key`` in the last ``ttl`` seconds (since a
-    ``clear_mark``). True when the cache does not answer or refuses the command.
+    ``clear_mark``). True when the cache does not answer or refuses the command. With a
+    ``token`` (a string) the mark is that token's: ``clear_mark`` clears it only with it.
     """
     px = _milliseconds(ttl)
     cache_key = _cache().make_key(f'mark:{key}')
-    reply = _call('mark_once', lambda client: client.set(cache_key, 1, nx=True, px=px))
+    value = 1 if token is None else token
+    reply = _call('mark_once', lambda client: client.set(cache_key, value, nx=True, px=px))
     return reply is _SKIPPED or reply is _FAILED or bool(reply)
 
 
-def clear_mark(key):
+def clear_mark(key, token=None):
     """
-    Let the next ``mark_once`` for ``key`` return true.
+    Let the next ``mark_once`` for ``key`` return true; with a ``token``, only if the mark
+    is still the one ``mark_once`` set with it, and not a later caller's.
 
-    A clear that an outage kept for later is replayed without a token so it can end a
-    window that another caller opened once the cache answered again: that caller's work
-    then runs twice at worst.
+    A clear without a token that an outage kept for later is replayed without one, so it
+    can end a window that another caller opened once the cache answered again: that
+    caller's work then runs twice at worst. One with a token is replayed with it.
     """
-    cache_key = _cache().make_key(f'mark:{key}')
-    _call('clear_mark', lambda client: client.delete(cache_key),
-          defer=('mark', cache_key, None))
+    clear = ('mark', _cache().make_key(f'mark:{key}'), token)
+    _call('clear_mark', lambda client: _apply(client, *clear), defer=clear)
 
 
 def acquire_slot(name, ceiling, ttl):
@@ -653,10 +655,12 @@ def _call(op, command, defer=None):
 
 def _apply(client, kind, key, token):
     """
-    Release a lock or slot by its token, or clear a mark, on a client or a pipeline. A
-    client returns how many it freed, 0 or 1.
+    Release a lock or slot by its token, or clear a mark (with a token, only while the
+    mark is still that token's), on a client or a pipeline. A client returns how many it
+    freed, 0 or 1.
     """
-    if kind == 'lock':
+    if kind == 'lock' or (kind == 'mark' and token is not None):
+        # the compare-and-delete of a lock's release
         return _RELEASE_LOCK(keys=[key], args=[token], client=client)
 
     if kind == 'slot':

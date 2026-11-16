@@ -57,7 +57,11 @@ SAMPLER_DOCKER_TIMEOUT_S = 10.0
 #: snapshot waits this long to include them
 RUN_STATS_SETTLE_S = 11.0
 
-RESTART_SERVICES = ("chris", "worker-mains", "worker-periodic", "celery-scheduler")
+#: CUBE's own services: the run refuses to start when any of them is missing (a queue
+#: nobody consumes leaves its scenarios hanging to their timeout) and restarts them when
+#: health does not come back after a failure
+RESTART_SERVICES = ("chris", "worker-mains", "worker-register", "worker-heavy",
+                    "worker-background", "worker-periodic", "celery-scheduler")
 
 #: the Celery workers among them, whose log volume each scenario records
 WORKER_SERVICES = tuple(s for s in RESTART_SERVICES if s.startswith("worker-"))
@@ -106,6 +110,11 @@ class BenchmarkRunner:
         
         self.broker = BrokerClient(broker_host, int(broker_port or 6379))
         self.pg_stats = PgStatStatements(self.docker)
+
+        missing = missing_services(self.docker, RESTART_SERVICES)
+        if missing:
+            raise RuntimeError(f"[bench] CUBE services not running: {', '.join(missing)}. "
+                               f"Start the stack with 'just bench-start'.")
         
         self.pins = pins
         self.plugins = {role: resolve_plugin(self.api, name)
@@ -358,7 +367,7 @@ class BenchmarkRunner:
         # were sampled differently
         env["sampler"] = sampler_record(
             STATS_INTERVAL_S, QUEUE_INTERVAL_S if self.broker.available else None,
-            SAMPLER_WORKERS)
+            SAMPLER_WORKERS, queues=self.broker.queues if self.broker.available else ())
 
         env["attribution"] = {
             "resource_sampling": True if self.sampler_docker.available
@@ -420,6 +429,15 @@ def apply_build_errors(classification: Classification, build_errors: list) -> Cl
             Verdict.FAIL,
             classification.criteria + (f"build_error:{len(build_errors)}",))
     return classification
+
+
+def missing_services(docker: DockerClient, services: tuple[str, ...]) -> list[str]:
+    """
+    The ``services`` that have no running container; none when Docker cannot tell.
+    """
+    if not docker.available:
+        return []
+    return [s for s in services if docker.find_service(s) is None]
 
 
 def apply_orphan_cancels(classification: Classification, orphans: list) -> Classification:

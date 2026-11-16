@@ -148,11 +148,27 @@ class PluginInstanceJob(abc.ABC):
     def enqueue_run(self, job_class_name):
         """
         Have a task submit the job of the class named ``job_class_name`` for the plugin
-        instance: a status check never submits a job itself.
+        instance: the status checks of the copy, plugin and upload jobs never submit one
+        themselves. The delete job of the remote cleanup has a task of its own, on the
+        cleanup's queue, and its status check, on that queue too, submits it again itself
+        when the remote does not have it.
         """
-        from plugininstances.tasks import run_plugin_instance_job
+        from plugininstances.tasks import (run_plugin_instance_cleanup_job,
+                                           run_plugin_instance_job)
 
-        run_plugin_instance_job.delay(self.c_plugin_inst.id, job_class_name)
+        if job_class_name == 'PluginInstanceDeleteJob':
+            run_plugin_instance_cleanup_job.delay(self.c_plugin_inst.id)
+        else:
+            run_plugin_instance_job.delay(self.c_plugin_inst.id, job_class_name)
+
+    def enqueue_registration(self):
+        """
+        Have a task register the plugin instance's output files, on the queue of
+        registrations: a status check never registers them itself.
+        """
+        from plugininstances.tasks import register_plugin_instance_output
+
+        register_plugin_instance_output.delay(self.c_plugin_inst.id)
 
     def job_exists(self, job_type: JobType) -> dict | None:
         """

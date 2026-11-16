@@ -194,19 +194,9 @@ NATS_ADDRESS = 'nats://nats:4222'
 PFDCM_ADDRESS = 'http://pfdcm:4005'
 
 
-# Celery settings
+# Celery settings (see common.py)
 
 CELERY_BROKER_URL = 'redis://chris-broker:6379/0'
-
-#: Only add pickle to this list if your broker is secured
-#: from unwanted access (see userguide/security.html)
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-
-# Worker settings
-# messages to prefetch at a time multiplied by the number of concurrent processes
-# default is 4 (four messages for each process)
-CELERYD_PREFETCH_MULTIPLIER = 2
 
 
 # Cache settings (see common.py)

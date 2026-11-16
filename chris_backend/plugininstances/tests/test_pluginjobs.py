@@ -6,7 +6,10 @@ import time
 import uuid
 from unittest import mock
 
+from celery.exceptions import SoftTimeLimitExceeded
+from django.db import connection
 from django.test import TestCase, tag
+from django.test.utils import CaptureQueriesContext
 from django.contrib.auth.models import User
 from django.conf import settings
 
@@ -14,13 +17,16 @@ from pfconclient import client as pfcon
 from pfconclient.exceptions import PfconRequestException
 
 from core.models import ChrisInstance, ChrisFolder, ChrisLinkFile
+from userfiles.models import UserFile
 from core.storage import connect_storage
 from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter
-from plugininstances.models import PluginInstance, PathParameter, ComputeResource
+from plugininstances.models import (BoolParameter, ComputeResource, PathParameter,
+                                    PluginInstance, StrParameter)
 from plugininstances.services import pluginjobs, copyjobs
 from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.uploadjobs import PluginInstanceUploadJob
+from plugininstances.tests.test_transitions import PluginInstanceFixture
 
 
 COMPUTE_RESOURCE_URL = settings.COMPUTE_RESOURCE_URL
@@ -259,7 +265,13 @@ class PluginInstanceAppJobTests(TestCase):
             self.skipTest('Copy job failed to transition to scheduled - likely pfcon Docker issue')
         self.assertEqual(pl_inst.status, 'scheduled')
 
-        # run the app job and poll it until it finishes or transitions to uploading
+        # run the app job and poll it until it finishes or transitions to uploading;
+        # the registration its status check enqueues runs here too
+        register = mock.patch.object(PluginInstanceJob, 'enqueue_registration',
+                                     lambda job: pluginjobs.PluginInstanceAppJob(
+                                         job.c_plugin_inst).register_output())
+        register.start()
+        self.addCleanup(register.stop)
         plg_inst_app_job = pluginjobs.PluginInstanceAppJob(pl_inst)
         plg_inst_app_job.run()
         self.assertEqual(pl_inst.status, 'started')
@@ -370,12 +382,13 @@ class PluginInstanceAppJobTests(TestCase):
             compute_resource=plugin.compute_resources.all()[0])
         return pl_inst
 
-    def _registering_job(self, pl_inst, size):
+    def _registering_job(self, pl_inst, size, remote_status='finishedSuccessfully'):
         """
-        An app job for ``pl_inst`` whose remote fetch is bypassed and whose registration
-        finds ``size`` bytes.
+        An app job for ``pl_inst`` whose remote says the job ended with ``remote_status``,
+        whose remote fetch is bypassed and whose registration finds ``size`` bytes.
         """
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job._get_status = mock.Mock(return_value={'compute': {'status': remote_status}})
         job._get_job_zip_data = mock.Mock(return_value=b'')
         job._get_job_json_data = mock.Mock(return_value={})
         job.unpack_zip_file = mock.Mock()
@@ -394,7 +407,7 @@ class PluginInstanceAppJobTests(TestCase):
         pl_inst = self._create_plugin_inst()
         job = self._registering_job(pl_inst, 1024)
 
-        job.register_output('finishedSuccessfully')
+        job.register_output()
 
         self.assertEqual(pl_inst.status, 'finishedSuccessfully')
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)   # fresh DB fetch
@@ -410,9 +423,9 @@ class PluginInstanceAppJobTests(TestCase):
         job is marked finishedWithError must still have their size persisted.
         """
         pl_inst = self._create_plugin_inst()
-        job = self._registering_job(pl_inst, 512)
+        job = self._registering_job(pl_inst, 512, 'finishedWithError')
 
-        job.register_output('finishedWithError')
+        job.register_output()
 
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)
         self.assertEqual(db_inst.status, 'finishedWithError')
@@ -420,10 +433,10 @@ class PluginInstanceAppJobTests(TestCase):
 
     def test_register_output_of_a_job_that_did_not_end_cancels_with_code10(self):
         pl_inst = self._create_plugin_inst()
-        job = self._registering_job(pl_inst, 1)
+        job = self._registering_job(pl_inst, 1, 'started')
 
         with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR') as logs:
-            job.register_output('started')
+            job.register_output()
 
         self.assertIn('[CODE10,', logs.output[0])
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)
@@ -441,19 +454,93 @@ class PluginInstanceAppJobTests(TestCase):
                                                                     'registeringFiles')
         job._register_output_files = mock.Mock(side_effect=cancelled_meanwhile)
 
-        job.register_output('finishedSuccessfully')
+        job.register_output()
 
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)
         self.assertEqual(db_inst.status, 'cancelled')
         self.assertEqual(db_inst.size, 0)  # the registration that lost wrote nothing
-        job.enqueue_run.assert_not_called()  # nor scheduled the cleanup
+        # but the cancel's cleanup goes again, after whatever the registration inserted
+        self.assertEqual(db_inst.remote_cleanup_status, 'deletingData')
+        job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
+
+    def test_a_registration_cancelled_before_its_insert_registers_no_files(self):
+        pl_inst = self._create_plugin_inst()
+        name = f'{pl_inst.get_output_path()}/a.txt'
+        self.storage_manager.upload_obj(name, b'12345')
+        self.addCleanup(self.storage_manager.delete_path, pl_inst.get_output_path())
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job._get_status = mock.Mock(return_value={'compute': {'status':
+                                                              'finishedSuccessfully'}})
+        job._get_job_json_data = mock.Mock(return_value={})
+        job.enqueue_run = mock.Mock()
+
+        def listed_then_cancelled(content):
+            job.plugin_inst_output_files = {name}
+            # the API cancels it and its cleanup may already be deleting the output
+            PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled',
+                                                                    'registeringFiles')
+
+        job.check_files_from_json_exist = mock.Mock(side_effect=listed_then_cancelled)
+
+        job.register_output()
+
+        self.assertFalse(UserFile.objects.filter(fname=name).exists())
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).status, 'cancelled')
+
+    def test_a_check_that_finds_the_job_undefined_cancels_it_with_code10(self):
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job._get_status = mock.Mock(return_value={'compute': {'status': 'undefined',
+                                                              'logs': ''}})
+        job.enqueue_run = mock.Mock()
+
+        with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR'):
+            job.check_exec_status()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.error_code), ('cancelled', 'CODE10'))
+        job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
+
+    def test_a_timed_out_check_cancels_from_the_status_it_checked_only(self):
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)   # holds 'started'
+        job._job_has_timeout = mock.Mock(return_value=True)
+        job.enqueue_run = mock.Mock()
+        # another task moved it on meanwhile: the timeout is that of a job that ended
+        PluginInstance.objects.filter(pk=pl_inst.pk).transition('registeringFiles',
+                                                                'started')
+
+        with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR'):
+            status = job.check_exec_status()
+
+        self.assertEqual(status, 'registeringFiles')
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).error_code, '')
+
+        # in 'started', as the check read it: cancelled, with the code
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(status='started')
+        with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR'):
+            job.check_exec_status()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.error_code), ('cancelled', 'CODE13'))
+
+    def test_a_soft_time_limit_inside_the_registration_reaches_its_task(self):
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 10)
+        job._register_output_files = mock.Mock(side_effect=SoftTimeLimitExceeded())
+
+        with self.assertRaises(SoftTimeLimitExceeded):
+            job.register_output()
+
+        self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).status,
+                         'registeringFiles')
 
     def test_a_stale_started_object_cannot_move_a_cancelled_instance_on(self):
         pl_inst = self._create_plugin_inst('started')
         job = pluginjobs.PluginInstanceAppJob(pl_inst)   # holds 'started'
         job._get_status = mock.Mock(return_value={
             'compute': {'status': 'finishedSuccessfully', 'logs': ''}})
-        job.register_output = mock.Mock()
+        job.enqueue_registration = mock.Mock()
         job.enqueue_run = mock.Mock()
         PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled', 'started')
 
@@ -461,8 +548,158 @@ class PluginInstanceAppJobTests(TestCase):
 
         self.assertEqual(status, 'cancelled')
         self.assertEqual(PluginInstance.objects.get(pk=pl_inst.pk).status, 'cancelled')
-        job.register_output.assert_not_called()
+        job.enqueue_registration.assert_not_called()
         job.enqueue_run.assert_not_called()
+
+    def test_the_status_check_of_an_ended_job_has_a_task_register_its_files(self):
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job.pfcon_client.requires_upload_job = False  # the fixture's needs one on swift, s3
+        job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'finishedWithError', 'logs': ''}})
+        job.enqueue_registration = mock.Mock()
+        job.enqueue_run = mock.Mock()
+        job.register_output = mock.Mock()
+
+        self.assertEqual(job.check_exec_status(), 'registeringFiles')
+
+        job.enqueue_registration.assert_called_once_with()
+        job.enqueue_run.assert_not_called()
+        job.register_output.assert_not_called()  # never in the status check
+
+    def test_the_status_check_of_an_ended_job_has_its_upload_job_fetch_the_files(self):
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job.pfcon_client.requires_upload_job = True
+        job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'finishedWithError', 'logs': ''}})
+        job.enqueue_registration = mock.Mock()
+        job.enqueue_run = mock.Mock()
+        job.register_output = mock.Mock()
+
+        self.assertEqual(job.check_exec_status(), 'uploading')
+
+        # the upload job fetches the files; its status check has them registered
+        job.enqueue_run.assert_called_once_with('PluginInstanceUploadJob')
+        job.enqueue_registration.assert_not_called()
+        job.register_output.assert_not_called()
+
+    def test_a_registration_that_cannot_ask_the_remote_cancels_with_code02(self):
+        pl_inst = self._create_plugin_inst()
+        job = self._registering_job(pl_inst, 1)
+        job._get_status = mock.Mock(side_effect=PfconRequestException('down'))
+
+        with mock.patch.object(pluginjobs.time, 'sleep') as sleep, \
+                self.assertLogs('plugininstances.services.pluginjobs', 'ERROR') as logs:
+            job.register_output()
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.id)
+        self.assertEqual((db_inst.status, db_inst.error_code), ('cancelled', 'CODE02'))
+        self.assertEqual(len([line for line in logs.output if '[CODE02,' in line]),
+                         job.REMOTE_STATUS_TRIES)
+        self.assertEqual(job._get_status.call_count, job.REMOTE_STATUS_TRIES)
+        self.assertEqual(sleep.call_count, job.REMOTE_STATUS_TRIES - 1)
+
+    def test_a_run_a_newer_one_overtook_writes_nothing(self):
+        pl_inst = self._create_plugin_inst()
+        older = self._registering_job(pl_inst, 10)
+        newer = self._registering_job(PluginInstance.objects.get(pk=pl_inst.pk), 20)
+
+        older_token = older._claim_registration()
+        newer.register_output()   # claims after the older run did, and ends it
+        older.c_plugin_inst.size = 10
+        older._end_registration('cancelled', older_token)
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.id)
+        self.assertEqual((db_inst.status, db_inst.size), ('finishedSuccessfully', 20))
+        older.enqueue_run.assert_not_called()
+
+    def test_a_run_whose_claim_a_newer_run_took_writes_nothing_while_that_one_runs(self):
+        pl_inst = self._create_plugin_inst()
+        older = self._registering_job(pl_inst, 10)
+        older_token = older._claim_registration()
+        newer = self._registering_job(PluginInstance.objects.get(pk=pl_inst.pk), 20)
+        newer._claim_registration()               # redelivered, still registering
+
+        older.c_plugin_inst.size = 10
+        older._end_registration('finishedSuccessfully', older_token)
+
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.size, db_inst.remote_cleanup_status),
+                         ('registeringFiles', 0, 'notStarted'))
+        older.enqueue_run.assert_not_called()
+
+    def test_a_registration_run_twice_registers_each_file_once(self):
+        pl_inst = self._create_plugin_inst()
+        output = pl_inst.get_output_path()
+        names = [f'{output}/a.txt', f'{output}/sub/b.txt']
+
+        for name in names:
+            self.storage_manager.upload_obj(name, b'12345')
+        self.addCleanup(self.storage_manager.delete_path, output)
+
+        inserts = []
+        for _ in range(2):
+            PluginInstance.objects.filter(pk=pl_inst.pk).update(status='registeringFiles')
+            job = pluginjobs.PluginInstanceAppJob(PluginInstance.objects.get(pk=pl_inst.pk))
+            job._get_status = mock.Mock(
+                return_value={'compute': {'status': 'finishedSuccessfully'}})
+            job._get_job_json_data = mock.Mock(return_value={})
+            job.check_files_from_json_exist = mock.Mock(
+                side_effect=lambda content, job=job: setattr(
+                    job, 'plugin_inst_output_files', set(names)))
+            job.enqueue_run = mock.Mock()
+
+            with CaptureQueriesContext(connection) as queries:
+                job.register_output()
+            inserts.append(['ON CONFLICT' in q['sql'] for q in queries
+                            if q['sql'].startswith('INSERT INTO "core_chrisfile"')])
+
+        self.assertEqual(UserFile.objects.filter(fname__in=names).count(), 2)
+        db_inst = PluginInstance.objects.get(pk=pl_inst.id)
+        self.assertEqual((db_inst.status, db_inst.size), ('finishedSuccessfully', 10))
+        # only the second run, whose INSERT fails on the first run's rows, skips rows
+        self.assertEqual(inserts, [[False], [False, True]])
+
+    def test_a_link_file_written_again_keeps_its_row(self):
+        pl_inst = self._create_plugin_inst()
+        user = User.objects.get(username=self.username)
+        folder = pl_inst.output_folder
+        linked = f'home/{self.username}/uploads'
+        name = linked.replace('/', '_')
+
+        first = pluginjobs.PluginInstanceAppJob._link_file(linked, user, folder, name)
+        first.save(name=name)
+        again = pluginjobs.PluginInstanceAppJob._link_file(linked, user, folder, name)
+
+        self.assertEqual(again.pk, first.pk)
+        again.save(name=name)  # writes its storage object again, no second row
+        self.assertEqual(ChrisLinkFile.objects.filter(fname=first.fname.name).count(), 1)
+
+    def test_a_link_file_name_that_links_another_path_is_refused(self):
+        pl_inst = self._create_plugin_inst()
+        user = User.objects.get(username=self.username)
+        folder = pl_inst.output_folder
+        # 'a/b_c' and 'a_b/c' both come out as 'a_b_c'
+        first = pluginjobs.PluginInstanceAppJob._link_file('a/b_c', user, folder, 'a_b_c')
+        first.save(name='a_b_c')
+
+        with self.assertRaisesRegex(ValueError, 'links a/b_c, not a_b/c'):
+            pluginjobs.PluginInstanceAppJob._link_file('a_b/c', user, folder, 'a_b_c')
+
+    def test_two_links_to_one_path_in_one_run_are_written_and_counted_once(self):
+        pl_inst = self._create_plugin_inst('registeringFiles')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        folder = pl_inst.output_folder
+        linked = f'home/{self.username}/uploads/data'
+        ChrisFolder.objects.get_or_create(path=linked, owner=pl_inst.owner)
+
+        job._create_chris_link_file(linked, folder)
+        size = pl_inst.size
+        job._create_chris_link_file(linked + '/', folder)  # from another parent's output
+
+        self.assertEqual(pl_inst.size, size)
+        self.assertEqual(ChrisLinkFile.objects.filter(parent_folder=folder).count(), 1)
 
     def test_submitting_a_job_another_task_submitted_does_not_cancel_it(self):
         pl_inst = self._create_plugin_inst('scheduled')
@@ -713,3 +950,205 @@ class PluginInstanceAppJobTests(TestCase):
         # delete files from storage
         self.storage_manager.delete_path(outputdir)
         self.storage_manager.delete_obj(f'home/{self.username}/uploads/in.txt')
+
+
+class RegistrationSizeTests(PluginInstanceFixture, TestCase):
+    """
+    PluginInstanceAppJob.registers_at_most: on a mocked storage, what it lists, how much of
+    it and what it answers; on the stack's storage, that it counts what a registration of
+    the same output registers. And the 'ts' parameters it reads.
+    """
+
+    def job(self, inst, listings, unextpaths=(), inputs=()):
+        """
+        An app job of ``inst`` whose storage lists ``listings[prefix]`` (as much of it as
+        the limit asked lets), whose 'unextpath' parameter names ``unextpaths`` and, as a
+        'ts' plugin's, whose input instances are ``inputs``.
+        """
+        job = pluginjobs.PluginInstanceAppJob(inst)
+        job.storage_manager = mock.Mock()
+        job.storage_manager.ls.side_effect = (
+            lambda prefix, limit=None: listings.get(prefix, [])[:limit])
+        job.get_plugin_instance_path_parameters = mock.Mock(
+            return_value=({'--dir': ','.join(unextpaths)} if unextpaths else {}, {}))
+        job.get_ts_plugin_instance_parameters = mock.Mock(
+            return_value=([str(i.pk) for i in inputs], [], False))
+        return job
+
+    def test_an_output_of_at_most_the_files_is_small_and_one_of_more_is_not(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+        job = self.job(inst, {output: [f'{output}/{i}' for i in range(3)]})
+
+        self.assertTrue(job.registers_at_most(3))
+        self.assertFalse(job.registers_at_most(2))
+        self.assertEqual(job.storage_manager.ls.call_args_list,
+                         [mock.call(output, limit=4), mock.call(output, limit=3)])
+
+    def test_an_output_an_out_of_network_remote_sends_as_a_zip_is_not_small(self):
+        inst = self.instance('registeringFiles')
+        inst.compute_resource.compute_innetwork = False
+        job = self.job(inst, {})
+
+        self.assertFalse(job.registers_at_most(100))
+        job.storage_manager.ls.assert_not_called()
+
+    def test_unextpath_paths_add_their_objects_under_filesystem_storage_else_a_link(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+        listings = {output: [f'{output}/x'],
+                    'a': ['a/1', 'a/2'], 'b': ['b/1', 'b/2', 'b/3']}
+
+        job = self.job(inst, listings, unextpaths=('a', 'b'))
+        job.storage_env = 'filesystem'  # copies of every object
+        self.assertTrue(job.registers_at_most(6))
+        self.assertFalse(job.registers_at_most(5))
+
+        job = self.job(inst, listings, unextpaths=('a', 'b'))
+        job.storage_env = 'fslink'  # a link file per path
+        self.assertTrue(job.registers_at_most(3))
+        self.assertFalse(job.registers_at_most(2))
+        self.assertEqual({c.args[0] for c in job.storage_manager.ls.call_args_list},
+                         {output})
+
+    def test_a_ts_instance_adds_its_inputs_objects_and_one_with_a_link_is_large(self):
+        inst = self.instance('registeringFiles')
+        first, second = (self.instance('finishedSuccessfully') for _ in range(2))
+        listings = {first.get_output_path(): ['p/1', 'p/2'],
+                    second.get_output_path(): ['q/1', 'q/2']}
+
+        job = self.job(inst, listings, inputs=(first, second))
+        self.assertTrue(job.registers_at_most(4))
+        limits = [c.kwargs['limit'] for c in job.storage_manager.ls.call_args_list]
+        # the output, then each input with the room left
+        self.assertEqual(limits, [5, 5, 3])
+        self.assertFalse(job.registers_at_most(3))
+
+        listings[second.get_output_path()] = ['q/1', 'q/link.chrislink']
+        job = self.job(inst, listings, inputs=(first, second))
+        self.assertFalse(job.registers_at_most(10))
+
+    @staticmethod
+    def _delete(path):
+        storage = connect_storage(settings)
+        if storage.path_exists(path):
+            storage.delete_path(path)
+
+    def _upload(self, path, names):
+        """
+        Upload a small object at each of ``names`` under ``path`` in the stack's storage,
+        deleted at the end of the test.
+        """
+        self.addCleanup(self._delete, path)
+        storage = connect_storage(settings)
+        for name in names:
+            storage.upload_obj(f'{path}/{name}', b'x')
+
+    def _register_for_real(self, job, names=()):
+        """
+        Run ``job``'s registration on the stack's storage and database, its remote mocked:
+        the job ended successfully and its JSON lists ``names`` in the output. Returns how
+        many files and link files it registered.
+        """
+        output = job.c_plugin_inst.get_output_path()
+        job._get_status = mock.Mock(
+            return_value={'compute': {'status': 'finishedSuccessfully'}})
+        job._get_job_json_data = mock.Mock(
+            return_value={'job_output_path': output, 'rel_file_paths': list(names)})
+        job.enqueue_run = mock.Mock()  # the remote cleanup
+        self.addCleanup(self._delete, output)
+
+        job.register_output()
+
+        self.assertEqual(PluginInstance.objects.get(pk=job.c_plugin_inst.pk).status,
+                         'finishedSuccessfully')
+        return len(job.plugin_inst_output_files) + len(job._links_written)
+
+    def _ts_plugin(self):
+        (meta, _) = PluginMeta.objects.get_or_create(name='pl-topologicalcopy', type='ts')
+        (ts_plugin, _) = Plugin.objects.get_or_create(meta=meta, version='0.1')
+        ts_plugin.compute_resources.set([self.compute_resource])
+        return ts_plugin
+
+    def test_the_count_of_an_output_is_what_its_registration_registers(self):
+        inst = self.instance('registeringFiles')
+        names = ('a.txt', 'sub/b.txt', 'sub/c.txt')
+        self._upload(inst.get_output_path(), names)
+        job = pluginjobs.PluginInstanceAppJob(inst)
+
+        self.assertTrue(job.registers_at_most(3))
+        self.assertFalse(job.registers_at_most(2))
+        self.assertEqual(self._register_for_real(job, names), 3)
+
+    def test_the_count_of_a_ts_instance_is_what_its_registration_copies(self):
+        ts_plugin = self._ts_plugin()
+        parents = [self.instance('finishedSuccessfully') for _ in range(2)]
+        self._upload(parents[0].get_output_path(), ('a.txt', 'sub/b.txt'))
+        self._upload(parents[1].get_output_path(), ('c.txt', 'sub/d.txt'))
+        inst = PluginInstance.objects.create(plugin=ts_plugin, owner=self.user,
+                                             previous=parents[0],
+                                             compute_resource=self.compute_resource)
+        param = PluginParameter.objects.create(plugin=ts_plugin, name='plugininstances',
+                                               flag='--plugininstances')
+        StrParameter.objects.create(plugin_inst=inst, plugin_param=param,
+                                    value=f'{parents[0].pk},{parents[1].pk}')
+        PluginInstance.objects.filter(pk=inst.pk).update(status='registeringFiles')
+        job = pluginjobs.PluginInstanceAppJob(PluginInstance.objects.get(pk=inst.pk))
+
+        self.assertTrue(job.registers_at_most(4))
+        self.assertFalse(job.registers_at_most(3))
+        self.assertEqual(self._register_for_real(job), 4)
+
+    def test_a_most_of_0_takes_only_an_output_without_files(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+
+        self.assertTrue(self.job(inst, {}).registers_at_most(0))
+        self.assertFalse(self.job(inst, {output: [f'{output}/a']}).registers_at_most(0))
+
+    def test_a_link_file_in_the_output_itself_counts_as_one_file(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+        job = self.job(inst, {output: [f'{output}/x.chrislink', f'{output}/y']})
+
+        self.assertTrue(job.registers_at_most(2))
+        self.assertFalse(job.registers_at_most(1))
+
+    def test_the_ts_parameters_are_read_from_a_ts_instance_only(self):
+        ts_plugin = self._ts_plugin()
+        parent = self.instance('finishedSuccessfully')
+        inst = PluginInstance.objects.create(plugin=ts_plugin, owner=self.user,
+                                             previous=parent,
+                                             compute_resource=self.compute_resource)
+        for name, value in (('plugininstances', '4,5'), ('filter', r'\.txt$,')):
+            param = PluginParameter.objects.create(plugin=ts_plugin, name=name,
+                                                   flag=f'--{name}')
+            StrParameter.objects.create(plugin_inst=inst, plugin_param=param, value=value)
+        param = PluginParameter.objects.create(plugin=ts_plugin, name='groupByInstance',
+                                               flag='--groupByInstance', type='boolean')
+        BoolParameter.objects.create(plugin_inst=inst, plugin_param=param, value=True)
+
+        self.assertEqual(
+            pluginjobs.PluginInstanceAppJob(inst).get_ts_plugin_instance_parameters(),
+            (['4', '5'], [r'\.txt$', ''], True))
+        fs_inst = self.instance('registeringFiles')  # a parameter of that name too
+        param = PluginParameter.objects.create(plugin=fs_inst.plugin, name='plugininstances',
+                                               flag='--plugininstances')
+        StrParameter.objects.create(plugin_inst=fs_inst, plugin_param=param, value='4')
+        self.assertEqual(
+            pluginjobs.PluginInstanceAppJob(fs_inst).get_ts_plugin_instance_parameters(),
+            ([], [], False))
+
+    def test_the_count_stops_listing_once_it_is_past_the_most(self):
+        inst = self.instance('registeringFiles')
+        output = inst.get_output_path()
+        parent = self.instance('finishedSuccessfully')
+
+        job = self.job(inst, {output: ['o/1', 'o/2', 'o/3']}, inputs=(parent,))
+        self.assertFalse(job.registers_at_most(2))
+        job.storage_manager.ls.assert_called_once_with(output, limit=3)
+
+        job = self.job(inst, {}, unextpaths=('a', 'b', 'c'))
+        job.storage_env = 'fslink'  # three link files: past two before any listing
+        self.assertFalse(job.registers_at_most(2))
+        job.storage_manager.ls.assert_not_called()

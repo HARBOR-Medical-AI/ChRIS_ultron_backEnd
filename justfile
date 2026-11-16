@@ -341,7 +341,7 @@ bench-compose +command:
 bench-start pins='benchmark.yml': check-builder (bench-pull-plugins pins)
     just bench-compose 'up -d --build db chris-broker chris-cache nats pfcon cube-nonroot-user-volume-fix'
     just bench-compose 'run --rm chris python manage.py migrate --noinput'
-    just bench-compose 'up -d --build chris worker-mains worker-periodic celery-scheduler'
+    just bench-compose 'up -d --build chris worker-mains worker-register worker-heavy worker-background worker-periodic celery-scheduler'
     just bench-compose '--profile cube run --rm chrisomatic chrisomatic /etc/chrisomatic-benchmark/{{ pins }}' \
         || { >&2 echo "[bench] chrisomatic failed. If a dev 'just' ran on these volumes, reset them with 'just bench-nuke' (it deletes the dev stack's data too) and run 'just bench-start {{ pins }}' again."; exit 1; }
 

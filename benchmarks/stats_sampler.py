@@ -38,12 +38,15 @@ METHOD = "one-shot reads, CPU between consecutive readings"
 READ_BUDGET = 0.8
 
 
-def sampler_record(interval: float, queue_interval: float | None, workers: int) -> dict:
+def sampler_record(interval: float, queue_interval: float | None, workers: int,
+                   queues: tuple[str, ...] = ()) -> dict:
     """
-    The sampler's settings as ``environment.json`` records them.
+    The sampler's settings as ``environment.json`` records them, with the Celery queues it
+    read: a run whose queues were named otherwise (CUBE's renamed them, HARBOR-planning
+    #152) differs in it.
     """
     return {"method": METHOD, "interval_s": interval, "queue_interval_s": queue_interval,
-            "workers": workers}
+            "workers": workers, "queues": list(queues)}
 
 
 
