@@ -304,6 +304,30 @@ reads its cgroup counter in every run since 2026-10-13: in the 2026-10-14 table 
 18.92, 32.99 and 18.86 GB, where the sampled figures say 30.47, 18.91, 32.34 and 18.80. The arm A
 runs and the logs of both arms are kept on the benchmark box.
 
+## Queues and atomic transitions — 2026-11-16
+
+The baselines of issue 2 ([#152](https://github.com/HARBOR-Medical-AI/HARBOR-planning/issues/152),
+REPORT.md § 17): compare-and-swap status transitions, a queue per class of Celery task on five
+workers, at most one pending status check per instance, registrations on `register` or, past 100
+files, `register_large`, and the registration listing loop's `break`. They are the AFTER arm of a
+BEFORE/AFTER campaign (BEFORE at 72d0f35, master with the loop's `break` and the harness's new
+counters; not archived); every run started on a fresh stack at de29c61 on a clean tree, with
+every envelope knob at its default, and records the refused duplicate submissions, the cancels
+only a lost update explains, the workers' log bytes and the status queue's bound in each level
+row, and the Celery services' command lines in `environment.json`.
+
+| Run | Commit | Command (`just bench-run --tier ...`) | Result |
+|---|---|---|---|
+| `2026-11-16T143224Z` | de29c61 | `full --topology linear --axis feeds --cap 128 --repeat 3 --restart-on-fail` | PASS; 128 feeds 169.4 s (BEFORE 352.4 s); no refused submission (BEFORE 17); `status` peak 123 of 128 |
+| `2026-11-16T150045Z` | de29c61 | `full --topology fanout_fanin --axis branches --cap 64 --file-count 1000 --repeat 1 --restart-on-fail` | PASS; 64 branches 44.0 s (BEFORE 52.3–53.3 s) |
+| `2026-11-16T151158Z` | de29c61 | `full --topology diamond --axis layers --cap 8 --repeat 1 --restart-on-fail` | PASS; 8 layers 1,305.7 s (BEFORE 1,340.6 and 1,349.6 s); workers' logs 1.4 MB (BEFORE 999 MB) |
+
+These are the baselines for the three commands from here on. Against earlier runs `bench-compare`
+reports the new envelope knobs, the limits of the new workers and the queues the sampler reads
+as cautions. The BEFORE and Transitions arms, the other AFTER runs (the smoke, fanout_fanin ·
+feeds = 64, the repeats and the isolation pair), the 2-CPU runs and every service's log for
+each run are kept on the benchmark box.
+
 ## Regenerating the archive
 
 ```bash
