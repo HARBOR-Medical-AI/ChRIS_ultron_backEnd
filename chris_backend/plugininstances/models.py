@@ -10,7 +10,7 @@ from django.dispatch import receiver
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from core.models import AsyncDeletableModel, ChrisFolder
+from core.models import AsyncDeletableModel, ChrisFolder, ChrisInstance
 from feeds.models import Feed
 from plugins.models import ComputeResource, Plugin, PluginParameter
 from plugins.fields import CPUField, MemoryField
@@ -329,8 +329,8 @@ class PluginInstance(AsyncDeletableModel):
         ones by default), writing ``fields``, with its remote cleanup armed in the same
         UPDATE when the database row is in a status with a job in the remote compute
         (``REMOTE_JOB_STATUSES``): the status a caller read may be stale by then.
-        The periodic task handle_remote_cleanup submits the cleanup's jobs.
-        Returns the ``StatusWrite``.
+        The periodic task handle_remote_cleanup submits the cleanup's jobs. The cancel
+        that wins logs the final status. Returns the ``StatusWrite``.
         """
         sources = _statuses(source or ACTIVE_STATUSES)
         remote = [s for s in sources if s in REMOTE_JOB_STATUSES]
@@ -347,9 +347,25 @@ class PluginInstance(AsyncDeletableModel):
             for statuses, armed in attempts:
                 written = self.transition('cancelled', statuses, **fields, **armed)
 
+                if written:
+                    self.log_final_status()
                 if written or written.status not in sources:
                     return written
         return written
+
+    def log_final_status(self, job_id=None):
+        """
+        Log the terminal status, and the error code if any, that a write has just given
+        this instance: the line that tells how it ended, which only the writer that won
+        logs. ``job_id`` is the id of its jobs in the remote compute, read from the
+        ``ChrisInstance`` when not given.
+        """
+        if job_id is None:
+            job_id = ChrisInstance.load().job_id_prefix + str(self.id)
+        error_code = self.error_code
+        logger.info(f"Saved plugin instance final status for job {job_id} as "
+                    f"'{self.status}'"
+                    + (f' with error code {error_code}' if error_code else ''))
 
     def update_if_status(self, source, **fields):
         """

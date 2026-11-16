@@ -156,8 +156,10 @@ class PluginInstanceUploadJobTests(TestCase):
         upload_job.job_exists = mock.Mock(return_value=None)  # nor did it create the job
         upload_job.enqueue_run = mock.Mock()
 
-        upload_job.run()
+        with self.assertLogs('plugininstances.services', 'ERROR') as logs:
+            upload_job.run()
 
+        self.assertIn('[CODE01,', logs.output[0])
         self.assertEqual(pl_inst.status, 'cancelled')
         self.assertEqual(pl_inst.error_code, 'CODE01')
         upload_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')

@@ -22,12 +22,14 @@ from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from core.cache import acquire_lock, release_lock
 from core.celery import app
+from core.models import ChrisInstance
 from plugins.models import PluginMeta, Plugin, PluginParameter, ComputeResource
 from plugininstances import tasks
 from plugininstances.models import (PluginInstance, PluginInstanceLock, StatusWrite,
                                     StrParameter)
 from plugininstances.services.copyjobs import PluginInstanceCopyJob
 from plugininstances.services.pluginjobs import PluginInstanceAppJob
+from plugininstances.utils import run_if_ready
 
 
 COMPUTE_RESOURCE_URL = settings.COMPUTE_RESOURCE_URL
@@ -295,6 +297,66 @@ class TransitionTests(PluginInstanceFixture, TestCase):
         self.assertEqual(cancelled, StatusWrite(False, 'started'))
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'started')
 
+    def test_the_cancel_that_wins_logs_the_final_status_once(self):
+        inst = self.instance('started')
+        twin = PluginInstance.objects.get(pk=inst.pk)
+        job_id = ChrisInstance.load().job_id_prefix + str(inst.pk)
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs('plugininstances', 'INFO') as logs:
+            self.assertTrue(inst.cancel(error_code='CODE19'))
+            self.assertFalse(twin.cancel())  # cancelled already: logs nothing
+
+        self.assertEqual(logs.output, [
+            f"INFO:plugininstances.models:Saved plugin instance final status for job "
+            f"{job_id} as 'cancelled' with error code CODE19"])
+
+    def test_the_periodic_cancel_of_waiting_children_logs_each_final_status(self):
+        failed = self.instance('finishedWithError')
+        orphans = [self.instance('waiting', previous=failed) for _ in range(2)]
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs('plugininstances', 'INFO') as logs:
+            tasks.cancel_waiting_plugin_instances()
+
+        final = [line for line in logs.output if 'final status' in line]
+        self.assertEqual(len(final), 2)
+        for orphan in orphans:
+            self.assertEqual(PluginInstance.objects.get(pk=orphan.pk).status, 'cancelled')
+
+    def test_a_waiting_ts_instance_with_a_failed_parent_is_cancelled(self):
+        (meta, _) = PluginMeta.objects.get_or_create(name='pl-topologicalcopy', type='ts')
+        (ts_plugin, _) = Plugin.objects.get_or_create(meta=meta, version='0.1')
+        ts_plugin.compute_resources.set([self.compute_resource])
+        parent = self.instance('finishedSuccessfully')
+        failed = self.instance('cancelled')
+        inst = PluginInstance.objects.create(plugin=ts_plugin, owner=self.user,
+                                             previous=parent,
+                                             compute_resource=self.compute_resource)
+        PluginInstance.objects.filter(pk=inst.pk).update(status='waiting')
+        plugin_param = PluginParameter.objects.create(plugin=ts_plugin,
+                                                      name='plugininstances',
+                                                      flag='--plugininstances')
+        StrParameter.objects.create(plugin_inst=inst, plugin_param=plugin_param,
+                                    value=f'{parent.pk},{failed.pk}')
+
+        tasks.cancel_waiting_plugin_instances()
+
+        self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'cancelled')
+
+    def test_a_new_instance_whose_parent_failed_is_cancelled_with_its_final_status(self):
+        failed = self.instance('finishedWithError')
+        child = PluginInstance.objects.create(plugin=self.plugins['ds'], owner=self.user,
+                                              previous=failed,
+                                              compute_resource=self.compute_resource)
+        logging.disable(logging.NOTSET)
+
+        with self.assertLogs('plugininstances', 'INFO') as logs:
+            run_if_ready(child, failed)
+
+        self.assertEqual(PluginInstance.objects.get(pk=child.pk).status, 'cancelled')
+        self.assertIn("as 'cancelled'", logs.output[0])
+
     def test_a_job_s_cancel_arms_and_submits_the_cleanup_only_with_a_remote_job(self):
         for status, armed in (('created', False), ('waiting', False), ('started', True)):
             with self.subTest(status=status):
@@ -482,7 +544,8 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
 
         job._get_job_json_data.assert_not_called()
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'registeringFiles')
-        self.assertIn('owns it: this one writes nothing', logs.output[-1])
+        self.assertIn('Registered 0 output files', logs.output[-1])
+        self.assertIn('a newer run owns it', logs.output[-1])
 
     def test_the_soft_time_limit_in_a_step_is_no_failure_of_that_step(self):
         inst = self.instance('registeringFiles')

@@ -712,14 +712,38 @@ class PluginInstanceAppJobTests(TestCase):
         job.get_cmd_args = mock.Mock(return_value=[])
         job.enqueue_run = mock.Mock()
 
-        # the refused submission is logged (with a traceback here: this compute resource
-        # takes the legacy path, which retries with a new token)
-        with self.assertLogs('plugininstances.services', 'ERROR'):
+        logging.disable(logging.INFO)  # setUp disables WARNING and below
+        # (this compute resource takes the legacy path, which logs the refusal with a
+        # traceback and retries with a new token)
+        with self.assertLogs('plugininstances.services', 'WARNING') as logs:
             job.run()
 
+        self.assertIn('another task, or an earlier try of this one, submitted it',
+                      logs.output[-1])
+        self.assertFalse([line for line in logs.output if '[CODE01,' in line])
         db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
         self.assertEqual((db_inst.status, db_inst.error_code), ('started', ''))
         job.enqueue_run.assert_not_called()
+
+    def test_submitting_a_job_the_remote_refused_and_lacks_cancels_it_with_code01(self):
+        pl_inst = self._create_plugin_inst('scheduled')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        job.pfcon_client.requires_copy_job = True  # no legacy retry with a new token
+        job.pfcon_client.submit_job = mock.Mock(
+            side_effect=PfconRequestException('Bad Request', code=400))
+        job._get_status = mock.Mock(side_effect=PfconRequestException('Not Found', code=404))
+        job.get_cmd_args = mock.Mock(return_value=[])
+        job.enqueue_run = mock.Mock()
+
+        with self.assertLogs('plugininstances.services', 'ERROR') as logs:
+            job.run()
+
+        self.assertIn(f'[CODE01,{job.str_job_id}]: Error submitting plugin job',
+                      logs.output[-1])
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.error_code, db_inst.remote_cleanup_status),
+                         ('cancelled', 'CODE01', 'deletingData'))
+        job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
 
     def test_a_job_submitted_after_its_instance_was_cancelled_gets_cleaned_up(self):
         pl_inst = self._create_plugin_inst('scheduled')

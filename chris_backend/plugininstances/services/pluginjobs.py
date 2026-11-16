@@ -10,7 +10,6 @@ import re
 import io
 import secrets
 import time
-import json
 import zipfile
 from typing import List, Optional
 
@@ -47,9 +46,11 @@ class PluginInstanceAppJob(PluginInstanceJob):
     def __init__(self, plugin_instance):
         super().__init__(plugin_instance)
         self.l_plugin_inst_param_instances = self.c_plugin_inst.get_parameter_instances()
-        # the token of the registration this object runs, and the link files it wrote
+        # the token of the registration this object runs, the link files it wrote and how
+        # many output files it registered
         self._registration_token = None
         self._links_written = set()
+        self._files_registered = 0
 
     def run(self):
         """
@@ -117,22 +118,19 @@ class PluginInstanceAppJob(PluginInstanceJob):
             job_timeout = 9000
 
         pfcon_url = self.pfcon_client.url
-        logger.info(f'Submitting plugin job {job_id} to pfcon url -->{pfcon_url}<--, '
-                    f'description: {json.dumps(job_descriptors, indent=4)}')
+        logger.info(f'Submitting plugin job {job_id} to pfcon url -->{pfcon_url}<--')
         try:
             d_resp = self._submit(JobType.PLUGIN, job_id, job_descriptors, 
                                   job_zip_file_content, job_timeout)
         except PfconRequestException as e:
-            logger.error(f'[CODE01,{job_id}]: Error submitting plugin job to pfcon url '
-                         f'-->{pfcon_url}<--, detail: {str(e)}')
-            d_resp = self.job_exists(JobType.PLUGIN)
+            d_resp = self.submitted_elsewhere(JobType.PLUGIN, 'plugin', e)
 
             if d_resp is None:
                 self.end('cancelled', 'scheduled', 'CODE01')  # giving up
                 return
-
-        logger.info(f'Successfully submitted plugin job {job_id} to pfcon url '
-                    f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
+        else:
+            logger.info(f'Successfully submitted plugin job {job_id} to pfcon url '
+                        f'-->{pfcon_url}<--')
 
         # update the job status and summary
         # https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/408
@@ -211,11 +209,9 @@ class PluginInstanceAppJob(PluginInstanceJob):
                              f'pfcon url -->{pfcon_url}<--, detail: {str(e)}')
                 return self.c_plugin_inst.status  # return, periodic task will retry later
 
-            logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                        f' for plugin job {job_id}: {json.dumps(d_resp, indent=4)}')
-                        
             status = d_resp['compute']['status']
-            logger.info(f'Current plugin job {job_id} remote status = {status}')
+            logger.info('Current plugin job %s remote status = %s %s', job_id, status,
+                        d_resp['compute'].get('message') or '')
             logger.info(f'Current plugin job {job_id} plugin instance DB status = '
                         f'{self.c_plugin_inst.status}')
 
@@ -913,9 +909,11 @@ class PluginInstanceAppJob(PluginInstanceJob):
         registered are left as they are and link files are written again.
         """
         token = self._registration_token = self._claim_registration()
+        started = time.monotonic()
         # the total of what this run registers: a run again counts every file again
         self.c_plugin_inst.size = 0
         self._links_written = set()
+        self._files_registered = 0
         remote_status = self._remote_job_status()
 
         if not self._owns_registration():
@@ -934,7 +932,17 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 self.c_plugin_inst.error_code = 'CODE10'
             final = 'cancelled'
 
-        self._end_registration(final, token)
+        ended = self._end_registration(final, token)
+
+        if ended is None:
+            outcome = 'a newer run owns it'
+        else:
+            outcome = (f'it ends {final}' if ended
+                       else f'it is {ended.status} already, which stays')
+        logger.info('Registered %d output files and %d link files (%d bytes) of job %s in '
+                    '%.1f s: %s', self._files_registered,
+                    len(self._links_written), self.c_plugin_inst.size, self.str_job_id,
+                    time.monotonic() - started, outcome)
 
     def give_up_registration(self, error_code):
         """
@@ -993,9 +1001,10 @@ class PluginInstanceAppJob(PluginInstanceJob):
         """
         End the instance with ``final``, its size and error code and its remote cleanup
         armed, if this run still owns the registration and the instance is still
-        registering files; the remote cleanup's first job then goes out. When a cancel
-        won, its cleanup is armed again: it may have deleted the output folder before
-        this run inserted its files.
+        registering files; the final status is then logged and the remote cleanup's first
+        job goes out. When a cancel won, its cleanup is armed again: it may have deleted
+        the output folder before this run inserted its files. Returns the ``StatusWrite``,
+        or None when a newer run owns the registration.
         """
         fields = {'size': self.c_plugin_inst.size, **ARM_REMOTE_CLEANUP}
         if self.c_plugin_inst.error_code:
@@ -1012,9 +1021,11 @@ class PluginInstanceAppJob(PluginInstanceJob):
             logger.info(f'A newer run of the registration of job {self.str_job_id} owns '
                         f'it: this one writes nothing')
         elif ended:
+            self.log_final_status()
             self._submit_remote_cleanup()
         elif ended.status == 'cancelled':
             self.schedule_remote_cleanup(rearm=True)
+        return ended
 
     def register_output_files_on_success(self):
         """
@@ -1070,8 +1081,18 @@ class PluginInstanceAppJob(PluginInstanceJob):
         except SoftTimeLimitExceeded:
             raise
         except Exception:
+            self._log_unreported_failure()
             return 'cancelled'  # giving up
         return 'finishedSuccessfully'
+
+    def _log_unreported_failure(self):
+        """
+        Log the exception that stopped the registration of the output files, with its
+        traceback, unless the step that failed logged it with an error code of its own.
+        """
+        if not self.c_plugin_inst.error_code:
+            logger.exception(f'Error while registering the output files of job '
+                             f'{self.str_job_id}')
 
     def _data_fetched(self):
         """
@@ -1149,7 +1170,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
             except SoftTimeLimitExceeded:
                 raise
             except Exception:
-                pass  # giving up
+                self._log_unreported_failure()  # giving up
         return 'finishedWithError'
 
     def handle_undefined_status(self):
@@ -1209,8 +1230,6 @@ class PluginInstanceAppJob(PluginInstanceJob):
                         raise
                     continue
 
-                logger.info(f'Registering file -->{obj_path}<-- for job {job_id}')
-
                 folder_path = os.path.dirname(obj_path)
                 parent_folder = folders.get(folder_path)
 
@@ -1232,6 +1251,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
         self.plugin_inst_output_files = {f.fname.name for f in files}
         db_files = self._insert_files(files)
+        self._files_registered = len(db_files)
 
         total_size = 0
         for plg_inst_file in db_files:

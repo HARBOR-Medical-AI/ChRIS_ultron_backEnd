@@ -5,7 +5,6 @@ environment (ChRIS / pfcon interface) as well as deleting them when finished.
 """
 
 import logging
-import json
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
@@ -46,14 +45,11 @@ class PluginInstanceUploadJob(PluginInstanceJob):
 
         pfcon_url = self.pfcon_client.url
 
-        logger.info(f'Submitting upload job {job_id} to pfcon url -->{pfcon_url}<--, '
-                    f'description: {json.dumps(job_descriptors, indent=4)}')
+        logger.info(f'Submitting upload job {job_id} to pfcon url -->{pfcon_url}<--')
         try:
             d_resp = self._submit(JobType.UPLOAD, job_id, job_descriptors)
         except PfconRequestException as e:
-            logger.error(f'[CODE01,{job_id}]: Error submitting upload job to pfcon url '
-                         f'-->{pfcon_url}<--, detail: {str(e)}')
-            d_resp = self.job_exists(JobType.UPLOAD)
+            d_resp = self.submitted_elsewhere(JobType.UPLOAD, 'upload', e)
 
             if d_resp is None:
                 retries = self.c_plugin_inst.increment('upload_retry_count')
@@ -63,9 +59,9 @@ class PluginInstanceUploadJob(PluginInstanceJob):
                 else:
                     self.run()  # retry
                 return
-
-        logger.info(f'Successfully submitted upload job {job_id} to pfcon url '
-                    f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
+        else:
+            logger.info(f'Successfully submitted upload job {job_id} to pfcon url '
+                        f'-->{pfcon_url}<--')
 
         # update the job status and summary
         self.submitted(summary=self.get_job_status_summary(d_resp),
@@ -96,11 +92,9 @@ class PluginInstanceUploadJob(PluginInstanceJob):
                              f'url -->{pfcon_url}<--, detail: {str(e)}')
                 return self.c_plugin_inst.status  # return, periodic task will retry later
 
-            logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                        f' for upload job {job_id}: {json.dumps(d_resp, indent=4)}')
-
             status = d_resp['compute']['status']
-            logger.info(f'Current upload job {job_id} remote status = {status}')
+            logger.info('Current upload job %s remote status = %s %s', job_id, status,
+                        d_resp['compute'].get('message') or '')
             logger.info(f'Current upload job {job_id} plugin instance DB status = '
                         f'{self.c_plugin_inst.status}')
 

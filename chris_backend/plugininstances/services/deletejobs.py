@@ -5,7 +5,6 @@ environment (ChRIS / pfcon interface) as well as deleting them when finished.
 """
 
 import logging
-import json
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
@@ -51,13 +50,14 @@ class PluginInstanceDeleteJob(PluginInstanceJob):
                             f'other jobs at pfcon url -->{pfcon_url}<--: {str(e)}')
                 return
 
-            logger.error(f'[CODE01,{job_id}]: Error submitting data delete job to pfcon '
-                         f'url -->{pfcon_url}<--, detail: {str(e)}')
-            self._count_failure()
+            # the check's submission and the run task's can race: the remote then refuses
+            # the second container, which is no failure
+            if self.submitted_elsewhere(JobType.DELETE, 'data delete', e) is None:
+                self._count_failure()
             return
 
         logger.info(f'Successfully submitted data delete job {job_id} to pfcon url '
-                    f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
+                    f'-->{pfcon_url}<--')
 
         # update the job summary
         self.c_plugin_inst.move_remote_cleanup(
@@ -95,11 +95,9 @@ class PluginInstanceDeleteJob(PluginInstanceJob):
             self.run()
             return self.c_plugin_inst.remote_cleanup_status
 
-        logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                    f' for delete job {job_id}: {json.dumps(d_resp, indent=4)}')
-
         status = d_resp['compute']['status']
-        logger.info(f'Current delete job {job_id} remote status = {status}')
+        logger.info('Current delete job %s remote status = %s %s', job_id, status,
+                    d_resp['compute'].get('message') or '')
 
         # only while deleting data: another task may have moved it on meanwhile
         if not self.c_plugin_inst.move_remote_cleanup(
@@ -209,7 +207,10 @@ class PluginInstanceDeleteJob(PluginInstanceJob):
         if not self.c_plugin_inst.move_remote_cleanup(final, running):
             return False
 
-        logger.info(f'Remote cleanup for job {job_id} ended as {final}')
+        # as the database has it now: a cancel may have come after this task read it
+        status = instance.values_list('status', flat=True).first()
+        logger.info(f"Remote cleanup for job {job_id} ended as {final}; the plugin "
+                    f"instance's final status is '{status}'")
         return True
 
     def _plugin_job_active(self):

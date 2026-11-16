@@ -42,3 +42,11 @@ if not DEBUG:
 
 # log each API worker's connection pool counters (see core.utils.db_pool_stats)
 DB_POOL_STATS_INTERVAL = float(os.getenv('CUBE_DB_POOL_STATS_INTERVAL', '0'))
+
+# The dev settings log the apps at DEBUG to the console and to /tmp/debug.log, a file that
+# nothing rotates (916 MB inside worker-mains in one diamond · layers = 8 scenario): the
+# benchmark logs them at INFO, to the console only, as production does.
+LOGGING['handlers'].pop('file', None)  # noqa: F405
+for _name, _logger in LOGGING['loggers'].items():  # noqa: F405
+    if _name:  # the apps', not the root logger
+        _logger.update(level='INFO', handlers=['console_verbose'])

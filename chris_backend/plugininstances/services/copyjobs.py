@@ -7,7 +7,6 @@ environment (ChRIS / pfcon interface) as well as deleting them when finished.
 import logging
 import os
 import time
-import json
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
@@ -78,14 +77,11 @@ class PluginInstanceCopyJob(PluginInstanceJob):
 
         pfcon_url = self.pfcon_client.url
 
-        logger.info(f'Submitting copy job {job_id} to pfcon url -->{pfcon_url}<--, '
-                    f'description: {json.dumps(job_descriptors, indent=4)}')
+        logger.info(f'Submitting copy job {job_id} to pfcon url -->{pfcon_url}<--')
         try:
             d_resp = self._submit(JobType.COPY, job_id, job_descriptors)
         except PfconRequestException as e:
-            logger.error(f'[CODE01,{job_id}]: Error submitting copy job to pfcon url '
-                         f'-->{pfcon_url}<--, detail: {str(e)}')
-            d_resp = self.job_exists(JobType.COPY)
+            d_resp = self.submitted_elsewhere(JobType.COPY, 'copy', e)
 
             if d_resp is None:
                 retries = self.c_plugin_inst.increment('copy_retry_count')
@@ -95,9 +91,9 @@ class PluginInstanceCopyJob(PluginInstanceJob):
                 else:
                     self.run()  # retry
                 return
-
-        logger.info(f'Successfully submitted copy job {job_id} to pfcon url '
-                    f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
+        else:
+            logger.info(f'Successfully submitted copy job {job_id} to pfcon url '
+                        f'-->{pfcon_url}<--')
 
         # update the job status and summary
         # https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/408
@@ -130,11 +126,9 @@ class PluginInstanceCopyJob(PluginInstanceJob):
                              f'url -->{pfcon_url}<--, detail: {str(e)}')
                 return self.c_plugin_inst.status  # return, periodic task will retry later
 
-            logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                        f' for copy job {job_id}: {json.dumps(d_resp, indent=4)}')
-
             status = d_resp['compute']['status']
-            logger.info(f'Current copy job {job_id} remote status = {status}')
+            logger.info('Current copy job %s remote status = %s %s', job_id, status,
+                        d_resp['compute'].get('message') or '')
             logger.info(f'Current copy job {job_id} plugin instance DB status = '
                         f'{self.c_plugin_inst.status}')
 

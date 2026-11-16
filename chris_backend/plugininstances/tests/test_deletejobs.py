@@ -203,13 +203,44 @@ class PluginInstanceDeleteJobTests(TestCase):
         pl_inst.save(update_fields=['remote_cleanup_status', 'remote_cleanup_retry_count'])
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.pfcon_client.submit_job = mock.Mock(side_effect=PfconRequestException('test error'))
+        delete_job.job_exists = mock.Mock(return_value=None)  # the remote has no such job
         delete_job._count_failure = mock.Mock(return_value=False)
 
-        delete_job.run()
+        with self.assertLogs('plugininstances.services', 'ERROR') as logs:
+            delete_job.run()
 
         # counted, and left to the periodic task rather than submitted again at once
+        self.assertIn('[CODE01,', logs.output[0])
         delete_job._count_failure.assert_called_once()
         delete_job.pfcon_client.submit_job.assert_called_once()
+
+    def test_run_refused_because_another_task_submitted_it_counts_no_failure(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='finishedSuccessfully',
+            compute_resource=plugin.compute_resources.all()[0])
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            remote_cleanup_status='deletingData', remote_cleanup_retry_count=0)
+        pl_inst.refresh_from_db()
+        delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
+        # the check's submission and the run task's raced: the remote refused the second
+        # container of a job it has
+        delete_job.pfcon_client.submit_job = mock.Mock(
+            side_effect=PfconRequestException('container name already in use', code=500))
+        delete_job._get_status = mock.Mock(return_value={
+            'compute': {'status': 'started', 'logs': ''}})
+        delete_job.pfcon_client.requires_copy_job = True  # no legacy token retry
+
+        logging.disable(logging.INFO)  # setUp disables WARNING and below
+        with self.assertLogs('plugininstances.services', 'WARNING') as logs:
+            delete_job.run()
+
+        self.assertIn('but pfcon has the job', logs.output[-1])
+        self.assertFalse([line for line in logs.output if '[CODE01,' in line])
+        pl_inst.refresh_from_db()
+        self.assertEqual((pl_inst.remote_cleanup_status, pl_inst.remote_cleanup_retry_count),
+                         ('deletingData', 0))
 
     def test_check_exec_status_finished_successfully(self):
         user = User.objects.get(username=self.username)

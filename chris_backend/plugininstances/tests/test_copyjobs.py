@@ -168,12 +168,46 @@ class PluginInstanceCopyJobTests(TestCase):
             'compute': {'status': 'started', 'logs': ''}})
         copy_job.enqueue_run = mock.Mock()
 
-        with self.assertLogs('plugininstances.services.copyjobs', 'ERROR'):
+        logging.disable(logging.NOTSET)  # setUp disables WARNING and below
+        self.addCleanup(logging.disable, logging.WARNING)
+        with self.assertLogs('plugininstances.services', 'WARNING') as logs:
             copy_job.run()
+
+        self.assertEqual([r.levelname for r in logs.records], ['WARNING'])  # no CODE01
 
         db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
         self.assertEqual((db_inst.status, db_inst.copy_retry_count, db_inst.error_code),
                          ('copying', 0, ''))
+
+    def test_run_submit_error_for_a_job_the_remote_lacks_cancels_it_past_the_retries(self):
+        user = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        (pl_inst, tf) = PluginInstance.objects.get_or_create(
+            plugin=plugin, owner=user, status='copying',
+            compute_resource=plugin.compute_resources.all()[0])
+        PluginInstance.objects.filter(pk=pl_inst.pk).update(
+            copy_retry_count=PluginInstance.MAX_COPY_RETRIES)
+        pl_inst.refresh_from_db()
+        pl_param = plugin.parameters.all()[0]
+        PathParameter.objects.get_or_create(plugin_inst=pl_inst, plugin_param=pl_param,
+                                            value=self.username)
+        copy_job = copyjobs.PluginInstanceCopyJob(pl_inst)
+        copy_job.pfcon_client.requires_copy_job = True  # no legacy retry with a new token
+        copy_job.pfcon_client.submit_job = mock.Mock(
+            side_effect=PfconRequestException('Bad Request', code=400))
+        copy_job._get_status = mock.Mock(
+            side_effect=PfconRequestException('Not Found', code=404))
+        copy_job.enqueue_run = mock.Mock()
+
+        with self.assertLogs('plugininstances.services', 'ERROR') as logs:
+            copy_job.run()
+
+        self.assertIn(f'[CODE01,{copy_job.str_job_id}]: Error submitting copy job',
+                      logs.output[-1])
+        db_inst = PluginInstance.objects.get(pk=pl_inst.pk)
+        self.assertEqual((db_inst.status, db_inst.error_code, db_inst.remote_cleanup_status),
+                         ('cancelled', 'CODE01', 'deletingData'))
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceDeleteJob')
         copy_job.pfcon_client.submit_job.assert_called_once()
 
     def test_run_skips_when_cancelled(self):

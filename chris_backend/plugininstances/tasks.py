@@ -446,14 +446,14 @@ def cancel_waiting_plugin_instances():
     any of those DB statuses.
     """
     lookup = Q(previous__status='finishedWithError') | Q(previous__status='cancelled')
-    PluginInstance.objects.filter(status='waiting').filter(lookup).transition(
-        'cancelled', 'waiting')
+
+    # one by one, from 'waiting' still: each cancel that wins logs the final status
+    for plg_inst in PluginInstance.objects.filter(status='waiting').filter(lookup):
+        plg_inst.cancel('waiting')
 
     ts_instances = PluginInstance.objects.filter(
         status='waiting'
     ).filter(plugin__meta__type='ts')
-
-    plg_inst_ids = []
 
     for plg_inst in ts_instances:
         param = plg_inst.string_param.filter(plugin_param__name='plugininstances').first()
@@ -462,12 +462,9 @@ def cancel_waiting_plugin_instances():
             parent_ids = [int(parent_id) for parent_id in param.value.split(',')]
             parents = PluginInstance.objects.filter(pk__in=parent_ids)
 
-            for parent in parents:
-                if parent.status in ('finishedWithError', 'cancelled'):
-                    plg_inst_ids.append(plg_inst.id)
-                    break
-
-    PluginInstance.objects.filter(pk__in=plg_inst_ids).transition('cancelled', 'waiting')
+            if any(parent.status in ('finishedWithError', 'cancelled')
+                   for parent in parents):
+                plg_inst.cancel('waiting')
 
 
 @shared_task

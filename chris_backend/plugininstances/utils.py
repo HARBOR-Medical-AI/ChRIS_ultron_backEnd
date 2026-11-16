@@ -26,7 +26,7 @@ def run_if_ready(plg_inst, previous):
                 all_parents_finished = False
                 break
             if parent.status in ('finishedWithError', 'cancelled'):
-                plg_inst.transition('cancelled', 'created')
+                plg_inst.cancel('created')
                 all_parents_finished = False
                 break
 
@@ -40,7 +40,7 @@ def run_if_ready(plg_inst, previous):
         plg_inst.transition('waiting', 'created')
 
     elif previous.status in ('finishedWithError', 'cancelled'):
-        plg_inst.transition('cancelled', 'created')
+        plg_inst.cancel('created')
 
 
 def cancel_plugin_instances(plg_insts, source=None):
