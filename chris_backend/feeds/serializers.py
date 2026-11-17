@@ -4,6 +4,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db.utils import IntegrityError
 from rest_framework import serializers
 
+from core.serializers import save_validated_fields
 from plugininstances.enums import STATUS_CHOICES
 from .models import (Note, Feed, Tag, Tagging, Comment, FeedGroupPermission,
                      FeedUserPermission)
@@ -131,7 +132,8 @@ class FeedSerializer(serializers.HyperlinkedModelSerializer):
         """
         Overriden to grant or remove public access to the feed's folder and all its
         descendant folders, link files and files depending on the new public status of
-        the feed.
+        the feed, and to save only the fields the request changes: a whole save would
+        write back the state of a deletion requested since the request read the feed.
         """
         if 'public' in validated_data:
             if instance.public and not validated_data['public']:
@@ -141,7 +143,7 @@ class FeedSerializer(serializers.HyperlinkedModelSerializer):
             elif not instance.public and validated_data['public']:
                 instance.folder.grant_public_access()
                 instance.folder.create_public_link()
-        return super(FeedSerializer, self).update(instance, validated_data)
+        return save_validated_fields(instance, validated_data)
 
     def validate_public(self, public):
         """

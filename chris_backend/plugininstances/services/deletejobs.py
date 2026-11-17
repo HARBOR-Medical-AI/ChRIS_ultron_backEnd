@@ -258,12 +258,14 @@ class PluginInstanceDeleteJob(PluginInstanceJob):
 
     def _cleanup_plugin_instance_output_dir(self):
         """
-        Clean up the plugin instance output directory by deleting all files and folders 
+        Clean up the plugin instance output directory by deleting all files and folders
         under it. This is needed to remove any orphan files that might be left in the
-        output dir.
+        output dir. A directory that is not in storage is no error: one cancelled before
+        its job ran was never created (pfcon then skips the delete job and the cleanup
+        comes here at once), and a cleanup run again finds it deleted.
         """
         output_folder = self.c_plugin_inst.output_folder
-        
+
         for folder in output_folder.children.all():
             folder.delete()
         for file in output_folder.chris_files.all():
@@ -271,4 +273,5 @@ class PluginInstanceDeleteJob(PluginInstanceJob):
         for link_file in output_folder.chris_link_files.all():
             link_file.delete()
 
-        self.storage_manager.delete_path(output_folder.path)
+        if self.storage_manager.path_exists(output_folder.path):
+            self.storage_manager.delete_path(output_folder.path)

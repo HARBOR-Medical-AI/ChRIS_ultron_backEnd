@@ -95,7 +95,11 @@ class PluginInstanceTasksTests(TasksTests):
                                return_value=None) as cancel_mock:
             tasks.cancel_plugin_instance_job(self.plg_inst.id, 'PluginInstanceAppJob',
                                              error_code='CODE13')
-            cancel_mock.assert_called_with('CODE13')
+            cancel_mock.assert_called_with('CODE13', None)  # from any active status
+
+            tasks.cancel_plugin_instance_job(self.plg_inst.id, 'PluginInstanceAppJob',
+                                             error_code='CODE18', source='scheduled')
+            cancel_mock.assert_called_with('CODE18', 'scheduled')
 
     def test_task_check_running_plugin_instances_exec_status(self):
         with mock.patch.object(tasks.check_plugin_instance_job_exec_status, 'enqueue_once',
@@ -262,7 +266,7 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
                     if self.plg_inst.status == 'cancelled': break
 
                 self.assertEqual(self.plg_inst.status, 'cancelled')  # instance must be cancelled
-            self.assertTrue(any('stuck in lock' in msg for msg in cm.output))
+            self.assertTrue(any('stuck registering its files' in msg for msg in cm.output))
 
     @tag('integration')
     def test_task_cancel_plugin_instances_stuck_in_scheduled_status_during_async_run(self):

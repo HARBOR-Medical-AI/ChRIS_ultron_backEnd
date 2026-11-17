@@ -116,10 +116,14 @@ def time_limits(queue, env=None):
     if not value:
         return TIME_LIMITS[queue]
 
-    soft, hard = (float(limit) for limit in value.split(','))
+    try:
+        soft, hard = (float(limit) for limit in value.split(','))
+    except ValueError:  # not two numbers
+        soft = hard = 0
+
     if not 0 < soft < hard:
         raise ValueError(f'CUBE_CELERY_TIME_LIMITS_{queue.upper()}={value!r}: a soft '
-                         f'limit under the hard one, both above 0')
+                         f'limit under the hard one, both above 0, as "<soft>,<hard>"')
     return soft, hard
 
 
@@ -189,8 +193,9 @@ PUBLISHED_AT_HEADER = 'cube_published_at'
 
 @before_task_publish.connect
 def stamp_published_at(headers=None, **kwargs):
+    # set anew: a retry's message carries the custom headers of the one it replaces
     if headers is not None:
-        headers.setdefault(PUBLISHED_AT_HEADER, time.time())
+        headers[PUBLISHED_AT_HEADER] = time.time()
 
 
 def _period_options(period):

@@ -135,7 +135,7 @@ class PluginInstanceJob(abc.ABC):
         did. Returns the ``StatusWrite``.
         """
         fields = {'error_code': error_code} if error_code else {}
-        ended = self.c_plugin_inst.cancel(source, **fields)
+        ended = self.c_plugin_inst.cancel(source, job_id=self.str_job_id, **fields)
 
         if ended:
             if self.c_plugin_inst.remote_cleanup_status == 'deletingData':

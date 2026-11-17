@@ -171,7 +171,7 @@ class BenchmarkRunner:
         db_deltas = self._db_deltas(before_counts, feeds)   # before cleanup deletes them
         red = metrics.red_rollup(self._sink.requests())
         resources = metrics.resource_rollup(samples[0])
-        queues = metrics.queue_rollup(samples[1])
+        queues = metrics.queue_rollup(samples[1], metrics.pending_ttl_s())
         cancels = metrics.cancel_evidence(poll.timelines)
 
         classification = apply_orphan_cancels(
@@ -243,7 +243,8 @@ class BenchmarkRunner:
              "role": tl.role.value if tl.role else None, "feed_id": tl.feed_id,
              "parent_ids": list(tl.parent_ids),
              "first_seen": tl.first_seen, "history": tl.history,
-             "final_status": tl.final_status, "error_code": tl.error_code}
+             "final_status": tl.final_status, "error_code": tl.error_code,
+             "submitted": tl.submitted}
             for tl in result.timelines))
 
     def _on_level(self, level: LevelResult) -> None:
@@ -492,9 +493,11 @@ def log_evidence(docker: DockerClient | None, since: float,
     * ``worker_log_bytes``: the bytes each Celery worker logged, running or stopped since,
       and ``worker_logs_unread``: the ``workers`` whose log could not be read, or that had
       no container, which that total leaves out;
-    * ``pfcon_conflicts``: the duplicate submissions of a run's jobs (``RUN_JOBS``) that
-      pfcon refused, and ``pfcon_conflicts_by_job`` all the containers it refused by job
-      (``conflicting_jobs``); ``None`` when pfcon's log could not be read.
+    * ``pfcon_conflicts``: the duplicate submissions pfcon refused of a run's jobs
+      (``RUN_JOBS``), and of jobs its line does not name (``unknown``: not shown to be the
+      cleanup's), and ``pfcon_conflicts_by_job`` all the containers it refused by job
+      (``conflicting_jobs``), summed over pfcon's containers; ``None`` when pfcon's log
+      could not be read.
 
     ``{}`` when Docker is not available; a log that cannot be read is left out, since
     instrumentation must never end a scenario.
@@ -521,9 +524,10 @@ def log_evidence(docker: DockerClient | None, since: float,
                 unread.discard(service)
             elif service == "pfcon":
                 _, lines = docker.log_volume(container, since, PFCON_CONFLICT)
-                by_job = conflicting_jobs(lines)
+                by_job = (by_job or Counter()) + conflicting_jobs(lines)
 
-    conflicts = None if by_job is None else sum(by_job[job] for job in RUN_JOBS)
+    conflicts = (None if by_job is None
+                 else sum(by_job[job] for job in (*RUN_JOBS, "unknown")))
     return {"worker_log_bytes": worker_bytes, "worker_logs_unread": sorted(unread),
             "pfcon_conflicts": conflicts,
             "pfcon_conflicts_by_job": None if by_job is None else dict(by_job)}

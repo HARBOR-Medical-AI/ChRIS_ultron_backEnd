@@ -88,7 +88,7 @@ def poll_to_completion(api: ChrisApi, feed_ids: list[int], instances: list[Insta
 
     while True:
         observed = _scan(api, feed_ids)
-        statuses = {iid: status for iid, (status, _) in observed.items()}
+        statuses = {iid: status for iid, (status, *_) in observed.items()}
 
         if _record(observed, timelines):
             last_progress = time.monotonic()
@@ -127,23 +127,25 @@ def poll_to_completion(api: ChrisApi, feed_ids: list[int], instances: list[Insta
     )
 
 
-def _scan(api: ChrisApi, feed_ids: list[int]) -> dict[int, tuple[str, str]]:
+def _scan(api: ChrisApi, feed_ids: list[int]) -> dict[int, tuple[str, str, bool]]:
     """
-    Each instance of the feeds with its status and error code (blank for none).
+    Each instance of the feeds with its status, its error code (blank for none), and
+    whether a pfcon response is recorded for it (its ``raw``): a job of its went out.
     """
-    observed: dict[int, tuple[str, str]] = {}
+    observed: dict[int, tuple[str, str, bool]] = {}
 
     for fid in feed_ids:
         for item in api.get_feed_instances(fid):
             try:
                 observed[int(item["id"])] = (item.get("status") or "",
-                                             item.get("error_code") or "")
+                                             item.get("error_code") or "",
+                                             bool(item.get("raw")))
             except (KeyError, ValueError, TypeError):
                 continue
     return observed
 
 
-def _record(observed: dict[int, tuple[str, str]],
+def _record(observed: dict[int, tuple[str, str, bool]],
             timelines: dict[int, StatusTimeline]) -> bool:
     """
     Apply a status scan to the timelines; return True if anything advanced.
@@ -151,7 +153,7 @@ def _record(observed: dict[int, tuple[str, str]],
     now = time.time()
     progressed = False
 
-    for iid, (status, error_code) in observed.items():
+    for iid, (status, error_code, submitted) in observed.items():
         tl = timelines.get(iid)
 
         if tl is None:  # unexpected instance — track it anyway
@@ -161,7 +163,7 @@ def _record(observed: dict[int, tuple[str, str]],
         if status and status not in tl.first_seen:
             progressed = True
 
-        tl.observe(status, now, error_code)
+        tl.observe(status, now, error_code, submitted)
     return progressed
 
 

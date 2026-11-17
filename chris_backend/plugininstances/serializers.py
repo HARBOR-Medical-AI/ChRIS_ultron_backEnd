@@ -6,6 +6,7 @@ from drf_spectacular.utils import OpenApiTypes, extend_schema_field
 
 from collectionjson.fields import ItemLinkField
 from core.models import PathAccessError, validate_path_access
+from core.serializers import save_validated_fields
 from plugins.enums import TYPES
 from plugins.models import Plugin
 
@@ -105,13 +106,7 @@ class PluginInstanceSerializer(serializers.HyperlinkedModelSerializer):
         changed since the request read the instance.
         """
         validated_data.pop('status', None)
-
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-
-        if validated_data:
-            instance.save(update_fields=list(validated_data))
-        return instance
+        return save_validated_fields(instance, validated_data)
 
     def validate_previous(self, previous_id):
         """

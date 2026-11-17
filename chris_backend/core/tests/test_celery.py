@@ -7,6 +7,8 @@ runner routes every task to the 'celery' queue.
 
 import logging
 
+from celery.app.task import Context
+from django.conf import settings
 from django.test import SimpleTestCase, TransactionTestCase
 from django_celery_beat.models import PeriodicTask
 from django_celery_beat.schedulers import DatabaseScheduler, ModelEntry
@@ -81,9 +83,16 @@ class QueueTests(SimpleTestCase):
         self.assertEqual(task_options('delete', {'CUBE_CELERY_TIME_LIMITS_DELETE': '5,6'}),
                          {'soft_time_limit': 5.0, 'time_limit': 6.0})
 
-        for value in ('20,10', '0,5', '5'):
-            with self.subTest(value=value), self.assertRaises(ValueError):
+        for value in ('20,10', '0,5', '5', 'a,b', '1,2,3'):
+            with self.subTest(value=value), \
+                    self.assertRaisesRegex(ValueError, 'CUBE_CELERY_TIME_LIMITS_STATUS'):
                 time_limits('status', {'CUBE_CELERY_TIME_LIMITS_STATUS': value})
+
+    def test_the_worker_settings_take_effect(self):
+        # the prefetch setting this issue started from had a name Celery ignores
+        self.assertEqual(app.conf.worker_prefetch_multiplier, 2)
+        self.assertIs(app.conf.worker_cancel_long_running_tasks_on_connection_loss, False)
+        self.assertEqual([name for name in dir(settings) if name.startswith('CELERYD_')], [])
 
     def test_the_most_files_of_a_short_registration_can_be_replaced(self):
         name = 'CUBE_CELERY_REGISTER_FAST_MAX_FILES'
@@ -105,6 +114,18 @@ class QueueTests(SimpleTestCase):
         core_celery.stamp_published_at(headers=headers)
 
         self.assertIsInstance(headers[core_celery.PUBLISHED_AT_HEADER], float)
+
+    def test_a_retried_message_is_stamped_anew(self):
+        # Celery gives a retry's message the custom headers of the message it replaces
+        task = app.tasks['plugininstances.tasks.register_large_plugin_instance_output']
+        request = Context(id='x', args=[1], kwargs={},
+                          **{core_celery.PUBLISHED_AT_HEADER: 1.0})
+        headers = task.signature_from_request(request).options['headers']
+        self.assertEqual(headers[core_celery.PUBLISHED_AT_HEADER], 1.0)
+
+        core_celery.stamp_published_at(headers=headers)
+
+        self.assertGreater(headers[core_celery.PUBLISHED_AT_HEADER], 1.0)
 
 
 class BeatSchedulerTests(TransactionTestCase):

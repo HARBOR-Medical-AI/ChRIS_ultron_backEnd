@@ -106,7 +106,8 @@ class QueueStatsTests(SimpleTestCase):
         self.assertEqual([row['depth'] for row in stats['queues']], [1, 0, 2])
 
     def test_the_command_prints_a_table_or_json(self):
-        stats = {'queues': [{'queue': 'status', 'depth': 4, 'waited_s': 1.5}],
+        stats = {'queues': [{'queue': 'status', 'depth': 4, 'waited_s': 1.5},
+                            {'queue': 'register_large', 'depth': 12, 'waited_s': None}],
                  'unacknowledged': 2}
 
         with mock.patch.object(queuestats, 'queue_stats', return_value=stats):
@@ -114,7 +115,12 @@ class QueueStatsTests(SimpleTestCase):
             call_command('queuestats', stdout=table)
             call_command('queuestats', '--json', stdout=as_json)
 
-        self.assertIn('status           4  1.5 s', table.getvalue())
+        rows = table.getvalue().splitlines()[:3]
+        self.assertIn('4  1.5 s', rows[1])
+        self.assertTrue(rows[2].endswith('12  -'))
+        # the depths line up under their heading, however long a queue's name
+        self.assertEqual(len({row.index(depth) + len(depth)
+                              for row, depth in zip(rows, ('depth', '4', '12'))}), 1)
         self.assertIn('unacknowledged: 2', table.getvalue())
         self.assertEqual(json.loads(as_json.getvalue()), stats)
 

@@ -140,15 +140,18 @@ repeats; `report.md` names the levels where they appear:
 
 - **`pfcon_conflicts`** — the lines of pfcon's log, from the scenario's start to the end of
   its cleanup, that say Docker refused a second container for a job of a plugin instance's
-  run (`already in use`, for its plugin, copy or upload job): a duplicate submission.
-  `pfcon_conflicts_by_job` counts every refused container by job, the remote cleanup's
-  delete job among them (its status check and its run task can both submit it, which CUBE
-  takes as done) and `unknown` for a line that names no container. `null` when pfcon's log
-  could not be read.
-- **`orphan_cancels`** — children cancelled with no error code of their own before they
-  were seen to run, although every parent finished successfully: a parent's status written
-  back by a stale task. A child that ran and failed between two scans carries the code of
-  its failure and is not counted. Each is also a hard failure (`orphan_cancel:N` among the
+  run (`already in use`, for its plugin, copy or upload job), or for a container the line
+  does not name, which is not shown to be the cleanup's: a duplicate submission.
+  `pfcon_conflicts_by_job` counts every refused container by job, summed over pfcon's
+  containers, the remote cleanup's delete job among them (its status check and its run
+  task can both submit it, which CUBE takes as done) and `unknown` for a line that names no
+  container. `null` when pfcon's log could not be read.
+- **`orphan_cancels`** — children cancelled with no error code of their own and no job
+  ever submitted before they were seen to run, although every parent finished successfully:
+  a parent's status written back by a stale task. A child that ran and failed between two
+  scans is not counted: it carries the code of its failure, or a registration that failed
+  without one leaves its jobs' pfcon responses (`raw`; `submitted` in
+  `status_samples.jsonl`). Each is also a hard failure (`orphan_cancel:N` among the
   level's criteria).
 - **`masked_cancels`** — instances seen `cancelled` that then showed another status, a
   cancellation a stale write undid, whether or not a later one cancelled them again: read
@@ -162,11 +165,12 @@ repeats; `report.md` names the levels where they appear:
 
 `status_queue_bound` is the most status checks a scenario's level can queue when each
 running instance has at most one pending, as CUBE publishes them since HARBOR-planning
-#152: the feeds times the most instances of the topology that can run at once. A check
-lives 60 s (`CUBE_CELERY_PENDING_TTL`) and an expired one stays in the list until a worker
-pops it, beside the check published in its place, so the bound holds only while the
-queue's oldest message is younger than that: `status_queue_peak_fresh` is the `status`
-queue's peak over those samples alone (the sampler reads the wait of the oldest message
+#152: the feeds times the most instances of the topology that can run at once, a ceiling
+over the whole scenario (a phase where fewer run could exceed its own count under it). A
+check lives 60 s (`CUBE_CELERY_PENDING_TTL`, the run's own) and an expired one stays in the
+list until a worker pops it, beside the check published in its place, so the bound holds
+only while the queue's oldest message is younger than that, by half a second (a sample's
+period): `status_queue_peak_fresh` is the `status` queue's peak over those samples alone (the sampler reads the wait of the oldest message
 from the stamp CUBE puts on each one; 0 when the queue stayed empty, `null` for runs
 without the queue or the stamp). The queue also carries the cancel tasks, so a peak above
 the bound during cancellations is no failure of that rule. `report.md` names the levels

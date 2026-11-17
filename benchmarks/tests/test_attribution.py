@@ -20,7 +20,7 @@ from benchmarks.docker_client import (CGROUP_COUNTERS_CMD, CONTAINER_START_KEY, 
                                       parse_cgroup_counters)
 from benchmarks.environment import (ENVELOPE_KEYS, POSTGRES_SETTINGS, collect_environment,
                                     envelope)
-from benchmarks.metrics import PENDING_TTL_S, MetricSink, queue_rollup
+from benchmarks.metrics import PENDING_TTL_S, MetricSink, pending_ttl_s, queue_rollup
 from benchmarks.models import QueueSample
 from benchmarks.pg_stats import (COUNTERS_SQL, SETTINGS_SQL, STATEMENT_COLUMNS,
                                  STATEMENTS_SQL, PgStatStatements, connection_states,
@@ -170,12 +170,27 @@ def test_queue_rollup_s_fresh_peak_leaves_out_the_samples_with_an_expired_check(
     samples = [QueueSample(0, "status", 0), QueueSample(1, "status", 5, 10.0),
                QueueSample(2, "status", 40, PENDING_TTL_S + 15),
                QueueSample(3, "status", 30, None),          # its wait unknown
-               QueueSample(4, "status", 6, PENDING_TTL_S), QueueSample(0, "submit", 4)]
+               QueueSample(4, "status", 6, PENDING_TTL_S - 1),
+               QueueSample(5, "status", 9, PENDING_TTL_S - 0.2),  # its replacement may be in
+               QueueSample(0, "submit", 4)]
     roll = queue_rollup(samples)
 
     assert roll["status"]["depth_peak"] == 40  # nosec B101 - pytest assertion
     assert roll["status"]["depth_peak_fresh"] == 6  # nosec B101 - pytest assertion
     assert "depth_peak_fresh" not in roll["submit"]  # nosec B101 - pytest assertion
+
+
+def test_queue_rollup_s_fresh_peak_follows_the_run_s_pending_ttl():
+    samples = [QueueSample(0, "status", 5, 15.0), QueueSample(1, "status", 9, 25.0)]
+
+    assert queue_rollup(samples, 20.0)["status"]["depth_peak_fresh"] == 5  # nosec B101 - pytest assertion
+    assert queue_rollup(samples, 120.0)["status"]["depth_peak_fresh"] == 9  # nosec B101 - pytest assertion
+
+
+def test_the_pending_ttl_is_the_one_the_envelope_gives_the_run():
+    assert pending_ttl_s({"CUBE_CELERY_PENDING_TTL": "20"}) == 20.0  # nosec B101 - pytest assertion
+    assert pending_ttl_s({}) == PENDING_TTL_S  # nosec B101 - pytest assertion
+    assert pending_ttl_s({"CUBE_CELERY_PENDING_TTL": "soon"}) == PENDING_TTL_S  # nosec B101 - pytest assertion
 
 
 def test_queue_rollup_s_fresh_peak_of_a_status_queue_that_stayed_empty_is_0():

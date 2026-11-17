@@ -11,6 +11,7 @@ import uuid
 from unittest import mock
 
 from django.conf import settings
+from django.core.cache import caches
 from django.test import SimpleTestCase, override_settings
 
 from core import cache as core_cache
@@ -54,6 +55,15 @@ class DedupedTaskTests(CacheStateMixin, SimpleTestCase):
 
         self.assertEqual(self.apply_async.call_args_list, [
             mock.call(self.args, expires=PENDING_TTL, task_id=mock.ANY)])
+
+    def test_a_check_s_marker_lives_as_long_as_its_message(self):
+        self.task.enqueue_once(*self.args)
+
+        cache = caches['default']
+        key = cache.make_key(f'mark:{self.task.pending_key(self.args)}')
+        ttl = cache._cache.get_client(write=True).pttl(key)
+        self.assertTrue((PENDING_TTL - 1) * 1000 < ttl <= PENDING_TTL * 1000, ttl)
+        self.assertEqual(self.apply_async.call_args.kwargs['expires'], PENDING_TTL)
 
     def test_a_task_that_returned_is_published_again(self):
         self.task.enqueue_once(*self.args)

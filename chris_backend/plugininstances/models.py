@@ -29,9 +29,8 @@ class StatusWrite:
     """
     The outcome of a conditional write of a plugin instance: whether this caller made it
     (true as a bool), and a status: when it won, the one it wrote, or for a write of other
-    fields the one the caller's object holds (one of the statuses the write expected);
-    when it lost, the one another writer left in the database row, None when the row is
-    gone.
+    fields the one the caller's object holds, which may be older than the row's; when it
+    lost, the one another writer left in the database row, None when the row is gone.
     """
     won: bool
     status: str | None
@@ -323,14 +322,16 @@ class PluginInstance(AsyncDeletableModel):
         _statuses(to)
         return self._write({'status__in': sources}, {'status': to, **fields})
 
-    def cancel(self, source=None, **fields):
+    def cancel(self, source=None, job_id=None, **fields):
         """
         Move this instance to 'cancelled' from the statuses ``source`` (the active
         ones by default), writing ``fields``, with its remote cleanup armed in the same
         UPDATE when the database row is in a status with a job in the remote compute
         (``REMOTE_JOB_STATUSES``): the status a caller read may be stale by then.
         The periodic task handle_remote_cleanup submits the cleanup's jobs. The cancel
-        that wins logs the final status. Returns the ``StatusWrite``.
+        that wins logs the final status, naming the instance's jobs ``job_id`` (read
+        from the ``ChrisInstance`` when not given, a query: a caller that cancels many
+        reads the prefix once). Returns the ``StatusWrite``.
         """
         sources = _statuses(source or ACTIVE_STATUSES)
         remote = [s for s in sources if s in REMOTE_JOB_STATUSES]
@@ -348,7 +349,7 @@ class PluginInstance(AsyncDeletableModel):
                 written = self.transition('cancelled', statuses, **fields, **armed)
 
                 if written:
-                    self.log_final_status()
+                    self.log_final_status(job_id)
                 if written or written.status not in sources:
                     return written
         return written

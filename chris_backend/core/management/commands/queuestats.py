@@ -90,10 +90,11 @@ class Command(BaseCommand):
             self.stdout.write(json.dumps(stats))
             return
 
-        self.stdout.write(f"{'queue':<10} {'depth':>7}  next waited")
+        width = max(map(len, ['queue', *(row['queue'] for row in stats['queues'])]))
+        self.stdout.write(f"{'queue':<{width}} {'depth':>7}  next waited")
         for row in stats['queues']:
             waited = '-' if row['waited_s'] is None else f"{row['waited_s']} s"
-            self.stdout.write(f"{row['queue']:<10} {row['depth']:>7}  {waited}")
+            self.stdout.write(f"{row['queue']:<{width}} {row['depth']:>7}  {waited}")
 
         unacked = stats['unacknowledged']
         self.stdout.write(f"unacknowledged: {'-' if unacked is None else unacked}")

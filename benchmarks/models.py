@@ -127,7 +127,9 @@ class StatusTimeline:
     status it saw, in order (a status seen again after another is there twice);
     resolution = poll cadence. The feed and the parents are those the harness created it
     with (unknown for an unexpected one); ``error_code`` is the one the last read showed
-    (CUBE's ``CODEnn``, blank for none).
+    (CUBE's ``CODEnn``, blank for none), and ``submitted`` whether any read showed a pfcon
+    response recorded for it (``raw``): a job of its went out, which one cancelled from
+    ``waiting`` never had.
     """
     instance_id: int
     node_key: str
@@ -138,8 +140,11 @@ class StatusTimeline:
     parent_ids: tuple[int, ...] = ()
     error_code: str = ""
     history: list[tuple[str, float]] = field(default_factory=list)
+    submitted: bool = False
 
-    def observe(self, status: str, t: float, error_code: str = "") -> None:
+    def observe(self, status: str, t: float, error_code: str = "",
+                submitted: bool = False) -> None:
+        self.submitted = self.submitted or submitted
         if status and status not in self.first_seen:
             self.first_seen[status] = t
         if status:

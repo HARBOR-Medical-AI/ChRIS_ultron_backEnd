@@ -675,8 +675,10 @@ class PluginInstanceDeleteJobTests(TestCase):
 
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
         delete_job.storage_manager.delete_path = mock.Mock()
+        delete_job.storage_manager.path_exists = mock.Mock(side_effect=[True, False])
 
         delete_job._cleanup_plugin_instance_output_dir()
+        delete_job._cleanup_plugin_instance_output_dir()  # deleted already: nothing to do
 
         self.assertFalse(ChrisFolder.objects.filter(pk=child_folder.pk).exists())
         delete_job.storage_manager.delete_path.assert_called_once_with(

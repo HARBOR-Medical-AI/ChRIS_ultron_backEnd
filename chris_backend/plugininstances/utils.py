@@ -1,4 +1,6 @@
 
+from core.models import ChrisInstance
+
 from .tasks import schedule_plugin_instance
 from .models import PluginInstance, ACTIVE_STATUSES
 from .enums import STATUSES
@@ -51,7 +53,9 @@ def cancel_plugin_instances(plg_insts, source=None):
     moved to 'cancelled'.
     """
     source = source or STATUSES - {'cancelled'}
-    return sum(bool(inst.cancel(source)) for inst in plg_insts)
+    prefix = ChrisInstance.load().job_id_prefix  # once, for every final status logged
+    return sum(bool(inst.cancel(source, job_id=f'{prefix}{inst.id}'))
+               for inst in plg_insts)
 
 
 def cancel_plugin_instance_tree(plg_inst):

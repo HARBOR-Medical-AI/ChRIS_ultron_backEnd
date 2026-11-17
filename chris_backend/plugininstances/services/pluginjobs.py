@@ -438,6 +438,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
             try:
                 l_ls = self.storage_manager.ls(storage_path)
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 logger.error(f'[CODE06,{job_id}]: Error while listing storage files '
                              f'in {storage_path}, detail: {str(e)}')
@@ -449,6 +451,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     try:
                         linked_path = self.storage_manager.download_obj(
                             obj_path).decode().strip()
+                    except SoftTimeLimitExceeded:
+                        raise
                     except Exception as e:
                         logger.error(f'[CODE08,{job_id}]: Error while downloading file '
                                      f'{obj_path} from storage, detail: {str(e)}')
@@ -643,8 +647,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     link_file = self._link_file(path, owner, parent_folder,
                                                 str_source_trace_dir)
                     link_file.save(name=str_source_trace_dir)
-                    logger.info(f'Creating link file -->'
-                                f'{link_file.fname.name}<-- for job {job_id}')
+                    logger.debug(f'Creating link file -->'
+                                 f'{link_file.fname.name}<-- for job {job_id}')
                     self.c_plugin_inst.size += link_file.fname.size
             except SoftTimeLimitExceeded:
                 raise
@@ -659,8 +663,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 link_file = self._link_file(path, owner, parent_folder,
                                             str_source_trace_dir)
                 link_file.save(name=str_source_trace_dir)
-                logger.info(f'Creating link file -->'
-                            f'{link_file.fname.name}<-- for job {job_id}')
+                logger.debug(f'Creating link file -->'
+                             f'{link_file.fname.name}<-- for job {job_id}')
                 self.c_plugin_inst.size += link_file.fname.size
             except SoftTimeLimitExceeded:
                 raise
@@ -916,10 +920,9 @@ class PluginInstanceAppJob(PluginInstanceJob):
         self._files_registered = 0
         remote_status = self._remote_job_status()
 
-        if not self._owns_registration():
-            # a newer run or a cancel has taken it meanwhile: no fetch either (on fslink
-            # the remote's listing removes the link files of the output folder, which the
-            # other run writes)
+        if self.registration_overtaken():
+            # no fetch either (on fslink the remote's listing removes the link files of
+            # the output folder, which the other run writes)
             final = 'cancelled'
         elif remote_status == 'finishedSuccessfully':
             final = self.register_output_files_on_success()
@@ -988,14 +991,21 @@ class PluginInstanceAppJob(PluginInstanceJob):
         self.c_plugin_inst.error_code = 'CODE02'
         return None
 
-    def _owns_registration(self):
+    def registration_overtaken(self):
         """
-        Whether this run still owns the registration and the instance still registers
-        files: neither a newer run nor a cancel has taken it since its claim.
+        Whether a newer run or a cancel has taken this run's registration since its claim,
+        logged when so: the run then writes nothing more (no files, folders, links or
+        copies, and no attempt of its own again). Never for a registration that claimed
+        nothing (not through register_output).
         """
-        return PluginInstance.objects.filter(
-            pk=self.c_plugin_inst.pk, status='registeringFiles',
-            lock__owner_token=self._registration_token).exists()
+        if self._registration_token is None or PluginInstance.objects.filter(
+                pk=self.c_plugin_inst.pk, status='registeringFiles',
+                lock__owner_token=self._registration_token).exists():
+            return False
+
+        logger.info(f'The registration of job {self.str_job_id} was cancelled or taken '
+                    f'over: this run writes nothing more')
+        return True
 
     def _end_registration(self, final, token):
         """
@@ -1060,6 +1070,9 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 logger.info('Uploading remote output files for job %s to '
                             'file storage', job_id)
                 self.unpack_zip_file(job_file_content)
+
+            if self.registration_overtaken():
+                return 'cancelled'  # what follows writes links and copies
 
             logger.info('Copying local output files for job %s in file '
                         'storage', job_id)
@@ -1198,6 +1211,10 @@ class PluginInstanceAppJob(PluginInstanceJob):
         files = []
         folders = {}
 
+        if self.registration_overtaken():  # no renames, folders or rows of its own
+            self.plugin_inst_output_files = set()
+            return
+
         # remove commas from the existing files/folders names and handle the special cases
         changed_file_paths = self.storage_manager.sanitize_obj_names(outputdir)
 
@@ -1242,10 +1259,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 plg_inst_file.fname.name = obj_path
                 files.append(plg_inst_file)
 
-        if self._registration_token and not self._owns_registration():
-            # a cancel's cleanup may be deleting the output: no rows for its files
-            logger.info(f'The registration of job {job_id} was cancelled or taken over: '
-                        f'this run registers no files')
+        if self.registration_overtaken():
+            # since the check above: a cancel's cleanup may be deleting the output
             self.plugin_inst_output_files = set()
             return
 

@@ -116,6 +116,31 @@ def test_a_child_whose_own_copy_failed_between_two_scans_is_no_orphan():
     assert cancel_evidence([finished, failed_copy])["orphan_cancels"] == []  # nosec B101 - pytest assertion
 
 
+def test_a_child_whose_registration_failed_unseen_without_a_code_is_no_orphan():
+    finished = _timeline(1, "finishedSuccessfully", ["started", "finishedSuccessfully"])
+    ran_unseen = _timeline(2, "cancelled", ["waiting", "cancelled"], parents=[1])
+    ran_unseen.submitted = True  # the pfcon responses of its jobs were there
+
+    assert cancel_evidence([finished, ran_unseen])["orphan_cancels"] == []  # nosec B101 - pytest assertion
+
+
+def test_the_poller_records_whether_a_job_of_an_instance_went_out():
+    refs = [InstanceRef(iid, 7, f"n{iid}", PluginRole.DS) for iid in (1, 2, 3)]
+    scans = itertools.chain(
+        [[{"id": 1, "status": "started", "raw": "eJzLSM3JyQcABiwCFQ=="},
+          {"id": 2, "status": "waiting", "raw": ""}, {"id": 3, "status": "waiting"}]],
+        itertools.repeat([{"id": 1, "status": "cancelled", "raw": ""},
+                          {"id": 2, "status": "cancelled", "raw": ""},
+                          {"id": 3, "status": "cancelled"}]))
+    api = SimpleNamespace(get_feed_instances=lambda feed_id: next(scans))
+
+    poll = poll_to_completion(api, [7], refs, poll_every=0.001, scenario_timeout=5,
+                              no_progress_timeout=5)
+
+    assert {tl.instance_id: tl.submitted for tl in poll.timelines} == {  # nosec B101 - pytest assertion
+        1: True, 2: False, 3: False}
+
+
 def test_a_cancel_undone_then_done_again_is_masked_and_a_relabel_is_not():
     undone = _timeline(1, "cancelled", ["started", "cancelled", "registeringFiles",
                                         "cancelled"])
@@ -216,6 +241,18 @@ def test_log_evidence_counts_each_worker_s_bytes_and_pfcon_s_conflicts():
                         "pfcon_conflicts": 1,
                         "pfcon_conflicts_by_job": {"plugin": 1, "delete": 1}}
     assert client.listings == [{"all_states": True}]  # nosec B101 - pytest assertion
+
+
+def test_the_conflicts_of_every_pfcon_container_add_up_and_unnamed_ones_count():
+    containers = [_LoggingContainer("pfcon", [_conflict(b"chris-jid-1")]),
+                  _LoggingContainer("pfcon", [b"409 ... already in use, somehow\n",
+                                              _conflict(b"chris-jid-2-delete")]),
+                  _LoggingContainer("pfcon", [b"fine\n"])]  # one left stopped, say
+
+    evidence = log_evidence(_docker(containers), 1.0, ())
+
+    assert evidence["pfcon_conflicts"] == 2  # nosec B101 - pytest assertion
+    assert evidence["pfcon_conflicts_by_job"] == {"plugin": 1, "unknown": 1, "delete": 1}  # nosec B101 - pytest assertion
 
 
 def test_a_stopped_worker_s_log_adds_to_its_running_one_s():
