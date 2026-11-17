@@ -304,7 +304,8 @@ a stack you can `just nuke` afterwards.
   `inspect()` broadcast made the scheduler tasks skip each other); nothing stops a shorter
   interval now, but compare runs at the same one (see `envelope.md`). Since #152 a
   registration that ends an instance `finishedSuccessfully` schedules the ready instances
-  of its feed itself, so a chain's runs from before wait about one interval more per hop.
+  of its feed itself; runs from before lost no interval per hop either, the scheduling
+  task running about 1 s after each tick's status checks (REPORT.md § 17).
 - **Run authoritative sweeps on a dedicated Linux box.** On Docker Desktop the VM's own
   limits dominate the per-container envelope, so laptop numbers are directional only.
 - **The workload plugins are pinned.** `just bench-start` registers `dbg-bigfiles` 1.0.0,

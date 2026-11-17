@@ -128,8 +128,9 @@ invocations saw each other as running and skipped (instances stuck in `waiting` 
 at `1.0`). It now takes a lock in the shared cache (`core.tasks.single_instance`), a
 millisecond, so nothing stops a shorter interval; compare runs at the same one. Since #152 a
 registration that ends an instance `finishedSuccessfully` also schedules the ready waiting
-instances of its feed itself, as the beat did on its next pass, so a chain's runs from before
-wait about one interval more per hop at the same interval.
+instances of its feed itself. Runs from before lost no interval per hop either: the beat's
+scheduling task ran about 1 s after each tick's status checks (that `inspect()`), once their
+inline registrations had ended (REPORT.md § 17).
 
 **The Celery queues:** one per class of task (`chris_backend/core/celery.py`), consumed by five
 workers: `worker-mains` (`submit`, `status`), `worker-register` (`register`), `worker-heavy`
@@ -171,8 +172,10 @@ defaults run fourteen Celery worker processes (4 + 2 + 4 + 2 + 2) and the beat
 connections at most, against 300.
 
 **CPU limits add up to more than the box:** with the defaults the services' limits total 22.5
-CPUs on the 16 of `miami.local`. They are ceilings, not reservations; a level where they bind
-together shows as throttling (`cpu_throttled_s` in the level rows).
+CPUs on the benchmark box's 16. They are ceilings, not reservations: a level where they bind
+together shows as the services' CPU adding up to the box's 16 CPUs while none reaches its own
+limit, and in latency; throttling (`cpu_throttled_s` in the level rows) shows only a service
+held at its own limit.
 
 `postgres/cube.conf` (below) also preloads `pg_stat_statements` on both stacks (the harness
 snapshots every statement per scenario); this is measurement instrumentation, not part of the

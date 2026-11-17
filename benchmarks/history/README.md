@@ -324,7 +324,7 @@ row, and the Celery services' command lines in `environment.json`.
 
 These are the baselines for the three commands from here on. Against earlier runs `bench-compare`
 reports the new envelope knobs, the limits of the new workers and the queues the sampler reads
-as cautions. The BEFORE and Transitions arms, the other AFTER runs (the smoke, fanout_fanin ·
+as cautions, and against runs before 2026-11-15 `commands` as not recorded. The BEFORE and Transitions arms, the other AFTER runs (the smoke, fanout_fanin ·
 feeds = 64, the repeats and the isolation pair), the 2-CPU runs and every service's log for
 each run are kept on the benchmark box.
 
