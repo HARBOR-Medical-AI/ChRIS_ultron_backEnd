@@ -54,6 +54,37 @@ class PublishError(Exception):
     """
 
 
+def publish_or_cancel(plg_inst, status, publish, *args, job_id=None, **kwargs):
+    """
+    Publish a task for ``plg_inst`` by calling ``publish`` (the task's ``delay`` or
+    ``apply_async``) with ``args`` and ``kwargs``. The caller has just moved the instance
+    to ``status``, where only that task moves it on. When the task cannot be published
+    (the broker refused it through Celery's publish retries, or the soft time limit cut a
+    publish to a broker that hangs), nothing ever would: the instance is cancelled from
+    ``status`` with CODE01, its remote cleanup armed in the same UPDATE for the periodic
+    task to submit, and PublishError raised. A task the broker stored after all finds the
+    instance cancelled and does nothing; one that ran first has moved the instance on, so
+    the cancel loses and the publish counts as made (a WARNING, None returned).
+    ``job_id`` names its jobs in the log, read from the ``ChrisInstance`` when not given.
+    """
+    try:
+        return publish(*args, **kwargs)
+    except Exception as e:
+        job_id = job_id or ChrisInstance.load().job_id_prefix + str(plg_inst.id)
+        cancelled = plg_inst.cancel(status, job_id=job_id, error_code='CODE01')
+
+        if not cancelled and cancelled.status not in (None, 'cancelled'):
+            logger.warning(f'Publishing the task that moves the plugin instance of job '
+                           f'{job_id} on from {status} failed ({e!r}), but the task went '
+                           f'out: the instance is {cancelled.status} already')
+            return None
+
+        logger.error(f'[CODE01,{job_id}]: Error publishing the task that moves the plugin '
+                     f'instance on from {status}, detail: {e!r}')
+        raise PublishError(f'plugin instance {plg_inst.id} was cancelled: the task that '
+                           f'moves it on from {status} was not published') from e
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3})
 def delete_plugin_instance(self, plugin_inst_id):
     try:
@@ -173,7 +204,9 @@ def register_plugin_instance_output(plg_inst_id):
 
     reason = _reason_to_send_on(job)
     if reason:
-        register_large_plugin_instance_output.delay(plg_inst_id)
+        publish_or_cancel(job.c_plugin_inst, 'registeringFiles',
+                          register_large_plugin_instance_output.delay, plg_inst_id,
+                          job_id=job.str_job_id)
         logger.info(f'Sent the registration of the output files of job {job.str_job_id} '
                     f'on to the {REGISTER_LARGE} queue: {reason}')
         return
@@ -236,10 +269,11 @@ def _register_output(task, job, again=None):
     """
     Run ``job``'s registration in ``task``, and when it ends the instance
     'finishedSuccessfully', schedule the ready waiting instances of its feed
-    (_schedule_followers). On its soft time limit run it again at once: in ``again`` when
-    given, another task, which takes it as its next attempt, else in ``task`` itself; once
-    it has had REGISTRATION_RETRIES + 1 attempts, cancel the instance with CODE13 instead.
-    A run that a newer one or a cancel has overtaken does neither.
+    (_schedule_followers). On its soft time limit run it again at once, as a message of
+    ``again`` when given (another task, which takes it as its next attempt), else of
+    ``task`` itself; once it has had REGISTRATION_RETRIES + 1 attempts, cancel the
+    instance with CODE13 instead. A run that a newer one or a cancel has overtaken does
+    neither.
     """
     try:
         job.register_output()
@@ -253,13 +287,16 @@ def _register_output(task, job, again=None):
             return  # a newer run, or a cancel, has it: this one tries nothing again
         if attempt >= REGISTRATION_RETRIES:
             job.give_up_registration('CODE13')
-        elif again is not None:
-            again.apply_async((job.c_plugin_inst.id,), retries=attempt + 1)
         else:
-            # at once: a message with a countdown waits in its worker's memory outside
-            # the reserved tasks that --disable-prefetch counts, so that worker would
-            # take another task meanwhile and the retry would wait behind it
-            raise task.retry(countdown=0, max_retries=REGISTRATION_RETRIES)
+            # a message of its own rather than Task.retry, which turns a publish that
+            # fails into a Reject that no failure handler sees; and at once: a message
+            # with a countdown waits in its worker's memory outside the reserved tasks
+            # that --disable-prefetch counts, so that worker would take another task
+            # meanwhile and the next attempt would wait behind it
+            next_task = again if again is not None else task
+            publish_or_cancel(job.c_plugin_inst, 'registeringFiles', next_task.apply_async,
+                              (job.c_plugin_inst.id,), job_id=job.str_job_id,
+                              retries=attempt + 1)
     else:
         # the object's status is the final one only when this run's final write won
         if job.c_plugin_inst.status == 'finishedSuccessfully':
@@ -401,7 +438,7 @@ def schedule_plugin_instance(plg_inst, source):
     task submit that job. Returns the ``StatusWrite``.
 
     When that task cannot be published nothing would ever submit the job, so the instance
-    is cancelled with CODE01, its remote cleanup armed, and PublishError raised.
+    is cancelled with CODE01 and PublishError raised (publish_or_cancel).
     """
     if plg_inst.compute_resource.compute_requires_copy_job:
         to, job_class_name = 'copying', 'PluginInstanceCopyJob'
@@ -412,15 +449,8 @@ def schedule_plugin_instance(plg_inst, source):
     moved = plg_inst.transition(to, source, start_date=now, end_date=now)
 
     if moved:
-        try:
-            run_plugin_instance_job.delay(plg_inst.id, job_class_name)
-        except Exception as e:
-            job_id = ChrisInstance.load().job_id_prefix + str(plg_inst.id)
-            logger.error(f'[CODE01,{job_id}]: Error publishing the task that submits the '
-                         f'{job_class_name} job, detail: {str(e)}')
-            plg_inst.cancel(to, job_id=job_id, error_code='CODE01')
-            raise PublishError(f'the job of plugin instance {plg_inst.id} was not '
-                               f'submitted') from e
+        publish_or_cancel(plg_inst, to, run_plugin_instance_job.delay, plg_inst.id,
+                          job_class_name)
     return moved
 
 
@@ -560,7 +590,9 @@ def cancel_plugin_inst_on_task_failure(sender=None, task_id=None, exception=None
     with CODE19 if it is still active and schedules its remote cleanup if nothing did.
     A crashed remote cleanup is left to the periodic task that drives cleanups, and a
     crashed cancel to its own retries: sending another at once would loop as fast as the
-    workers take it.
+    workers take it. A task that failed to publish the next one (PublishError) has
+    cancelled its instance itself, and the broker that refused that message would refuse
+    this one too.
     """
     # list of task names we want to handle
     handled_tasks = {
@@ -568,8 +600,8 @@ def cancel_plugin_inst_on_task_failure(sender=None, task_id=None, exception=None
         'plugininstances.tasks.register_plugin_instance_output',
         'plugininstances.tasks.register_large_plugin_instance_output',
     }
-    if sender.name not in handled_tasks:
-        return  # ignore other tasks
+    if sender.name not in handled_tasks or isinstance(exception, PublishError):
+        return  # ignore other tasks, and the instances cancelled already
 
     if not args:
         logger.warning(f"No args found for failed task {sender.name}")

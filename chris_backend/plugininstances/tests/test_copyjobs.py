@@ -355,7 +355,8 @@ class PluginInstanceCopyJobTests(TestCase):
         self.assertEqual(pl_inst.status, 'scheduled')
         self.assertTrue(pl_inst.summary['pushPath']['status'])
         # a status check never submits the app job itself
-        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob')
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob',
+                                                      moved_to='scheduled')
 
     def test_handle_finished_with_error_status(self):
         user = User.objects.get(username=self.username)
@@ -450,7 +451,8 @@ class PluginInstanceCopyJobTests(TestCase):
             self.storage_manager.delete_obj(user_space_path + 'test.txt')
             self.skipTest('Copy job failed to transition to scheduled - likely pfcon Docker issue')
         self.assertEqual(pl_inst.status, 'scheduled')
-        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob')
+        copy_job.enqueue_run.assert_called_once_with('PluginInstanceAppJob',
+                                                      moved_to='scheduled')
 
         # the task the status check enqueued submits the app job
         pluginjobs.PluginInstanceAppJob(pl_inst).run()

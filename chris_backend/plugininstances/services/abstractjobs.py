@@ -10,7 +10,9 @@ statuses the writer expects, its other fields are written while it is in the sta
 writer expects (``update_if_status``) but for the retry counters, and the remote cleanup
 moves on only from the step it expects (``move_remote_cleanup``). Only the task that won
 a transition does what follows it (submit the next job, the remote cleanup's first one);
-a cancel that lost to another task's end makes sure the cleanup is scheduled.
+a cancel that lost to another task's end makes sure the cleanup is scheduled. A task that
+alone moves the instance on from the status a transition wrote goes out through
+``publish_or_cancel``, which cancels the instance with CODE01 when it cannot be published.
 """
 
 import logging
@@ -199,30 +201,43 @@ class PluginInstanceJob(abc.ABC):
             self.schedule_remote_cleanup(rearm=True)
         return written
 
-    def enqueue_run(self, job_class_name):
+    def enqueue_run(self, job_class_name, moved_to=None):
         """
         Have a task submit the job of the class named ``job_class_name`` for the plugin
         instance: the status checks of the copy, plugin and upload jobs never submit one
-        themselves. The delete job of the remote cleanup has a task of its own, on the
+        themselves. ``moved_to`` is the status the caller has just moved the instance to,
+        where only that task moves it on: a task that cannot be published then cancels the
+        instance (publish_or_cancel). Without it, a publish that fails only raises: the
+        next status check submits a job again, as the periodic task does the remote
+        cleanup's. The delete job of the remote cleanup has a task of its own, on the
         cleanup's queue, and its status check, on that queue too, submits it again itself
         when the remote does not have it.
         """
-        from plugininstances.tasks import (run_plugin_instance_cleanup_job,
+        from plugininstances.tasks import (publish_or_cancel,
+                                           run_plugin_instance_cleanup_job,
                                            run_plugin_instance_job)
 
         if job_class_name == 'PluginInstanceDeleteJob':
             run_plugin_instance_cleanup_job.delay(self.c_plugin_inst.id)
-        else:
+        elif moved_to is None:
             run_plugin_instance_job.delay(self.c_plugin_inst.id, job_class_name)
+        else:
+            publish_or_cancel(self.c_plugin_inst, moved_to, run_plugin_instance_job.delay,
+                              self.c_plugin_inst.id, job_class_name,
+                              job_id=self.str_job_id)
 
     def enqueue_registration(self):
         """
         Have a task register the plugin instance's output files, on the queue of
-        registrations: a status check never registers them itself.
+        registrations: a status check never registers them itself. The caller has just moved
+        the instance to 'registeringFiles', where only that task moves it on, so a task that
+        cannot be published cancels the instance (publish_or_cancel).
         """
-        from plugininstances.tasks import register_plugin_instance_output
+        from plugininstances.tasks import publish_or_cancel, register_plugin_instance_output
 
-        register_plugin_instance_output.delay(self.c_plugin_inst.id)
+        publish_or_cancel(self.c_plugin_inst, 'registeringFiles',
+                          register_plugin_instance_output.delay, self.c_plugin_inst.id,
+                          job_id=self.str_job_id)
         logger.info(f'Queued the registration of the output files of job {self.str_job_id}: '
                     f'its task, on the register queue or the one it sends it on to, saves '
                     f'the final status')

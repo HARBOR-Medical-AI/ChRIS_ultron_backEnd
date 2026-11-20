@@ -450,8 +450,8 @@ class PluginInstanceAppJobTests(TestCase):
         def cancelled_meanwhile():
             pl_inst.size += 64
             # the API cancels the instance while its files are being registered
-            PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled',
-                                                                    'registeringFiles')
+            PluginInstance.objects.get(pk=pl_inst.pk).transition('cancelled',
+                                                                 'registeringFiles')
         job._register_output_files = mock.Mock(side_effect=cancelled_meanwhile)
 
         job.register_output()
@@ -477,8 +477,8 @@ class PluginInstanceAppJobTests(TestCase):
         def listed_then_cancelled(content):
             job.plugin_inst_output_files = {name}
             # the API cancels it and its cleanup may already be deleting the output
-            PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled',
-                                                                    'registeringFiles')
+            PluginInstance.objects.get(pk=pl_inst.pk).transition('cancelled',
+                                                                 'registeringFiles')
 
         job.check_files_from_json_exist = mock.Mock(side_effect=listed_then_cancelled)
 
@@ -507,8 +507,8 @@ class PluginInstanceAppJobTests(TestCase):
         job._job_has_timeout = mock.Mock(return_value=True)
         job.enqueue_run = mock.Mock()
         # another task moved it on meanwhile: the timeout is that of a job that ended
-        PluginInstance.objects.filter(pk=pl_inst.pk).transition('registeringFiles',
-                                                                'started')
+        PluginInstance.objects.get(pk=pl_inst.pk).transition('registeringFiles',
+                                                             'started')
 
         with self.assertLogs('plugininstances.services.pluginjobs', 'ERROR'):
             status = job.check_exec_status()
@@ -542,7 +542,7 @@ class PluginInstanceAppJobTests(TestCase):
             'compute': {'status': 'finishedSuccessfully', 'logs': ''}})
         job.enqueue_registration = mock.Mock()
         job.enqueue_run = mock.Mock()
-        PluginInstance.objects.filter(pk=pl_inst.pk).transition('cancelled', 'started')
+        PluginInstance.objects.get(pk=pl_inst.pk).transition('cancelled', 'started')
 
         status = job.check_exec_status()
 
@@ -580,7 +580,8 @@ class PluginInstanceAppJobTests(TestCase):
         self.assertEqual(job.check_exec_status(), 'uploading')
 
         # the upload job fetches the files; its status check has them registered
-        job.enqueue_run.assert_called_once_with('PluginInstanceUploadJob')
+        job.enqueue_run.assert_called_once_with('PluginInstanceUploadJob',
+                                                moved_to='uploading')
         job.enqueue_registration.assert_not_called()
         job.register_output.assert_not_called()
 

@@ -51,27 +51,6 @@ def _statuses(source, known=STATUSES):
     return sources
 
 
-class PluginInstanceQuerySet(models.QuerySet):
-
-    def transition(self, to, source, **fields):
-        """
-        Move every instance of this queryset that the database has in one of the statuses
-        ``source`` to status ``to``, writing ``fields`` in the same UPDATE. Returns how
-        many moved. The queryset's own filters are applied first, by id, so that the
-        condition on the status is checked on each database row as it is updated even when
-        those filters follow relations (an UPDATE through a subquery would check them
-        on what it read).
-        """
-        sources = _statuses(source)
-        _statuses(to)
-        ids = list(self.values_list('pk', flat=True))
-
-        if not ids:
-            return 0
-        return self.model.objects.filter(pk__in=ids, status__in=sources).update(
-            status=to, **fields)
-
-
 def get_default_job_status_summary() -> dict:
     """
     Get a default job status summary JSON.
@@ -133,8 +112,6 @@ class PluginInstance(AsyncDeletableModel):
     memory_limit = MemoryField(null=True)
     number_of_workers = models.IntegerField(null=True)
     gpu_limit = models.IntegerField(null=True)
-
-    objects = PluginInstanceQuerySet.as_manager()
 
     class Meta:
         ordering = ('-start_date',)
@@ -304,7 +281,7 @@ class PluginInstance(AsyncDeletableModel):
 
     # -- conditional writes ------------------------------------------------------------
     # Several tasks and API requests can act on one instance at once. Therefore the
-    # instance status is only ever written by transition() (or the queryset's): one
+    # instance status is only ever written by transition() (cancel() included): one
     # UPDATE conditional on the status the writer expects. What else a task writes is
     # conditional too, on the status (update_if_status()) or, for the remote cleanup, on
     # the cleanup's own status (move_remote_cleanup(), arm_remote_cleanup()), but for the

@@ -159,8 +159,8 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
         job.enqueue_run = mock.Mock()
 
         def cancelled_meanwhile(content):
-            PluginInstance.objects.filter(pk=inst.pk).transition('cancelled',
-                                                                 'registeringFiles')
+            PluginInstance.objects.get(pk=inst.pk).transition('cancelled',
+                                                              'registeringFiles')
 
         job.check_files_from_json_exist = mock.Mock(side_effect=cancelled_meanwhile)
 
@@ -205,8 +205,8 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
             remote_cleanup_status='deletingContainers')
         job = PluginInstanceDeleteJob(PluginInstance.objects.get(pk=inst.pk))
         # the tree it is in is cancelled after the cleanup's task read it
-        PluginInstance.objects.filter(pk=inst.pk).transition('cancelled',
-                                                             'finishedSuccessfully')
+        PluginInstance.objects.get(pk=inst.pk).transition('cancelled',
+                                                          'finishedSuccessfully')
 
         with mock.patch.object(PluginInstanceDeleteJob, '_plugin_job_active',
                                return_value=True), \

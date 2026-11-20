@@ -320,8 +320,8 @@ class PluginInstanceUploadJobTests(TestCase):
         upload_job = uploadjobs.PluginInstanceUploadJob(pl_inst)
         upload_job.enqueue_registration = mock.Mock()
         # an overlapping status check got there first
-        PluginInstance.objects.filter(pk=pl_inst.pk).transition('registeringFiles',
-                                                                'uploading')
+        PluginInstance.objects.get(pk=pl_inst.pk).transition('registeringFiles',
+                                                             'uploading')
 
         upload_job.handle_finished_successfully_status()
 

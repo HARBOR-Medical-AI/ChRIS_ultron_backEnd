@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.exceptions import SoftTimeLimitExceeded
 from kombu.exceptions import OperationalError
 from pfconclient.exceptions import PfconRequestException
 
@@ -119,8 +119,6 @@ class TransitionTests(PluginInstanceFixture, TestCase):
             with self.subTest(to=to, source=source), self.assertRaises(ValueError):
                 inst.transition(to, source)
 
-        with self.assertRaises(ValueError):
-            PluginInstance.objects.all().transition('done', 'started')
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'started')
 
     def test_only_a_transition_writes_the_status(self):
@@ -140,19 +138,6 @@ class TransitionTests(PluginInstanceFixture, TestCase):
 
         self.assertEqual((written.won, written.status), (False, 'cancelled'))
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).raw, 'a')
-
-    def test_the_queryset_form_checks_each_row_s_status_even_through_a_relation(self):
-        parent = self.instance('cancelled')
-        waiting = self.instance('waiting', previous=parent)
-        started = self.instance('started', previous=parent)
-
-        moved = PluginInstance.objects.filter(previous__status='cancelled').transition(
-            'cancelled', 'waiting')
-
-        self.assertEqual(moved, 1)
-        self.assertEqual(PluginInstance.objects.get(pk=waiting.pk).status, 'cancelled')
-        self.assertEqual(PluginInstance.objects.get(pk=started.pk).status, 'started')
-        self.assertEqual(PluginInstance.objects.none().transition('cancelled', 'waiting'), 0)
 
     def test_arming_the_remote_cleanup_is_idempotent_and_rearming_restarts_an_ended_one(self):
         inst = self.instance('cancelled')
@@ -465,9 +450,9 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
                 mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
                                   side_effect=SoftTimeLimitExceeded()), \
                 mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run'), \
-                mock.patch.object(type(self.large), 'retry', return_value=Retry()) as retry:
-            with self.assertLogs('plugininstances.tasks', 'ERROR') as first, \
-                    self.assertRaises(Retry):
+                mock.patch.object(type(self.large), 'retry') as retry, \
+                mock.patch.object(type(self.large), 'apply_async') as again:
+            with self.assertLogs('plugininstances.tasks', 'ERROR') as first:
                 tasks.register_large_plugin_instance_output(inst.pk)
             self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status,
                              'registeringFiles')
@@ -481,7 +466,9 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
         count.assert_not_called()  # the large queue's task counts nothing
         self.assertIn('reached its time limit (attempt 1)', first.output[0])
         self.assertIn(f'(attempt {tasks.REGISTRATION_RETRIES + 1})', final.output[0])
-        retry.assert_called_once_with(countdown=0, max_retries=tasks.REGISTRATION_RETRIES)
+        # no Task.retry, whose failed publish would be a Reject that no handler sees
+        retry.assert_not_called()
+        again.assert_called_once_with((inst.pk,), retries=1)
         inst.refresh_from_db()
         self.assertEqual((inst.status, inst.error_code), ('cancelled', 'CODE13'))
 
@@ -647,13 +634,11 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
                                       return_value=True), \
                     mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
                                       autospec=True, side_effect=overtaken), \
-                    mock.patch.object(type(task), 'retry') as retry, \
                     mock.patch.object(tasks.register_large_plugin_instance_output,
                                       'apply_async') as large, \
                     self.assertLogs('plugininstances.tasks', 'ERROR'):
                 task(inst.pk)
 
-            retry.assert_not_called()
             large.assert_not_called()
             inst.refresh_from_db()
             self.assertEqual((inst.status, inst.error_code), ('registeringFiles', ''))
@@ -1007,7 +992,8 @@ class TwoStatusChecksTests(PluginInstanceFixture, TestCase):
             job.check_exec_status()
 
         submissions = [c for job in jobs for c in job.enqueue_run.call_args_list]
-        self.assertEqual(submissions, [mock.call('PluginInstanceAppJob')])
+        self.assertEqual(submissions,
+                         [mock.call('PluginInstanceAppJob', moved_to='scheduled')])
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'scheduled')
 
     def test_two_checks_that_both_found_the_copy_finished_submit_the_app_job_once(self):
@@ -1018,7 +1004,8 @@ class TwoStatusChecksTests(PluginInstanceFixture, TestCase):
             job.handle_finished_successfully_status()
 
         submissions = [c for job in jobs for c in job.enqueue_run.call_args_list]
-        self.assertEqual(submissions, [mock.call('PluginInstanceAppJob')])
+        self.assertEqual(submissions,
+                         [mock.call('PluginInstanceAppJob', moved_to='scheduled')])
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'scheduled')
 
 
@@ -1061,8 +1048,145 @@ class ConcurrentStatusChecksTests(PluginInstanceFixture, TransactionTestCase):
 
         self.assertEqual(errors, [])
         submissions = [c for job in jobs for c in job.enqueue_run.call_args_list]
-        self.assertEqual(submissions, [mock.call('PluginInstanceAppJob')])
+        self.assertEqual(submissions,
+                         [mock.call('PluginInstanceAppJob', moved_to='scheduled')])
         self.assertEqual(PluginInstance.objects.get(pk=inst.pk).status, 'scheduled')
+
+
+class PublishFailureTests(PluginInstanceFixture, TestCase):
+    """
+    A task that alone moves an instance on from the status a transition just wrote and
+    cannot be published (the broker gone): the instance is cancelled with CODE01 and its
+    remote cleanup armed, rather than left in that status with no task.
+    """
+
+    BROKER_GONE = OperationalError('broker gone')
+
+    def assert_given_up(self, inst, call, *args):
+        """
+        ``call(*args)`` raises PublishError, logged with CODE01, and leaves ``inst``
+        cancelled with CODE01 and its remote cleanup armed.
+        """
+        with self.assertLogs('plugininstances.tasks', 'ERROR') as logs, \
+                self.assertRaises(tasks.PublishError):
+            call(*args)
+
+        inst.refresh_from_db()
+        self.assertEqual((inst.status, inst.error_code, inst.remote_cleanup_status),
+                         ('cancelled', 'CODE01', 'deletingData'))
+        self.assertIn('[CODE01,', '\n'.join(logs.output))
+
+    def test_a_copy_job_that_ended_cannot_hand_on_to_the_app_job(self):
+        inst = self.instance('copying')
+        job = PluginInstanceCopyJob(inst)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=self.BROKER_GONE):
+            self.assert_given_up(inst, job.handle_finished_successfully_status)
+
+    def test_an_app_job_that_ended_cannot_hand_on_to_the_upload_job(self):
+        ComputeResource.objects.filter(pk=self.compute_resource.pk).update(
+            compute_requires_upload_job=True)
+        inst = self.instance('started')
+        job = PluginInstanceAppJob(inst)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=self.BROKER_GONE):
+            self.assert_given_up(inst, job.handle_finished_successfully_status)
+
+    def test_a_job_that_ended_cannot_hand_on_to_its_registration(self):
+        for status, job_class in (('started', PluginInstanceAppJob),
+                                  ('uploading', PluginInstanceUploadJob)):
+            with self.subTest(status=status):
+                inst = self.instance(status)
+                job = job_class(inst)
+
+                with mock.patch.object(tasks.register_plugin_instance_output, 'delay',
+                                       side_effect=self.BROKER_GONE):
+                    self.assert_given_up(inst, job.handle_finished_successfully_status)
+
+    def test_a_registration_cannot_be_sent_on_to_the_register_large_queue(self):
+        inst = self.instance('registeringFiles')
+
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                               return_value=False), \
+                mock.patch.object(tasks.register_large_plugin_instance_output, 'delay',
+                                  side_effect=self.BROKER_GONE):
+            self.assert_given_up(inst, tasks.register_plugin_instance_output, inst.pk)
+
+    def test_a_registration_s_next_attempt_cannot_be_published(self):
+        task = app.tasks['plugininstances.tasks.register_large_plugin_instance_output']
+
+        for name in ('register_plugin_instance_output',
+                     'register_large_plugin_instance_output'):
+            with self.subTest(task=name):
+                inst = self.instance('registeringFiles')
+
+                with mock.patch.object(tasks.PluginInstanceAppJob, 'registers_at_most',
+                                       return_value=True), \
+                        mock.patch.object(tasks.PluginInstanceAppJob, 'register_output',
+                                          side_effect=SoftTimeLimitExceeded()), \
+                        mock.patch.object(type(task), 'apply_async',
+                                          side_effect=self.BROKER_GONE):
+                    self.assert_given_up(inst, getattr(tasks, name), inst.pk)
+
+    def test_a_job_submitted_again_cannot_be_published_and_the_next_check_tries_again(self):
+        inst = self.instance('copying')
+        job = PluginInstanceCopyJob(inst)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=self.BROKER_GONE), \
+                self.assertRaises(OperationalError):
+            job.handle_undefined_status()  # not a transition: the next poll does it again
+
+        inst.refresh_from_db()
+        self.assertEqual((inst.status, inst.error_code), ('copying', ''))
+
+    def test_a_task_the_broker_stored_after_all_and_ran_first_is_no_failure(self):
+        inst = self.instance('copying')
+        job = PluginInstanceCopyJob(inst)
+
+        def stored_and_ran(*_):
+            # the broker kept the message, and its task moved the instance on, before the
+            # publish gave up waiting for the broker's answer
+            PluginInstance.objects.filter(pk=inst.pk).update(status='started')
+            raise self.BROKER_GONE
+
+        logging.disable(logging.INFO)  # the WARNING asserted below, and nothing else
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=stored_and_ran), \
+                self.assertLogs('plugininstances.tasks', 'WARNING') as logs:
+            job.handle_finished_successfully_status()
+
+        inst.refresh_from_db()
+        self.assertEqual((inst.status, inst.error_code), ('started', ''))
+        self.assertEqual([record.levelname for record in logs.records], ['WARNING'])
+        self.assertIn('the task went out', logs.output[0])
+
+    def test_a_hand_off_that_is_published_sends_its_job_and_changes_nothing(self):
+        for status, job_class_name in (('scheduled', 'PluginInstanceAppJob'),
+                                       ('uploading', 'PluginInstanceUploadJob')):
+            with self.subTest(status=status):
+                inst = self.instance(status)
+                job = PluginInstanceCopyJob(inst)  # enqueue_run is the base class's
+
+                with mock.patch.object(tasks.run_plugin_instance_job, 'delay') as run:
+                    job.enqueue_run(job_class_name, moved_to=status)
+
+                run.assert_called_once_with(inst.pk, job_class_name)
+                inst.refresh_from_db()
+                self.assertEqual((inst.status, inst.error_code), (status, ''))
+
+    def test_the_failure_handler_leaves_alone_a_task_that_could_not_publish(self):
+        inst = self.instance('cancelled')
+        sender = mock.Mock()
+        sender.name = 'plugininstances.tasks.register_plugin_instance_output'
+
+        with mock.patch.object(tasks.cancel_plugin_instance_job, 'delay') as cancel:
+            tasks.cancel_plugin_inst_on_task_failure(
+                sender=sender, args=(inst.pk,), exception=tasks.PublishError('gone'))
+
+        cancel.assert_not_called()
 
 
 class UploadTransitionTests(PluginInstanceFixture, TestCase):
@@ -1123,15 +1247,14 @@ class StatusCheckBeatTests(PluginInstanceFixture, TestCase):
 
 class StatusWriteGuardTests(SimpleTestCase):
     """
-    Every write of a plugin instance's status goes through ``PluginInstance.transition``
-    or its queryset's: a status assigned and saved, or set by a plain UPDATE, is the lost
-    update #152 removed. What it cannot see is a whole-row ``save()`` of an instance read
-    before: the job classes and the views write named fields only.
+    Every write of a plugin instance's status goes through ``PluginInstance.transition``:
+    a status assigned and saved, or set by a plain UPDATE, is the lost update #152
+    removed. What it cannot see is a whole-row ``save()`` of an instance read before: the
+    job classes and the views write named fields only.
     """
 
-    # the implementation, and the PACS queries and retrieves, which have a status of
-    # their own
-    ALLOWED = {'plugininstances/models.py', 'pacsfiles/models.py'}
+    # the PACS queries and retrieves, which have a status of their own
+    ALLOWED = {'pacsfiles/models.py'}
     UPDATES = {'update', 'bulk_update', 'update_or_create'}
 
     @classmethod

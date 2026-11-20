@@ -201,12 +201,13 @@ Python tools are dev dependencies for `just lint`.
   instance `finishedSuccessfully` schedules the ready waiting instances of its feed at once,
   and the `periodic` beat tasks in `plugininstances/tasks.py` advance the rest, poll running
   ones, and cancel stuck ones. Several tasks can act on one instance at once, so only
-  `PluginInstance.transition` (and the queryset's `transition`, and `cancel`, which arms the
-  remote cleanup in the same
+  `PluginInstance.transition` (and `cancel`, which arms the remote cleanup in the same
   UPDATE when the row is in a status with a remote job, `REMOTE_JOB_STATUSES`) writes
   `status`: a conditional UPDATE from the statuses the writer expects, after
   which only the winner does what follows (a guard test in
-  `plugininstances/tests/test_transitions.py` refuses the other writes it can see). Other
+  `plugininstances/tests/test_transitions.py` refuses the other writes it can see). A task
+  that alone moves the instance on from that status goes out through `tasks.
+  publish_or_cancel`, which cancels it with CODE01 when the task cannot be published. Other
   fields go through `update_if_status`, the remote cleanup through
   `move_remote_cleanup`/`arm_remote_cleanup`; never save an instance whole.
 - Remote execution goes through pfcon via `plugininstances/services/`: `abstractjobs.

@@ -232,7 +232,7 @@ class PluginInstanceCopyJob(PluginInstanceJob):
 
         if self.c_plugin_inst.transition('scheduled', 'copying', summary=summary,
                                          start_date=now, end_date=now):
-            self.enqueue_run('PluginInstanceAppJob')
+            self.enqueue_run('PluginInstanceAppJob', moved_to='scheduled')
 
     def handle_finished_with_error_status(self):
         """

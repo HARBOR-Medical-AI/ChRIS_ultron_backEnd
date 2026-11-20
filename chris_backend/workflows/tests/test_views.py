@@ -8,9 +8,11 @@ from django.contrib.auth.models import Group, User
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework import status
+from kombu.exceptions import OperationalError
 
 from core.tests.query_counts import QueryCountAssertionsMixin
 from pipelines.models import Pipeline, PluginPiping, DEFAULT_PIPING_PARAMETER_MODELS
+from plugininstances import tasks
 from plugininstances.models import PluginInstance
 from plugins.models import ComputeResource
 from plugins.models import PluginMeta, Plugin
@@ -598,3 +600,30 @@ class WorkflowListPerformCreateHelperTests(ViewTests):
         with mock.patch('workflows.views.run_if_ready') as run_mock:
             self.view._dispatch_runs(plugin_instances_dict)
         self.assertEqual(run_mock.call_count, len(plugin_instances_dict))
+
+    def test__dispatch_runs_cancels_what_is_left_when_a_run_cannot_be_published(self):
+        nodes = self._make_canonical_nodes()
+        tree, root_id, inst_data = WorkflowList._build_inst_templates(
+            self.pipeline, nodes)
+        plugin_instances_dict = self.view._create_plugin_instance_tree(
+            tree, root_id, inst_data, self.previous_plugin_inst, self.workflow)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=OperationalError('broker gone')), \
+                self.assertLogs('plugininstances.tasks', 'ERROR') as logs, \
+                self.assertRaises(tasks.PublishError):
+            self.view._dispatch_runs(plugin_instances_dict)
+
+        # the root, whose run task went nowhere, says why; nothing stays in 'created'
+        ended = {inst.pk: (inst.status, inst.error_code)
+                 for inst in PluginInstance.objects.filter(workflow=self.workflow)}
+        root = plugin_instances_dict[root_id]
+        self.assertEqual(ended.pop(root.pk), ('cancelled', 'CODE01'))
+        self.assertTrue(ended)
+        self.assertEqual(set(ended.values()), {('cancelled', '')})
+        self.assertIn('[CODE01,', logs.output[0])
+        # the ts instance's parents were rewritten before any run: it names instances
+        ts_inst = plugin_instances_dict[self.pips[2].id]
+        param = ts_inst.string_param.filter(plugin_param__name='plugininstances').first()
+        self.assertEqual(param.value, f"{plugin_instances_dict[self.pips[0].id].id},"
+                                      f"{plugin_instances_dict[self.pips[1].id].id}")

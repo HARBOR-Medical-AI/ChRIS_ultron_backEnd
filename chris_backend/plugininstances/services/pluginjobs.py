@@ -834,7 +834,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
             # the upload job fetches the files into CUBE storage, and its status check
             # then registers them
             if self.c_plugin_inst.transition('uploading', 'started', end_date=now):
-                self.enqueue_run('PluginInstanceUploadJob')
+                self.enqueue_run('PluginInstanceUploadJob', moved_to='uploading')
             return
 
         # the task that moves it on has a task of its own register the files, on the
