@@ -24,6 +24,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 import redis
+from celery.app.utils import filter_hidden_settings
 from redis.commands.core import Script
 from django.conf import settings
 from django.core.cache import caches
@@ -32,7 +33,8 @@ from django.test import SimpleTestCase, override_settings
 
 from core import cache as core_cache
 from core.cache import (MAX_TTL, acquire_lock, acquire_slot, clear_mark, mark_once,
-                        release_lock, release_slot, verify_cache_connection)
+                        release_lock, release_slot, set_location, split_credentials,
+                        verify_cache_connection)
 
 
 class CacheProxy:
@@ -358,6 +360,19 @@ class MarkOnceTests(CacheTestCase):
         self.assertTrue(mark_once(key, 30))
         clear_mark(key)
 
+    def test_a_mark_with_a_token_is_cleared_by_that_token_alone(self):
+        key, mine, theirs = _name(), _name(), _name()
+        self.assertTrue(mark_once(key, 30, token=mine))
+
+        clear_mark(key, theirs)
+        self.assertFalse(mark_once(key, 30, token=theirs))  # still mine
+
+        clear_mark(key, mine)
+        self.assertTrue(mark_once(key, 30, token=theirs))
+        clear_mark(key)  # without a token: whosever it is
+        self.assertTrue(mark_once(key, 30))
+        clear_mark(key)
+
 
 class SlotTests(CacheTestCase):
 
@@ -622,6 +637,22 @@ class RefusalTests(CacheTestCase):
         self.assertEqual(_raw().exists(lock.key), 0)
         _raw().delete(mark)
 
+    def test_a_refused_replay_of_a_clear_with_a_token_is_named_clear_mark(self):
+        location = self.acl_user(caches['default'].make_key('lock:*'))
+        mark = _key('mark', _name())
+        _raw().set(mark, 'mine', px=30000)
+
+        with self.cache_at(location):
+            core_cache._health.defer(('mark', mark, 'mine'))
+
+            with self.assertLogs('core.cache', 'ERROR') as logs:
+                self.assertFalse(acquire_lock(_name(), 5).degraded)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn('refused clear_mark', logs.output[0])
+        self.assertEqual(_raw().exists(mark), 1)
+        _raw().delete(mark)
+
     def test_a_refused_script_exists_logs_its_whole_batch_and_leaves_it_to_the_ttls(self):
         # SCRIPT EXISTS goes ahead of the pipeline and raises, rather than returning
         location = self.acl_user(caches['default'].make_key('*'), commands=['-script'])
@@ -826,6 +857,23 @@ class DegradedModeTests(ProxiedCacheTestCase):
         release_slot(again)
         clear_mark(key)
 
+    def test_a_mark_cleared_with_its_token_during_an_outage_is_cleared_with_it(self):
+        mine, theirs = _name(), _name()
+        self.assertTrue(mark_once(mine, 30, 'mine'))  # a mark with a token
+        self.assertTrue(mark_once(theirs, 30, 'theirs'))
+        self.proxy.stop()
+        with self.assertLogs('core.cache', 'WARNING'):
+            clear_mark(mine, 'mine')
+            clear_mark(theirs, 'mine')  # a later caller's mark: it stays
+        self.proxy.start()
+        self.wait_for_retry()
+
+        with self.assertLogs('core.cache', 'INFO'):
+            self.assertTrue(mark_once(mine, 30))  # the replay went first
+        self.assertFalse(mark_once(theirs, 30))
+        clear_mark(mine)
+        clear_mark(theirs)
+
     def test_a_release_kept_through_a_second_failure_is_still_replayed(self):
         name = _name()
         lease = acquire_lock(name, 30)
@@ -971,6 +1019,39 @@ class DegradedModeTests(ProxiedCacheTestCase):
 
         self.assertEqual([r.levelname for r in logs.records], ['WARNING', 'INFO'])
         self.assertTrue(logs.records[1].getMessage().endswith(': 20'))
+
+    def test_a_long_outage_repeats_its_warning_with_what_went_ahead(self):
+        self.proxy.stop()
+
+        with mock.patch.object(core_cache._CacheHealth, 'REPEAT_WARNING_AFTER', 0.5), \
+                self.assertLogs('core.cache', 'DEBUG') as logs:
+            deadline = time.monotonic() + 1.4
+            while time.monotonic() < deadline:
+                mark_once(_name(), 5)
+                time.sleep(0.05)
+
+        warnings = [r.getMessage() for r in logs.records if r.levelname == 'WARNING']
+        self.assertGreaterEqual(len(warnings), 2)
+        self.assertNotIn('still', warnings[0])
+        self.assertRegex(warnings[1], r'still does not answer after \d+ s .*: \d+ calls '
+                                      r'went ahead without it so far$')
+
+    def test_a_warning_repeats_once_per_interval_not_on_every_failure(self):
+        health, error = core_cache._health, redis.ConnectionError('gone')
+
+        with self.assertLogs('core.cache', 'DEBUG') as logs:
+            for _ in range(3):
+                health.failed('mark_once', error)
+            health._warned_at -= health.REPEAT_WARNING_AFTER
+            for _ in range(3):
+                health.failed('mark_once', error)
+            health.succeeded(time.monotonic())
+            health.failed('mark_once', error)
+
+        warnings = [r.getMessage() for r in logs.records if r.levelname == 'WARNING']
+        self.assertEqual(len(warnings), 3, warnings)
+        self.assertIn('still does not answer', warnings[1])
+        self.assertNotIn('still', warnings[2])
 
     def test_concurrent_failures_log_one_warning(self):
         self.proxy.stop()
@@ -1189,82 +1270,112 @@ class ReplayTests(ProxiedCacheTestCase):
         pipeline.assert_not_called()
 
 
-@override_settings(CACHES={'default': {
-    'BACKEND': 'django.core.cache.backends.dummy.DummyCache', 'KEY_PREFIX': 'cube'}})
-class NoCacheServerTests(CacheTestCase):
-    """
-    A production deployment without ``CACHE_URL``: its ``CACHES['default']`` is a
-    ``DummyCache``.
-    """
+class SplitCredentialsTests(CacheTestCase):
 
-    def setUp(self):
-        super().setUp()
-        # whatever these tests call, nothing may ask for a client
-        patcher = mock.patch.object(core_cache, '_client',
-                                    side_effect=AssertionError('asked for a client'))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def test_a_location_without_credentials_comes_back_as_it_is(self):
+        location = 'rediss://cache:6380/0?socket_timeout=1&ssl_ca_certs=%2Fca.pem'
 
-    def test_the_helpers_go_ahead_without_their_guarantees(self):
-        name = _name()
+        self.assertEqual(split_credentials(location), (location, {}))
 
-        with self.assertLogs('core.cache', 'WARNING'):
-            locks = [acquire_lock(name, 5), acquire_lock(name, 5)]
-            slots = [acquire_slot(name, 1, 5), acquire_slot(name, 1, 5)]
-            marks = [mark_once(name, 5), mark_once(name, 5)]
+    def test_the_user_part_and_the_query_s_credentials_move_into_the_options(self):
+        user, secret, other = _name(), _name(), _name()
+        cases = {
+            f'redis://{user}:{secret}%40x@cache:6379/0': (
+                'redis://cache:6379/0', {'username': user, 'password': f'{secret}@x'}),
+            f'redis://:{secret}@cache:6379/0?socket_timeout=1': (
+                'redis://cache:6379/0?socket_timeout=1', {'password': secret}),
+            f'rediss://cache:6380/0?password={secret}&ssl_password={other}'
+            f'&ssl_cert_reqs=required': (
+                'rediss://cache:6380/0?ssl_cert_reqs=required',
+                {'password': secret, 'ssl_password': other}),
+            f'unix://{user}:{secret}@/run/cache.sock?db=0': (
+                'unix:///run/cache.sock?db=0', {'username': user, 'password': secret}),
+            # the user part wins, as in redis-py
+            f'redis://:{secret}@cache:6379/0?password={other}': (
+                'redis://cache:6379/0', {'password': secret}),
+        }
 
-        for lease in locks + slots:
-            self.assertTrue(lease.degraded)
-            self.assertIsNone(lease.token)
-        self.assertEqual(marks, [True, True])
+        for location, expected in cases.items():
+            with self.subTest(location=location):
+                self.assertEqual(split_credentials(location), expected)
+                # and redis-py reads the same server from what is left
+                params = redis.connection.parse_url(expected[0])
+                self.assertNotIn('password', params)
 
-    def test_the_releases_do_nothing_and_keep_nothing(self):
-        with self.assertLogs('core.cache', 'WARNING'):
-            lock, slot = acquire_lock(_name(), 5), acquire_slot(_name(), 1, 5)
-            self.assertFalse(release_lock(lock))
-            self.assertFalse(release_slot(slot))
-            clear_mark(_name())
+    def test_servers_share_their_credentials_or_are_refused(self):
+        secret, other = _name(), _name()
 
-        self.assertFalse(core_cache._health._pending)
+        self.assertEqual(
+            split_credentials(f'redis://:{secret}@a:6379/0;redis://:{secret}@b:6379/0'),
+            ('redis://a:6379/0,redis://b:6379/0', {'password': secret}))
 
-    def test_a_process_says_so_once_when_something_first_asks_for_the_cache(self):
-        with self.assertLogs('core.cache', 'DEBUG') as logs:
-            for _ in range(3):
-                acquire_lock(_name(), 5)
-                mark_once(_name(), 5)
-                acquire_slot(_name(), 1, 5)
-                clear_mark(_name())
+        for location in (f'redis://:{secret}@a:6379/0,redis://:{other}@b:6379/0',
+                         f'redis://:{secret}@a:6379/0,redis://b:6379/0'):
+            with self.subTest(location=location), \
+                    self.assertRaisesRegex(ImproperlyConfigured, 'different credentials'):
+                split_credentials(location)
 
-        self.assertEqual([r.levelname for r in logs.records], ['WARNING'])
-        self.assertIn('no CACHE_URL', logs.output[0])
-        self.assertIn('acquire_lock', logs.output[0])
+    def test_celery_s_settings_dump_masks_what_moved(self):
+        secret = _name()
+        url = f'redis://user:{secret}@cache:6379/0'
+        location, options = split_credentials(url)
+        dump = filter_hidden_settings({'CACHES': {'default': {
+            'LOCATION': location, 'OPTIONS': {'socket_timeout': 0.5, **options}}}})
 
-    def test_the_reset_a_fork_runs_lets_a_child_say_so_once_too(self):
-        for _ in range(2):
-            with self.assertLogs('core.cache', 'WARNING') as logs:
-                mark_once(_name(), 5)
-                mark_once(_name(), 5)
+        self.assertNotIn(secret, repr(dump))
+        self.assertIn(secret, repr(filter_hidden_settings(
+            {'CACHES': {'default': {'LOCATION': url}}})))
 
-            self.assertEqual(len(logs.records), 1)
-            core_cache._health.reset()
+    def test_set_location_points_a_cache_at_a_url_with_its_credentials_in_the_options(self):
+        secret = _name()
+        cache_settings = {'BACKEND': 'x', 'OPTIONS': {'socket_timeout': 0.5}}
 
-    def test_no_server_is_no_outage(self):
-        with self.assertLogs('core.cache', 'WARNING'):
-            acquire_lock(_name(), 5)
+        set_location(cache_settings, f'redis://user:{secret}@cache:6379/0')
 
-        self.assertIsNone(core_cache._health._down_since)
-        self.assertEqual(core_cache._health._failed_open, 0)
-        self.assertTrue(core_cache._health.available())
+        self.assertEqual(cache_settings, {
+            'BACKEND': 'x', 'LOCATION': 'redis://cache:6379/0',
+            'OPTIONS': {'socket_timeout': 0.5, 'username': 'user', 'password': secret}})
 
-    def test_a_callers_mistake_still_raises(self):
-        for helper in (lambda: acquire_lock(_name(), 0), lambda: mark_once(_name(), 0),
-                       lambda: acquire_slot(_name(), 1, 0),
-                       lambda: acquire_slot(_name(), 0, 5)):
-            with self.assertRaises(ValueError):
-                helper()
+    def test_the_helpers_reach_the_cache_with_the_credentials_in_the_options(self):
+        location, options = split_credentials(self.acl_user('*'))
+        conf = settings.CACHES['default']
 
-        with self.assertRaises(TypeError):
-            release_lock(None)
+        with override_settings(CACHES={'default': {
+                **conf, 'LOCATION': location, 'OPTIONS': {**conf['OPTIONS'], **options}}}):
+            verify_cache_connection(settings.CACHES['default'])
+            lease = acquire_lock(_name(), 5)
+
+            self.assertFalse(lease.degraded)
+            self.assertTrue(release_lock(lease))
+
+    def test_the_server_sees_the_user_the_options_name(self):
+        # a user kept from the helpers' keys: only a login as that user explains the
+        # refusal, where a connection without the credentials would be the default user
+        location, options = split_credentials(self.acl_user('elsewhere:*'))
+        conf = settings.CACHES['default']
+
+        with self.assertRaisesRegex(ImproperlyConfigured, 'refuses the scripts'):
+            verify_cache_connection({**conf, 'LOCATION': location,
+                                     'OPTIONS': {**conf['OPTIONS'], **options}})
+
+    def test_a_url_python_refuses_never_shows_its_password(self):
+        secret = _name()
+
+        with self.assertRaises(ImproperlyConfigured) as raised:
+            split_credentials(f'redis://:{secret}\uff0f@cache:6379/0')
+
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_the_query_s_credentials_are_read_as_redis_py_reads_them(self):
+        secret, other = _name(), _name()
+
+        for location in (f'redis://cache:6379/0?password={secret}&password={other}',
+                         f'redis://cache:6379/0?password={secret}%2541'):
+            with self.subTest(location=location):
+                _, options = split_credentials(location)
+                params = redis.connection.parse_url(location)
+                self.assertEqual(options['password'], params['password'])
 
 
 class StartupCheckTests(CacheTestCase):
@@ -1580,7 +1691,8 @@ class CacheSettingsTests(SimpleTestCase):
         broker = redis.connection.parse_url(settings.CELERY_BROKER_URL)
 
         self.assertEqual(conf['BACKEND'], 'django.core.cache.backends.redis.RedisCache')
-        self.assertEqual(conf['KEY_PREFIX'], 'cube')
+        # the test runner gives each run a prefix of its own after the settings' 'cube'
+        self.assertRegex(conf['KEY_PREFIX'], r'^cube(-test-[0-9a-f]+)?$')
         self.assertIn('db', cache)
         self.assertNotEqual((cache['host'], cache.get('port')),
                             (broker['host'], broker.get('port')))
@@ -1684,27 +1796,41 @@ print(json.dumps({'backend': type(caches['default']).__name__, 'degraded': lease
         self.assertEqual(json.loads(process.stdout.splitlines()[-1]),
                          {'backend': backend, 'degraded': degraded, 'connected': connected})
 
-    def test_no_cache_url_starts_with_no_cache_and_connects_to_nothing(self):
-        for cache_env in ({}, {'CACHE_URL': ''}):
+    def test_no_cache_url_stops_start_up(self):
+        for cache_env, says in (({}, '"CACHE_URL" not set'),
+                                ({'CACHE_URL': ''}, 'names no server')):
             with self.subTest(cache_env=cache_env):
-                process = self.start(**cache_env)
+                process = self.start('import django; django.setup()', **cache_env)
 
-                self.assertStarted(process, 'DummyCache', True, False)
-                self.assertIn('no CACHE_URL', process.stderr)
-                self.assertNotIn('does not answer', process.stderr)
-
-    def test_no_cache_url_says_nothing_until_a_helper_is_called(self):
-        process = self.start('import django; django.setup(); print("started")')
-
-        self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertNotIn('CACHE_URL', process.stderr)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn('ImproperlyConfigured', process.stderr)
+                self.assertIn(says, process.stderr)
 
     def test_a_cache_url_starts_with_that_cache(self):
         process = self.start(CACHE_URL=settings.CACHES['default']['LOCATION'])
 
         self.assertStarted(process, 'RedisCache', False, True)
         self.assertNotIn('core.cache', process.stderr)
-        self.assertNotIn('no CACHE_URL', process.stderr)
+
+    def test_the_credentials_of_the_cache_url_move_out_of_the_location(self):
+        user, password = _name(), _name()
+        _raw().acl_setuser(user, enabled=True, passwords=[f'+{password}'], keys=['*'],
+                           categories=['+@all'])
+        self.addCleanup(_raw().acl_deluser, user)
+        url = urlsplit(settings.CACHES['default']['LOCATION'])
+        cache_url = url._replace(
+            netloc=f'{user}:{password}@{url.hostname}:{url.port or 6379}').geturl()
+        program = (self.PROGRAM.rstrip() + "\nfrom django.conf import settings\n"
+                   "conf = settings.CACHES['default']\n"
+                   "print(json.dumps({'location': conf['LOCATION'],"
+                   " 'password': conf['OPTIONS'].get('password')}))\n")
+
+        process = self.start(program, CACHE_URL=cache_url)
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        lines = [json.loads(line) for line in process.stdout.splitlines()[-2:]]
+        self.assertFalse(lines[0]['degraded'])
+        self.assertEqual(lines[1], {'location': url.geturl(), 'password': password})
 
     def test_a_cache_url_for_a_server_that_is_down_only_warns(self):
         process = self.start(CACHE_URL='redis://127.0.0.1:6390/0')

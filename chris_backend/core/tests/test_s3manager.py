@@ -8,18 +8,59 @@ by S3Manager against the live MinIO instance started by docker-compose_s3.yml.
 Run via justfile:
     just set-storage s3
     just test-integration
+
+S3ManagerListingTests checks what ``ls`` asks a mocked client, and runs in every mode.
 """
 
 import unittest
+from unittest import mock
 
+from botocore.exceptions import ClientError
 from django.conf import settings
-from django.test import TestCase, tag
+from django.test import SimpleTestCase, TestCase, tag
 
 from core.storage.s3manager import S3Manager
 
 
 def _get_manager():
     return S3Manager(settings.S3_BUCKET_NAME, settings.S3_CONNECTION_PARAMS)
+
+
+class S3ManagerListingTests(SimpleTestCase):
+    """
+    What ``S3Manager.ls`` asks its client, a mock: no S3 service needed.
+    """
+
+    def setUp(self):
+        self.manager = S3Manager('bucket', {})
+        self.manager._client = mock.Mock()
+        self.paginate = self.manager._client.get_paginator.return_value.paginate
+
+    def test_a_limit_asks_for_that_many_keys_at_most(self):
+        self.paginate.return_value = [{'Contents': [{'Key': 'a/1'}, {'Key': 'a/2'}]}]
+
+        self.assertEqual(self.manager.ls('a/', limit=2), ['a/1', 'a/2'])
+        self.manager.ls('a/', limit=1500)
+        self.manager.ls('a/')
+
+        self.assertEqual(self.paginate.call_args_list, [
+            mock.call(Bucket='bucket', Prefix='a/',
+                      PaginationConfig={'MaxItems': 2, 'PageSize': 2}),
+            mock.call(Bucket='bucket', Prefix='a/',
+                      PaginationConfig={'MaxItems': 1500, 'PageSize': 1000}),
+            mock.call(Bucket='bucket', Prefix='a/')])
+
+    def test_a_listing_tried_again_lists_each_key_once(self):
+        def first_page_then_an_error():
+            yield {'Contents': [{'Key': 'a/1'}]}
+            raise ClientError({'Error': {'Code': 'SlowDown'}}, 'ListObjectsV2')
+
+        self.paginate.side_effect = [first_page_then_an_error(),
+                                     [{'Contents': [{'Key': 'a/1'}, {'Key': 'a/2'}]}]]
+
+        with mock.patch('core.storage.s3manager.time.sleep'), \
+                self.assertLogs('core.storage.s3manager', 'ERROR'):
+            self.assertEqual(self.manager.ls('a/'), ['a/1', 'a/2'])
 
 
 @tag('integration')
@@ -202,6 +243,17 @@ class S3ManagerLargeOpsTests(TestCase):
             self.manager.upload_obj(f'test/bulk/{i:04d}.dat', b'x')
         result = self.manager.ls('test/bulk/')
         self.assertEqual(len(result), count)
+
+    def test_ls_lists_its_limit_at_most(self):
+        names = {f'test/bulk/{i:04d}.dat' for i in range(5)}
+        for name in names:
+            self.manager.upload_obj(name, b'x')
+
+        some = self.manager.ls('test/bulk/', limit=3)
+
+        self.assertEqual(len(some), 3)
+        self.assertLessEqual(set(some), names)
+        self.assertEqual(set(self.manager.ls('test/bulk/', limit=10)), names)
 
     def test_batch_delete(self):
         """Verify delete_path uses batch delete efficiently."""

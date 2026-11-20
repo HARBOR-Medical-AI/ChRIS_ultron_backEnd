@@ -13,7 +13,6 @@ from rest_framework import status
 
 from celery.contrib.testing.worker import start_worker
 from core.celery import app as celery_app
-from core.celery import task_routes
 from core.tests.query_counts import QueryCountAssertionsMixin
 
 from plugins.models import PluginMeta, Plugin, ComputeResource
@@ -118,9 +117,8 @@ class TasksViewTests(TransactionTestCase):
         logging.getLogger('plugininstances.tasks').setLevel(logging.CRITICAL)
         warnings.filterwarnings('ignore', 'No directory at', UserWarning)
         super().setUpClass()
-        # route tasks to this worker by using the default 'celery' queue
-        # that is exclusively used for the automated tests
-        celery_app.conf.update(task_routes=None)
+        # the test runner routes every task to the default 'celery' queue that only
+        # the tests use (core/testrunner.py)
         # purge any stale messages from the default queue before starting
         # the worker, so leftover tasks from previous runs don't produce noise
         try:
@@ -137,8 +135,6 @@ class TasksViewTests(TransactionTestCase):
     def tearDownClass(cls):
         super().tearDownClass()
         cls.celery_worker.__exit__(None, None, None)
-        # reset routes to the original queues
-        celery_app.conf.update(task_routes=task_routes)
         logging.getLogger('plugininstances.tasks').setLevel(logging.NOTSET)
         logging.disable(logging.NOTSET)
 
@@ -403,6 +399,20 @@ class FeedDetailViewTests(TasksViewTests):
         feed = Feed.objects.get(name="Updated")
         self.assertTrue(feed.public)
         feed.remove_public_access()
+
+    def test_feed_update_leaves_the_deletion_state_alone(self):
+        put = json.dumps({"template": {"data": [
+            {"name": "name", "value": "Updated"},
+            {"name": "deletion_status", "value": "pending"},
+            {"name": "deletion_error", "value": "forged"}]}})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        feed = Feed.objects.get(name="Updated")
+        self.assertEqual((feed.deletion_status, feed.deletion_error), ('inactive', ''))
 
     def test_feed_update_failure_unauthenticated(self):
         response = self.client.put(self.read_update_delete_url, data=self.put,

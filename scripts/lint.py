@@ -26,16 +26,15 @@ status: 0 clean, 1 new issues, 2 failure. A git worktree cannot be checked this 
 import argparse
 import io
 import json
-import os
 import re
-import subprocess  # nosec B404 - runs git and the linters with fixed argument lists
 import sys
 import tarfile
 import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from repo import ToolError, changed_files, git, go_to_top, merge_base, run
 
 
 # Lockfiles and the uv project each belongs to.
@@ -54,18 +53,8 @@ PYLINT_RULES = """
 # A fix can leave another for the next pass, e.g. two names of one import statement.
 FIX_PASSES = 10
 
-# Right after a commit, Docker Desktop's file sharing can show the container the new ref a
-# moment before the commit object and then git exits 128: try again after these delays.
-GIT_RETRY_DELAYS = (0.5, 1.0)
-
 # The width of the rule column in the report.
 RULE_WIDTH = 14
-
-
-class LintError(Exception):
-    def __init__(self, message, status=None):
-        super().__init__(message)
-        self.status = status
 
 
 @dataclass(frozen=True)
@@ -76,39 +65,6 @@ class Issue:
     message: str
     line: int = field(default=0, compare=False)
     hint: str = field(default="", compare=False)
-
-
-def run(cmd, cwd=".", ok=(0, 1), text=True, label=None):
-    """
-    Run a command and return its stdout; fail on an exit status not in ``ok``.
-    """
-    try:
-        proc = subprocess.run(  # nosec B603 nosemgrep - fixed argument lists, no shell
-            cmd, cwd=cwd, capture_output=True, text=text, check=False
-        )
-    except FileNotFoundError:
-        raise LintError(f"{cmd[0]} is not installed: the dev image predates it, "
-                        f"`just build` makes a new one") from None
-
-    if proc.returncode not in ok:
-        stderr = proc.stderr if text else proc.stderr.decode(errors="replace")
-        name = label or " ".join(cmd[:3])
-        raise LintError(f"{name} exited {proc.returncode}: {stderr.strip()[-2000:]}",
-                        proc.returncode)
-    return proc.stdout
-
-
-def git(*args, ok=(0,), text=True):
-    # The checkout is mounted into the container, maybe owned by another uid.
-    cmd = ["git", "-c", "safe.directory=*", *args]
-
-    for delay in (*GIT_RETRY_DELAYS, None):
-        try:
-            return run(cmd, ok=ok, text=text, label=f"git {args[0]}")
-        except LintError as e:
-            if delay is None or e.status != 128:
-                raise
-            time.sleep(delay)
 
 
 class Tree:
@@ -178,7 +134,7 @@ def dodgy(tree, files):
     try:
         from dodgy.checks import check_file
     except ImportError:
-        raise LintError("dodgy is not installed: the dev image predates it, `just build` "
+        raise ToolError("dodgy is not installed: the dev image predates it, `just build` "
                         "makes a new one") from None
 
     return [
@@ -215,8 +171,8 @@ def advisories(tree, lockfiles):
         # a lockfile not audited is no lockfile without advisories
         try:
             vulns = json.loads(run(cmd, tree.root))["vulnerabilities"]
-        except (LintError, ValueError, KeyError) as e:
-            raise LintError(f"{lockfile} could not be audited in {tree.root}: {e}") from None
+        except (ToolError, ValueError, KeyError) as e:
+            raise ToolError(f"{lockfile} could not be audited in {tree.root}: {e}") from None
 
         upgrade = (
             "just lock-upgrade {}" if project == "."
@@ -281,23 +237,8 @@ class Branch:
 
     @classmethod
     def open(cls, ref, workdir):
-        if ref is None:
-            known = git("rev-parse", "-q", "--verify", "origin/master", ok=(0, 1))
-            ref = "origin/master" if known else "master"
-
-        try:
-            base = git("merge-base", "HEAD", ref).strip()
-        except LintError as e:
-            if e.status != 1:
-                raise
-            raise LintError(f"HEAD and {ref} share no commit: unrelated histories, or a "
-                            f"shallow clone (`git fetch --unshallow`)") from None
-
-        # NUL-separated: no quoting of names with unusual characters
-        changed = git("diff", "-z", "--name-only", "--no-renames", "--diff-filter=d", base)
-        untracked = git("ls-files", "-z", "--others", "--exclude-standard")
-        files = sorted({f for f in (changed + untracked).split("\0")
-                        if f and Path(f).is_file()})
+        ref, base = merge_base(ref)
+        files, _ = changed_files(base)
 
         # the archive of a commit without files holds a pax header alone, which tarfile
         # refuses
@@ -490,8 +431,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        # git and the tools take paths from the top of the repository
-        os.chdir(git("rev-parse", "--show-toplevel").strip())
+        go_to_top()
 
         with tempfile.TemporaryDirectory(prefix="lint-base-") as workdir:
             branch = Branch.open(args.base, workdir)
@@ -506,7 +446,7 @@ def main(argv=None):
             issues, new = branch.compare()
             report(branch, issues, new, args.all)
             return 1 if new else 0
-    except (LintError, OSError, ValueError, KeyError, tarfile.TarError) as e:
+    except (ToolError, OSError, ValueError, KeyError, tarfile.TarError) as e:
         # a tool that crashed or printed something else than its JSON included
         print(f"error: {e}", file=sys.stderr)
         return 2

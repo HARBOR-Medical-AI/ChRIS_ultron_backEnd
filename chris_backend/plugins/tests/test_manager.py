@@ -4,7 +4,9 @@ from unittest import mock
 
 from django.test import TestCase
 from django.conf import settings
+from django.contrib.auth.models import User
 
+from plugininstances.models import PluginInstance
 from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter, DefaultStrParameter
 from plugins.models import ComputeResource
@@ -145,3 +147,31 @@ class PluginManagerTests(TestCase):
         self.assertEqual(Plugin.objects.count(), 0)
         self.assertEqual(PluginMeta.objects.count(), 0)
         self.assertEqual(PluginParameter.objects.count(), 0)
+
+    def test_mananger_cancels_a_removed_plugin_s_instances_before_deleting_them(self):
+        """
+        Test whether removing a plugin cancels its instances (arming the remote cleanup
+        of one with a job) before the cascade deletes them.
+        """
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name, version="0.1")
+        user = User.objects.create_user(username='foo',
+                                        password='bar')  # nosec B106 - a test user
+        for status in ('created', 'started', 'finishedSuccessfully'):
+            inst = PluginInstance.objects.create(plugin=plugin, owner=user,
+                                                 compute_resource=self.compute_resource)
+            PluginInstance.objects.filter(pk=inst.pk).update(status=status)
+        original = PluginInstance.cancel
+        cancels = []
+
+        def cancel(inst, *args, **kwargs):
+            written = original(inst, *args, **kwargs)
+            cancels.append((inst.status, inst.remote_cleanup_status, written.won))
+            return written
+
+        with mock.patch.object(PluginInstance, 'cancel', cancel):
+            self.pl_manager.remove_plugin(plugin.id)
+
+        self.assertCountEqual(cancels, [('cancelled', 'notStarted', True),
+                                        ('cancelled', 'deletingData', True),
+                                        ('finishedSuccessfully', 'notStarted', False)])
+        self.assertEqual(PluginInstance.objects.count(), 0)

@@ -18,6 +18,22 @@
 # Set them identically for `just bench-start` and `just bench-run`; 0 removes a CPU or memory
 # limit (a Dragonfly's CPUs only together with enough memory, see below).
 
+# the environment every CUBE service of the benchmark shares: the API and each Celery service
+x-cube-env: &CUBE_BENCH_ENV
+  DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
+  CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
+  CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
+  CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
+  CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
+  CUBE_DEBUG: "${CUBE_DEBUG:-false}"
+  CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
+  # how long a status check's message and marker live, and when the broker gives a late-
+  # acknowledged task out again (core/tasks.py, core/celery.py)
+  CUBE_CELERY_PENDING_TTL: "${CUBE_CELERY_PENDING_TTL:-60}"
+  CUBE_CELERY_VISIBILITY_TIMEOUT: "${CUBE_CELERY_VISIBILITY_TIMEOUT:-3600}"
+  # the most files a registration on worker-register registers itself (core/celery.py)
+  CUBE_CELERY_REGISTER_FAST_MAX_FILES: "${CUBE_CELERY_REGISTER_FAST_MAX_FILES:-100}"
+
 services:
 
   chris:
@@ -25,52 +41,43 @@ services:
     cpus: ${CUBE_CPUS:-4}
     mem_limit: ${CUBE_MEM_LIMIT:-4g}
     environment:
-      DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
-      CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
-      CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
-      CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
-      CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
-      CUBE_DEBUG: "${CUBE_DEBUG:-false}"
-      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
+      <<: *CUBE_BENCH_ENV
       # one db_pool_stats log line per uvicorn worker every N seconds (0 disables)
       CUBE_DB_POOL_STATS_INTERVAL: "${CUBE_DB_POOL_STATS_INTERVAL:-5}"
 
   worker-mains:
-    command: celery -A core worker -c ${CUBE_WORKER_MAINS_CONCURRENCY:-4} -l info -Q main1,main2
+    command: celery -A core worker -c ${CUBE_WORKER_MAINS_CONCURRENCY:-4} -l info -Q submit,status
     cpus: ${CUBE_WORKER_CPUS:-4}
     mem_limit: ${CUBE_WORKER_MEM_LIMIT:-4g}
-    environment:
-      DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
-      CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
-      CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
-      CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
-      CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
-      CUBE_DEBUG: "${CUBE_DEBUG:-false}"
-      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
+    environment: *CUBE_BENCH_ENV
+
+  worker-register:
+    command: celery -A core worker -c ${CUBE_WORKER_REGISTER_CONCURRENCY:-2} -l info -Q register --disable-prefetch
+    cpus: ${CUBE_WORKER_REGISTER_CPUS:-1}
+    mem_limit: ${CUBE_WORKER_REGISTER_MEM_LIMIT:-1g}
+    environment: *CUBE_BENCH_ENV
+
+  worker-heavy:
+    command: celery -A core worker -c ${CUBE_WORKER_HEAVY_CONCURRENCY:-4} -l info -Q register_large,delete --disable-prefetch
+    cpus: ${CUBE_WORKER_HEAVY_CPUS:-4}
+    mem_limit: ${CUBE_WORKER_HEAVY_MEM_LIMIT:-4g}
+    environment: *CUBE_BENCH_ENV
+
+  worker-background:
+    command: celery -A core worker -c ${CUBE_WORKER_BACKGROUND_CONCURRENCY:-2} -l info -Q cleanup,pacs --disable-prefetch
+    cpus: ${CUBE_WORKER_BACKGROUND_CPUS:-1}
+    mem_limit: ${CUBE_WORKER_BACKGROUND_MEM_LIMIT:-1g}
+    environment: *CUBE_BENCH_ENV
 
   worker-periodic:
     cpus: ${CUBE_WORKER_PERIODIC_CPUS:-1}
     mem_limit: ${CUBE_WORKER_PERIODIC_MEM_LIMIT:-1g}
-    environment:
-      DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
-      CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
-      CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
-      CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
-      CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
-      CUBE_DEBUG: "${CUBE_DEBUG:-false}"
-      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
+    environment: *CUBE_BENCH_ENV
 
   celery-scheduler:
     cpus: ${CUBE_SCHEDULER_CPUS:-0.5}
     mem_limit: ${CUBE_SCHEDULER_MEM_LIMIT:-512m}
-    environment:
-      DJANGO_SETTINGS_MODULE: "config.settings.benchmark"
-      CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
-      CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
-      CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
-      CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
-      CUBE_DEBUG: "${CUBE_DEBUG:-false}"
-      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
+    environment: *CUBE_BENCH_ENV
 
   db:
     # docker-compose.yml's command line (postgres/cube.conf) plus the envelope's
@@ -130,17 +137,15 @@ services:
       # the health check before the step); the probe also reads chris's db_pool_stats lines
       BENCH_LOCUST_RECOVERY_S: "${BENCH_LOCUST_RECOVERY_S:-60}"
       CUBE_DB_POOL_STATS_INTERVAL: "${CUBE_DB_POOL_STATS_INTERVAL:-5}"
-      # recorded envelope knobs (kept in sync with the service overrides above)
-      CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
+      # recorded envelope knobs: the CUBE services' own (x-cube-env), and the others
+      <<: *CUBE_BENCH_ENV
       CUBE_UVICORN_WORKERS: "${CUBE_UVICORN_WORKERS:-4}"
-      CUBE_DB_POOL_MIN_SIZE: "${CUBE_DB_POOL_MIN_SIZE:-2}"
-      CUBE_DB_POOL_MAX_SIZE: "${CUBE_DB_POOL_MAX_SIZE:-10}"
-      CUBE_DB_POOL_TIMEOUT: "${CUBE_DB_POOL_TIMEOUT:-10}"
-      CUBE_DEBUG: "${CUBE_DEBUG:-false}"
-      CUBE_CACHE_URL: "${CUBE_CACHE_URL:-redis://chris-cache:6379/0}"
       CUBE_DB_MAX_CONNECTIONS: "${CUBE_DB_MAX_CONNECTIONS:-300}"
       CUBE_DB_SYNCHRONOUS_COMMIT: "${CUBE_DB_SYNCHRONOUS_COMMIT:-on}"
       CUBE_WORKER_MAINS_CONCURRENCY: "${CUBE_WORKER_MAINS_CONCURRENCY:-4}"
+      CUBE_WORKER_REGISTER_CONCURRENCY: "${CUBE_WORKER_REGISTER_CONCURRENCY:-2}"
+      CUBE_WORKER_HEAVY_CONCURRENCY: "${CUBE_WORKER_HEAVY_CONCURRENCY:-4}"
+      CUBE_WORKER_BACKGROUND_CONCURRENCY: "${CUBE_WORKER_BACKGROUND_CONCURRENCY:-2}"
       PFCON_WORKERS: "${PFCON_WORKERS:-8}"
     volumes:
       - ./benchmarks:/app/benchmarks

@@ -11,10 +11,9 @@ from django.utils import timezone
 
 from celery.contrib.testing.worker import start_worker
 from core.celery import app as celery_app
-from core.celery import task_routes
 
 from plugins.models import PluginMeta, Plugin, ComputeResource
-from plugininstances.models import PluginInstance, PluginInstanceLock
+from plugininstances.models import PluginInstance
 
 from plugininstances import tasks
 
@@ -94,16 +93,21 @@ class PluginInstanceTasksTests(TasksTests):
         with mock.patch.object(tasks.PluginInstanceAppJob,
                                'cancel_exec',
                                return_value=None) as cancel_mock:
-            tasks.cancel_plugin_instance_job(self.plg_inst.id, 'PluginInstanceAppJob')
-            cancel_mock.assert_called_with()
+            tasks.cancel_plugin_instance_job(self.plg_inst.id, 'PluginInstanceAppJob',
+                                             error_code='CODE13')
+            cancel_mock.assert_called_with('CODE13', None)  # from any active status
+
+            tasks.cancel_plugin_instance_job(self.plg_inst.id, 'PluginInstanceAppJob',
+                                             error_code='CODE18', source='scheduled')
+            cancel_mock.assert_called_with('CODE18', 'scheduled')
 
     def test_task_check_running_plugin_instances_exec_status(self):
-        with mock.patch.object(tasks.check_plugin_instance_job_exec_status, 'delay',
-                               return_value=None) as delay_mock:
+        with mock.patch.object(tasks.check_plugin_instance_job_exec_status, 'enqueue_once',
+                               return_value=None) as enqueue_mock:
             tasks.check_running_plugin_instances_exec_status()
 
             # check that the check_plugin_instance_job_exec_status task was called with appropriate args
-            delay_mock.assert_called_with(self.plg_inst.id, 'PluginInstanceAppJob')
+            enqueue_mock.assert_called_with(self.plg_inst.id, 'PluginInstanceAppJob')
             self.assertEqual(self.plg_inst.status, 'started')
 
 
@@ -113,9 +117,8 @@ class TasksAsyncTests(TransactionTestCase):
     def setUpClass(cls):
         logging.disable(logging.WARNING)
         super().setUpClass()
-        # route tasks to this worker by using the default 'celery' queue
-        # that is exclusively used for the automated tests
-        celery_app.conf.update(task_routes=None)
+        # the test runner routes every task to the default 'celery' queue that only
+        # the tests use (core/testrunner.py)
         # purge any stale messages from the default queue before starting
         # the worker, so leftover tasks from previous runs don't produce noise
         try:
@@ -132,8 +135,6 @@ class TasksAsyncTests(TransactionTestCase):
     def tearDownClass(cls):
         super().tearDownClass()
         cls.celery_worker.__exit__(None, None, None)
-        # reset routes to the original queues
-        celery_app.conf.update(task_routes=task_routes)
         logging.disable(logging.NOTSET)
 
     def tearDown(self):
@@ -202,7 +203,7 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
 
     @tag('integration')
     def test_task_run_plugin_instance_triggers_cancelling_when_exception_raised_during_async_run(self):
-        with mock.patch.object(tasks.PluginInstanceAppJob, 'schedule_remote_cleanup',
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run',
                                return_value=None):
             with mock.patch.object(tasks.PluginInstanceAppJob, 'run',
                                    side_effect=Exception):
@@ -220,32 +221,39 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
                     self.assertEqual(self.plg_inst.status, 'cancelled')  # instance must be cancelled
 
     @tag('integration')
-    def test_task_cancel_plugin_instance_triggers_cancelling_when_exception_raised_during_async_run(self):
-        with mock.patch.object(tasks.PluginInstanceAppJob, 'schedule_remote_cleanup',
-                               return_value=None):
-            with mock.patch.object(tasks.PluginInstanceAppJob, 'cancel_exec',
-                                side_effect=Exception):
-                with mock.patch("logging.Logger._log"):  # disable the error logging
-                    tasks.cancel_plugin_instance_job.delay(self.plg_inst.id, 'PluginInstanceAppJob')  # call async task
+    def test_task_cancel_plugin_instance_tries_again_when_exception_raised_during_async_run(self):
+        original = tasks.PluginInstanceAppJob.cancel_exec
+        calls = []
+
+        def fails_once(job, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise Exception('the database went away')
+            return original(job, *args, **kwargs)
+
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run',
+                               return_value=None), \
+                mock.patch.object(tasks.PluginInstanceAppJob, 'cancel_exec', fails_once), \
+                mock.patch("logging.Logger._log"):  # disable the error logging
+            tasks.cancel_plugin_instance_job.delay(self.plg_inst.id, 'PluginInstanceAppJob')  # call async task
 
             for _ in range(10):
                 time.sleep(3)
                 self.plg_inst.refresh_from_db()
                 if self.plg_inst.status == 'cancelled': break
 
-            self.assertEqual(self.plg_inst.status, 'cancelled')  # instance must be cancelled
+        self.assertEqual(self.plg_inst.status, 'cancelled')  # cancelled by the retry
+        self.assertEqual(len(calls), 2)
 
     @tag('integration')
     def test_task_cancel_plugin_instances_stuck_in_lock_during_async_run(self):
+        # registering files since the transition stamped end_date, 241 minutes ago
+        # (hardcoded cutoff delta in tasks.py), whether or not a registration started
         self.plg_inst.status = 'registeringFiles'
-        self.plg_inst.save(update_fields=['status'])
+        self.plg_inst.end_date = timezone.now() - timedelta(minutes=241)
+        self.plg_inst.save(update_fields=['status', 'end_date'])
 
-        plg_inst_lock = PluginInstanceLock(plugin_inst=self.plg_inst)
-        plg_inst_lock.save()
-        plg_inst_lock.start_date = timezone.now() - timedelta(minutes=241)  # hardcoded cutoff delta in tasks.py
-        plg_inst_lock.save(update_fields=['start_date'])
-
-        with mock.patch.object(tasks.PluginInstanceAppJob, 'schedule_remote_cleanup',
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run',
                                return_value=None):
             # plugininstances.tasks logger has propagate=False (see LOGGING in
             # config/settings/local.py), so target it directly
@@ -258,7 +266,7 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
                     if self.plg_inst.status == 'cancelled': break
 
                 self.assertEqual(self.plg_inst.status, 'cancelled')  # instance must be cancelled
-            self.assertTrue(any('stuck in lock' in msg for msg in cm.output))
+            self.assertTrue(any('stuck registering its files' in msg for msg in cm.output))
 
     @tag('integration')
     def test_task_cancel_plugin_instances_stuck_in_scheduled_status_during_async_run(self):
@@ -266,7 +274,7 @@ class PluginInstanceAsyncTasksTests(TasksAsyncTests):
         self.plg_inst.start_date = timezone.now() - timedelta(minutes=241)  # hardcoded cutoff delta in tasks.py
         self.plg_inst.save(update_fields=['status', 'start_date'])
 
-        with mock.patch.object(tasks.PluginInstanceAppJob, 'schedule_remote_cleanup',
+        with mock.patch.object(tasks.PluginInstanceAppJob, 'enqueue_run',
                                return_value=None):
             with self.assertLogs('plugininstances.tasks', level='ERROR') as cm:
                 tasks.cancel_plugin_instances_stuck_in_scheduled_status.delay()  # call async task

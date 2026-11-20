@@ -129,6 +129,26 @@ DATABASES = {
     }
 }
 
+# Celery
+# The environment-specific settings set CELERY_BROKER_URL; core/celery.py sets the queues,
+# the tasks' time limits and the broker's visibility timeout.
+
+#: Only add pickle to this list if your broker is secured
+#: from unwanted access (see Celery's userguide/security.html)
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+
+# messages each worker process holds beyond the one it runs; the workers of long tasks
+# take none (--disable-prefetch, see docker-compose.yml)
+CELERY_WORKER_PREFETCH_MULTIPLIER = 2
+
+# a worker that loses the broker lets its running registrations finish: their claim makes
+# a second run given out meanwhile harmless, where cancelling them would leave each to
+# wait for the visibility timeout (an hour) whenever the broker is still down as the
+# worker closes its channel. Celery's default, which its 6.0 makes True: set here so
+# that it stays.
+CELERY_WORKER_CANCEL_LONG_RUNNING_TASKS_ON_CONNECTION_LOSS = False
+
 # Cache
 # https://docs.djangoproject.com/en/6.0/topics/cache/
 # Django's RedisCache on a Redis-protocol server of its own (chris-cache in the compose

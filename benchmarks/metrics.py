@@ -9,10 +9,12 @@ events into a ``MetricSink``; the pure functions here roll those — plus the po
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections import defaultdict
 from typing import Iterable, Optional
 
+from .broker import STATUS_QUEUE
 from .models import (PHASE_ORDER, QueueSample, RequestRecord, ResourceSample,
                      StatusTimeline)
 
@@ -213,6 +215,51 @@ def timelines_rollup(timelines: list[StatusTimeline]) -> dict:
     }
 
 
+#: the statuses of an instance that has not started any job yet
+_NOT_STARTED = frozenset({"created", "waiting", "cancelled"})
+
+
+def cancel_evidence(timelines: list[StatusTimeline]) -> dict:
+    """
+    The ids of two kinds of cancellation that only a lost update explains (HARBOR-planning
+    #152), each sorted:
+
+    * ``orphan_cancels``: instances cancelled, with no error code of their own and no job
+      ever submitted, before they were seen to run, although every parent finished
+      successfully. CUBE's cancellation of a waiting child does that when it read a parent
+      as cancelled or failed: a parent's status that a stale write moved back to finished
+      afterwards. A child that ran and failed between two scans is not counted: a copy or
+      submission that failed carries the code of its failure, and a registration that
+      failed without one leaves the pfcon responses of its jobs (``submitted``).
+    * ``masked_cancels``: instances seen cancelled that then showed another status, a
+      cancellation a stale write undid, whether or not a later one cancelled them again
+      (``started``, ``cancelled``, ``started``, ``cancelled`` is one). An instance seen
+      cancelled last alone (a descendant of a cancelled one, relabelled whatever its
+      status) is not counted. A timeline without its ``history`` (an older record) is
+      read in the order its statuses were first seen.
+    """
+    by_id = {tl.instance_id: tl for tl in timelines}
+    orphans, masked = [], []
+
+    for tl in timelines:
+        seen = [status for status, _ in (tl.history or sorted(tl.first_seen.items(),
+                                                               key=lambda item: item[1]))]
+
+        if "cancelled" in seen and set(seen[seen.index("cancelled"):]) != {"cancelled"}:
+            masked.append(tl.instance_id)
+
+        if (tl.final_status != "cancelled" or tl.error_code or tl.submitted
+                or not tl.parent_ids or set(tl.first_seen) - _NOT_STARTED):
+            continue
+
+        parents = [by_id.get(p) for p in tl.parent_ids]
+
+        if all(p is not None and p.final_status == "finishedSuccessfully"
+               for p in parents):
+            orphans.append(tl.instance_id)
+    return {"orphan_cancels": sorted(orphans), "masked_cancels": sorted(masked)}
+
+
 def _timelines_span(timelines: list[StatusTimeline]) -> float:
     """
     Wall-clock span from the first observed status to the last terminal status.
@@ -252,20 +299,58 @@ def max_concurrent_active(timelines: list[StatusTimeline]) -> int:
 
 # --- broker queues ----------------------------------------------------------------------
 
-def queue_rollup(samples: list[QueueSample]) -> dict:
+#: how long CUBE keeps a status check's message alive (CUBE_CELERY_PENDING_TTL, its
+#: default in chris_backend/core/tasks.py): an older one stays in the queue until a worker
+#: pops it and drops it, beside the check published again in its place
+PENDING_TTL_S = 60.0
+
+#: how close to its expiry a check counts as expired already: its marker is set a moment
+#: before its message is stamped, and the sampler rounds the wait to 0.1 s, so the check
+#: published in its place may already be beside it
+FRESH_MARGIN_S = 0.5
+
+
+def pending_ttl_s(env=None) -> float:
+    """
+    The status checks' lifetime in the run: CUBE_CELERY_PENDING_TTL as the envelope sets it
+    for both the stack and the harness, else its default.
+    """
+    env = os.environ if env is None else env
+    try:
+        return float(env.get("CUBE_CELERY_PENDING_TTL") or PENDING_TTL_S)
+    except ValueError:
+        return PENDING_TTL_S
+
+
+def queue_rollup(samples: list[QueueSample], pending_ttl: float = PENDING_TTL_S) -> dict:
     """
     Peak/mean depth per Celery queue — sustained growth means the workers are the
-    bottleneck for that queue's task class.
+    bottleneck for that queue's task class. The ``status`` queue, whose oldest message's
+    wait the sampler reads, also gets ``depth_peak_fresh``: its peak over the samples in
+    which no message was within FRESH_MARGIN_S of outliving ``pending_ttl`` (the run's
+    CUBE_CELERY_PENDING_TTL: empty, or the oldest younger), to compare
+    with the bound of one pending check per instance, which expired checks still in the
+    list exceed. It is 0 when the queue was empty at every sample, and left out when the
+    queue held messages but no wait could be read (messages without CUBE's stamp).
     """
-    by_queue: dict[str, list[int]] = defaultdict(list)
+    by_queue: dict[str, list[QueueSample]] = defaultdict(list)
     
     for s in samples:
-        by_queue[s.queue].append(s.depth)
+        by_queue[s.queue].append(s)
 
-    return {queue: {"depth_peak": max(depths),
-                    "depth_mean": round(_mean(depths), 1),
-                    "samples": len(depths)}
-            for queue, depths in by_queue.items()}
+    rollup = {}
+
+    for queue, queue_samples in by_queue.items():
+        depths = [s.depth for s in queue_samples]
+        rollup[queue] = {"depth_peak": max(depths), "depth_mean": round(_mean(depths), 1),
+                         "samples": len(depths)}
+
+        if queue == STATUS_QUEUE and (max(depths) == 0 or any(
+                s.waited_s is not None for s in queue_samples)):
+            fresh = [s.depth for s in queue_samples if s.depth == 0 or (
+                s.waited_s is not None and s.waited_s < pending_ttl - FRESH_MARGIN_S)]
+            rollup[queue]["depth_peak_fresh"] = max(fresh, default=0)
+    return rollup
 
 
 # --- USE (resources) ------------------------------------------------------------------

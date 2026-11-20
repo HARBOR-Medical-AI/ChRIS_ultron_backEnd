@@ -43,7 +43,10 @@ just lint [--all] [--base REF]  # issues Codacy would call new: files changed si
                           #   with origin/master, uncommitted included; exit 1 on any, 2 if a tool
                           #   failed (scripts/lint.py); advisories marked ? may still be new to Codacy
 just lint-fix [--unsafe]  # Ruff's fixes for the new pyflakes issues only, then lint again
-just lint-test            # scripts/test_lint.py, in the dev image (no stack)
+just format [--base REF]  # Ruff's default style on the lines changed since the merge-base (and
+                          #   the statements they are in), files new to git whole
+                          #   (scripts/reformat.py); `just format-check` prints the diff, exit 1
+just lint-test            # scripts/test_*.py, in the dev image (no stack)
 
 just lock                 # re-resolve both uv.lock files after editing a pyproject.toml
 just lock-upgrade <pkg>   # bump one dependency
@@ -69,10 +72,13 @@ Python tools are dev dependencies for `just lint`.
   Tests marked `@tag('compose')` check how the compose stacks run PostgreSQL
   (`postgres/cube.conf`); add `--exclude-tag compose` to run the suite against any other server.
 - Tests that exercise Celery use `TransactionTestCase` and start an in-process worker with
-  `celery.contrib.testing.worker.start_worker(celery_app)` after setting
-  `celery_app.conf.update(task_routes=None)`, so tasks land on the default `celery` queue, which
-  is reserved for tests (see `core/celery.py`). `core/testrunner.py` terminates leftover DB
-  connections so the test database can be dropped (only when the run set up a test database).
+  `celery.contrib.testing.worker.start_worker(celery_app)`. The test runner
+  (`core/testrunner.py`) sets `task_routes=None` for the whole run, so tasks land on the
+  default `celery` queue, which is reserved for tests (see `core/celery.py`), and fails the
+  run when a test publishes to any other queue (a running stack would consume it). It also
+  gives the cache a key prefix of the run's own (`cube-test-<hex>`) and terminates leftover
+  DB connections so the test database can be dropped (only when the run set up a test
+  database).
 - `core/tests/test_cache.py` runs against the stack's cache server (`chris-cache`, database
   0), which a running dev stack also uses: its tests use names of their own and short
   TTLs, and never call `cache.clear()` or `SCRIPT FLUSH`, which can wedge a Dragonfly that is
@@ -96,7 +102,7 @@ Python tools are dev dependencies for `just lint`.
   `pfcon.remote`, `nats`, `chris-broker`, `chris-cache`, `lldap`), `production.py`
   (everything via `get_secret` from env; missing vars raise `ImproperlyConfigured`),
   `benchmark.py` (local + env-driven DB pool). Both `local` and `production` verify the storage
-  connection at import time, and the cache's (`production` only with a `CACHE_URL`) with
+  connection at import time, and the cache's with
   `core.cache.verify_cache_connection`, which raises only for a wrong configuration and only
   warns when the cache server does not answer or is a full Dragonfly, so CUBE starts without it.
 - `manage.py` and `core/celery.py` default to `config.settings.local`; `config/asgi.py`
@@ -145,16 +151,17 @@ Python tools are dev dependencies for `just lint`.
 - `CACHES['default']` is Django's `RedisCache` on a Dragonfly of its own, `chris-cache`,
   apart from the broker `chris-broker` (database 0 Celery, 1 reserved for event streams):
   `KEY_PREFIX` `cube`, 0.5 s socket timeouts, no retries. It runs with `--cache_mode` (evicts
-  when full) and no snapshot (starts empty), so anything in it may vanish. `LOCATION` comes from
-  `CUBE_CACHE_URL` (local and benchmark, default `redis://chris-cache:6379/0`) or
-  `CACHE_URL` (production, optional until HARBOR-planning #152 needs it: without one the
-  backend is a `DummyCache`, nothing connects, and the helpers go ahead degraded, with one
-  WARNING per process at the first call). The start-up check refuses, among the mistakes its
-  docstring lists, the broker's host and port as written (whatever the database; an IP or an
-  alias gets past it), socket timeouts in the URL outside (0, 5] s, and a server that refuses
-  the helpers' two scripts (it loads and runs each once on keys of the helpers' namespace). A
-  server that does not answer only gets a warning, as do most TLS mistakes (a TLS-only
-  Dragonfly answers a plain-text URL's password with an error, which is refused).
+  when full) and no snapshot (starts empty), so anything in it may vanish. `LOCATION` comes
+  from `CUBE_CACHE_URL` (local and benchmark, default `redis://chris-cache:6379/0`) or the
+  required `CACHE_URL` (production); both move the URL's credentials into `OPTIONS` with
+  `split_credentials`, because Celery's settings dump (`celery report`, `inspect conf`) masks
+  a password under its own key but not one inside the URL. The start-up check refuses, among
+  the mistakes its docstring lists, the broker's host and port as written (whatever the
+  database; an IP or an alias gets past it), socket timeouts in the URL outside (0, 5] s,
+  and a server that refuses the helpers' two scripts (it loads and runs each once on keys
+  of the helpers' namespace). A server that does not answer only gets a warning, as do most
+  TLS mistakes (a TLS-only Dragonfly answers a plain-text URL's password with an error,
+  which is refused).
   The code speaks only the Redis protocol: Redis 7+ and Valkey 8 pass
   `core.tests.test_cache` too; for them, the compose service needs `--maxmemory`, an
   `allkeys-*` policy and no persistence (see the comment on `chris-cache`).
@@ -165,9 +172,10 @@ Python tools are dev dependencies for `just lint`.
 - The helpers fail open: when the cache does not answer or refuses a command, an acquire
   returns a degraded `Lease` and `mark_once` returns true, so what they guard must be safe to
   run twice. When it does not answer each process skips it for 5 s, then lets one call try it
-  while the others keep skipping until that call's outcome is known; it logs one WARNING per
-  outage and one INFO when the cache answers again, and replays the releases and clears it
-  could not send, at most 256 per helper call in one pipeline. An error reply (out of memory, a key of the wrong type) is logged at ERROR
+  while the others keep skipping until that call's outcome is known; it logs a WARNING when an
+  outage starts and every 5 minutes while it lasts, and one INFO when the cache answers again,
+  and replays the releases and clears it could not send, at most 256 per helper call in one
+  pipeline. An error reply (out of memory, a key of the wrong type) is logged at ERROR
   and does not count as an outage (it ends one: the cache answered); the ones redis-py raises
   as connection errors (authentication, loading, too many clients) do.
 - Django's `RedisCache` builds a new connection pool, and so a new connection, for each request
@@ -185,9 +193,23 @@ Python tools are dev dependencies for `just lint`.
   checked by the permission classes in `plugininstances/permissions.py`.
 - Status state machine in `plugininstances/enums.py` (`created → waiting → copying → scheduled →
   started → uploading → registeringFiles → finishedSuccessfully | finishedWithError |
-  cancelled`). `plugininstances.utils.run_if_ready` decides whether a new instance runs now or
-  waits on its parents; the `periodic` beat tasks in `plugininstances/tasks.py` advance waiting
-  instances, poll running ones, and cancel stuck ones.
+  cancelled`); a cancel through the API (PUT, or the DELETE of an active instance) cancels
+  its descendants too, finished ones included (`plugininstances.utils.
+  cancel_plugin_instance_tree`), while a job or task that cancels an instance leaves its
+  waiting children to the beat, which cancels them. `plugininstances.utils.run_if_ready`
+  decides whether a new instance runs now or waits on its parents; a registration that ends an
+  instance `finishedSuccessfully` schedules the ready waiting instances of its feed at once,
+  and the `periodic` beat tasks in `plugininstances/tasks.py` advance the rest, poll running
+  ones, and cancel stuck ones. Several tasks can act on one instance at once, so only
+  `PluginInstance.transition` (and `cancel`, which arms the remote cleanup in the same
+  UPDATE when the row is in a status with a remote job, `REMOTE_JOB_STATUSES`) writes
+  `status`: a conditional UPDATE from the statuses the writer expects, after
+  which only the winner does what follows (a guard test in
+  `plugininstances/tests/test_transitions.py` refuses the other writes it can see). A task
+  that alone moves the instance on from that status goes out through `tasks.
+  publish_or_cancel`, which cancels it with CODE01 when the task cannot be published. Other
+  fields go through `update_if_status`, the remote cleanup through
+  `move_remote_cleanup`/`arm_remote_cleanup`; never save an instance whole.
 - Remote execution goes through pfcon via `plugininstances/services/`: `abstractjobs.
   PluginInstanceJob` handles auth-token refresh and job id prefixing; `PluginInstanceAppJob`,
   `PluginInstanceCopyJob`, `PluginInstanceUploadJob`, `PluginInstanceDeleteJob` are the
@@ -195,9 +217,22 @@ Python tools are dev dependencies for `just lint`.
   (`compute_innetwork`, `compute_requires_copy_job`, `compute_requires_upload_job`) select which
   jobs run. Post-terminal cleanup is tracked separately in `remote_cleanup_status`. Errors are
   logged and stored as `CODEnn` codes on the instance.
-- Celery: queues `main1`, `main2`, `periodic` with explicit `task_routes` and the beat schedule in
-  `core/celery.py` (`CUBE_CELERY_POLL_INTERVAL` env var). Compose runs `worker-mains`,
-  `worker-periodic`, and `celery-scheduler` (django-celery-beat DatabaseScheduler).
+- Celery: one queue per class of task (`submit`, `status`, `register`, `register_large`,
+  `delete`, `cleanup`, `pacs`, `periodic`) in one table in `core/celery.py` (`TASK_QUEUES`),
+  which also sets each class's time limits (`CUBE_CELERY_TIME_LIMITS_<QUEUE>`), the late
+  acknowledgement of the registrations under the broker's visibility timeout, and the beat
+  schedule (`CUBE_CELERY_POLL_INTERVAL`). Route a task there, never with `queue=` at a call
+  site: the test run's `task_routes=None` cannot send such a task to `celery`, so it reaches
+  the real queue (a running stack consumes it), and the test runner fails the run only if a
+  test publishes it. Compose runs `worker-mains` (`submit,status`), `worker-register`
+  (`register`), `worker-heavy` (`register_large,delete`), `worker-background`
+  (`cleanup,pacs`), `worker-periodic` and `celery-scheduler` (django-celery-beat
+  DatabaseScheduler); oxidicom publishes to `pacs` (`OXIDICOM_QUEUE_NAME`). The status checks
+  go out through `core.tasks.DedupedTask.enqueue_once` (one pending per instance), a
+  registration is a task of its own (`register_plugin_instance_output`), which sends one of
+  more than `CUBE_CELERY_REGISTER_FAST_MAX_FILES` files (counted by bounded listings,
+  `PluginInstanceAppJob.registers_at_most`), or one that reaches its 5-minute soft time
+  limit, on to `register_large`, and `manage.py queuestats` shows the backlog.
 - Deletion of feeds, folders, plugin instances, and PACS series is asynchronous:
   `AsyncDeletableModel.mark_deletion_pending()` then a `delete_*` task; the tasks are idempotent
   and record failures in `deletion_status`/`deletion_error`.

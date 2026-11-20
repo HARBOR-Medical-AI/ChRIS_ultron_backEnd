@@ -91,12 +91,12 @@ Each run writes `benchmarks/results/<run_id>/`:
 report.md            # ticket-ready: environment, breaking-point table, approach-to-failure curves
 summary.json         # machine-readable run summary (+ Postgres counters over the whole run)
 levels.jsonl/.csv    # one row per (topology, axis, level): the approach-to-failure curve
-environment.json     # host hardware, image ids (CUBE, pfcon, Postgres, the broker and the cache), envelope knobs, container limits, Postgres settings, workload plugin versions and images, the pin they were checked against, the resource sampler's settings, noise floor, attribution availability
+environment.json     # host hardware, image ids (CUBE, pfcon, Postgres, the broker and the cache), envelope knobs, container limits, the Celery services' command lines, Postgres settings, workload plugin versions and images, the pin they were checked against, the resource sampler's settings, noise floor, attribution availability
 api_requests.jsonl   # every measured API call (latency, status, endpoint class)
-status_samples.jsonl # per-instance status timelines (client-observed phase timing)
+status_samples.jsonl # per-instance status timelines (client-observed phase timing): when each status was first seen, the sequence of statuses seen (history), the last read's error code (CUBE's CODEnn), and each instance's feed and parents
 docker_stats.jsonl   # every service + job container read every 1 s: CPU over the time since its previous reading, or since a container born in the scenario started (null without a window: a service's first reading, one under 0.75 s after the previous, as the closing reading can be, whose CPU then goes into the next reading's window, a job's first under 0.25 s after its start, one after a restart), memory with and without the page cache, CPU throttling, cumulative blkio and CPU counters
-queue_depths.jsonl   # Celery queue depths (main1/main2/periodic), sampled every 0.5 s
-scenarios/<id>/      # scenario.json with db_counters and the sampler's summary (observer.sampler) (+ pg_stats.json; failure.json + logs/ on hard failures)
+queue_depths.jsonl   # Celery queue depths (submit/status/register/register_large/delete/cleanup/pacs/periodic; main1/main2/periodic before HARBOR-planning #152), sampled every 0.5 s, with the wait of the status queue's oldest message (waited_s)
+scenarios/<id>/      # scenario.json with db_counters, the sampler's summary (observer.sampler), the logs' evidence and the lost-update cancels (+ pg_stats.json; failure.json + logs/ on hard failures)
 ```
 
 The key artifact is the **approach-to-failure curve** (in `report.md` and `levels.csv`):
@@ -108,9 +108,13 @@ throttling, bytes written, queue depths, and the sampler's summary.
 
 Three attribution streams turn resource saturation into named culprits:
 
-- **Queue depths** — a sustained rise on `main2` means status checks are produced
-  faster than the workers consume them; `main1` is job submission. Per-scenario
-  peaks/means are in `scenario.json` (`queues`) and level rows (`peak_queue_depth`).
+- **Queue depths** — one queue per class of task: a sustained rise on `status` means
+  status checks are produced faster than `worker-mains` consumes them, on `submit` that job
+  submissions back up, on `register` that `worker-register` is, and on `register_large` or
+  `delete` that `worker-heavy` is the bottleneck.
+  Runs before HARBOR-planning #152 had `main2` (status checks, cleanup, deletions and PACS
+  tasks together) and `main1` (submissions). Per-scenario peaks/means are in
+  `scenario.json` (`queues`) and level rows (`peak_queue_depth`).
 - **`pg_stats.json`** — every statement the scenario ran (calls, time, rows, temp blocks
   written, WAL and full-page images), most total execution time first, reset per scenario
   (via `pg_stat_statements`, which `postgres/cube.conf` preloads on `db`). Names the
@@ -124,7 +128,53 @@ Three attribution streams turn resource saturation into named culprits:
   [envelope.md](envelope.md) § "What each run records about Postgres" has the details.
 
 `environment.json`'s `attribution` block records whether each stream was available for the
-run.
+run. Its `commands` block holds the command line of each Celery service running when the
+run started, as the engine created the container (concurrency, queues,
+`--disable-prefetch`): what environment variables set (`REMAP_SIGTERM`, the soft shutdown
+timeout, the time limits) is not in it, and a service that was not running is missing.
+
+Three measures show the lost status updates and duplicate job submissions of the
+concurrent-feeds walls (HARBOR-planning #152), and a fourth the Celery workers' log volume.
+Each scenario records them in `scenario.json` and each level row adds them up over its
+repeats; `report.md` names the levels where they appear:
+
+- **`pfcon_conflicts`** — the lines of pfcon's log, from the scenario's start to the end of
+  its cleanup, that say Docker refused a second container for a job of a plugin instance's
+  run (`already in use`, for its plugin, copy or upload job), or for a container the line
+  does not name, which is not shown to be the cleanup's: a duplicate submission.
+  `pfcon_conflicts_by_job` counts every refused container by job, summed over pfcon's
+  containers, the remote cleanup's delete job among them (its status check and its run
+  task can both submit it, which CUBE takes as done) and `unknown` for a line that names no
+  container. `null` when pfcon's log could not be read.
+- **`orphan_cancels`** — children cancelled with no error code of their own and no job
+  ever submitted before they were seen to run, although every parent finished successfully:
+  a parent's status written back by a stale task. A child that ran and failed between two
+  scans is not counted: it carries the code of its failure, or a registration that failed
+  without one leaves its jobs' pfcon responses (`raw`; `submitted` in
+  `status_samples.jsonl`). Each is also a hard failure (`orphan_cancel:N` among the
+  level's criteria).
+- **`masked_cancels`** — instances seen `cancelled` that then showed another status, a
+  cancellation a stale write undid, whether or not a later one cancelled them again: read
+  from each instance's sequence of statuses (`history` in `status_samples.jsonl`), so
+  `started`, `cancelled`, `started`, `cancelled` counts.
+- **`worker_log_bytes`** — what each Celery worker service wrote to its standard output and
+  error over the same window, its stopped containers included (not a file inside the
+  container, such as the `/tmp/debug.log` of the dev settings), the repeat's that logged
+  the most (`worker_log_bytes_total` adds up its services). `worker_logs_unread` names the
+  workers whose log could not be read, or that had no container; the total is then `null`.
+
+`status_queue_bound` is the most status checks a scenario's level can queue when each
+running instance has at most one pending, as CUBE publishes them since HARBOR-planning
+#152: the feeds times the most instances of the topology that can run at once, a ceiling
+over the whole scenario (a phase where fewer run could exceed its own count under it). A
+check lives 60 s (`CUBE_CELERY_PENDING_TTL`, the run's own) and an expired one stays in the
+list until a worker pops it, beside the check published in its place, so the bound holds
+only while the queue's oldest message is younger than that, by half a second (a sample's
+period): `status_queue_peak_fresh` is the `status` queue's peak over those samples alone (the sampler reads the wait of the oldest message
+from the stamp CUBE puts on each one; 0 when the queue stayed empty, `null` for runs
+without the queue or the stamp). The queue also carries the cancel tasks, so a peak above
+the bound during cancellations is no failure of that rule. `report.md` names the levels
+whose fresh peak is above it.
 
 ## Control plane: API saturation with Locust (RED)
 
@@ -249,9 +299,13 @@ a stack you can `just nuke` afterwards.
 - **`fslink` hides byte-copy cost.** File **count** is the real control-plane stressor;
   file **size** is a sanity check only (escalate count, not size, for meaningful results).
 - **Makespan is poll-gated.** Record `CUBE_CELERY_POLL_INTERVAL`; run the sweep at
-  `2s`, `4s` and `8s` to separate poller cost from CUBE's true capacity. Do **not** go
-  below `2s`: the `skip_if_running` guard's ~1 s `inspect()` broadcast makes the
-  periodic scheduler tasks mutually skip at sub-2 s cadences (see `envelope.md`).
+  `2s`, `4s` and `8s` to separate poller cost from CUBE's true capacity. Runs before
+  HARBOR-planning #152 could not go below `2s` (the `skip_if_running` guard's ~1 s
+  `inspect()` broadcast made the scheduler tasks skip each other); nothing stops a shorter
+  interval now, but compare runs at the same one (see `envelope.md`). Since #152 a
+  registration that ends an instance `finishedSuccessfully` schedules the ready instances
+  of its feed itself; runs from before lost no interval per hop either, the scheduling
+  task running about 1 s after each tick's status checks (REPORT.md § 17).
 - **Run authoritative sweeps on a dedicated Linux box.** On Docker Desktop the VM's own
   limits dominate the per-container envelope, so laptop numbers are directional only.
 - **The workload plugins are pinned.** `just bench-start` registers `dbg-bigfiles` 1.0.0,

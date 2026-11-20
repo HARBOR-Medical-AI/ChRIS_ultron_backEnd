@@ -27,8 +27,11 @@ from .pg_stats import server_settings
 ENVELOPE_KEYS = (
     "CUBE_CELERY_POLL_INTERVAL", "CUBE_UVICORN_WORKERS", "CUBE_DB_POOL_MIN_SIZE",
     "CUBE_DB_POOL_MAX_SIZE", "CUBE_DB_POOL_TIMEOUT", "CUBE_DB_MAX_CONNECTIONS",
-    "CUBE_DB_SYNCHRONOUS_COMMIT", "CUBE_WORKER_MAINS_CONCURRENCY", "PFCON_WORKERS",
-    "STORAGE_ENV", "CUBE_DEBUG", "CUBE_CACHE_URL",
+    "CUBE_DB_SYNCHRONOUS_COMMIT", "CUBE_WORKER_MAINS_CONCURRENCY",
+    "CUBE_WORKER_REGISTER_CONCURRENCY", "CUBE_WORKER_HEAVY_CONCURRENCY",
+    "CUBE_WORKER_BACKGROUND_CONCURRENCY", "PFCON_WORKERS", "STORAGE_ENV", "CUBE_DEBUG",
+    "CUBE_CACHE_URL", "CUBE_CELERY_PENDING_TTL", "CUBE_CELERY_VISIBILITY_TIMEOUT",
+    "CUBE_CELERY_REGISTER_FAST_MAX_FILES",
 )
 
 #: Postgres settings recorded with every run whatever their source: the server version
@@ -125,6 +128,8 @@ def collect_environment(docker: DockerClient, *, env: os._Environ | dict | None 
         "envelope": envelope(env),
         # the CPU/memory knobs as the engine applied them, not as the env vars asked
         "limits": docker.service_limits(),
+        # the Celery services' command lines (concurrency, queues) as the engine ran them
+        "commands": docker.service_commands(),
         "postgres": postgres_settings(docker),
         "noise_floor": None,                       # filled by measure_noise_floor()
         "manual_fields": {

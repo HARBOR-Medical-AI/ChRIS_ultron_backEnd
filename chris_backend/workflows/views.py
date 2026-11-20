@@ -10,8 +10,8 @@ from collectionjson import services
 from pipelines.models import Pipeline
 from plugininstances.models import PluginInstance, PARAMETER_MODELS
 from plugininstances.serializers import PluginInstanceSerializer
-from plugininstances.utils import run_if_ready
-from plugininstances.tasks import cancel_plugin_instance_job
+from plugininstances.tasks import PublishError
+from plugininstances.utils import cancel_plugin_instances, run_if_ready
 from ._types import (GivenNodeInfo, WorkflowPluginInstanceTemplateFactory,
                      WorkflowPluginInstanceTemplate, PipingId)
 from .models import Workflow, WorkflowFilter
@@ -107,14 +107,24 @@ class WorkflowList(generics.ListCreateAPIView):
     def _dispatch_runs(self,
                        plugin_instances_dict: Dict[PipingId, PluginInstance]) -> None:
         """
-        For each created plugin instance: rewrite the ``plugininstances`` param of
-        any ``ts`` plugin instance from piping-id refs to plugin-instance-id refs,
-        then submit the instance via :func:`run_if_ready`.
+        Rewrite the ``plugininstances`` param of every ``ts`` plugin instance from
+        piping-id refs to plugin-instance-id refs, then submit each instance, parents
+        first, via :func:`run_if_ready`. When a run task cannot be published
+        (``PublishError``: its instance is cancelled with CODE01), the instances still in
+        'created' are cancelled too before the error goes on, as no periodic task looks
+        at that status.
         """
-        for plg_inst in plugin_instances_dict.values():
+        instances = list(plugin_instances_dict.values())
+
+        for plg_inst in instances:
             if plg_inst.plugin.meta.type == 'ts':
                 self._rewrite_ts_parent_ids(plg_inst, plugin_instances_dict)
-            run_if_ready(plg_inst, plg_inst.previous)
+        try:
+            for plg_inst in instances:
+                run_if_ready(plg_inst, plg_inst.previous)
+        except PublishError:
+            cancel_plugin_instances(instances, source='created')
+            raise
 
     @staticmethod
     def _rewrite_ts_parent_ids(
@@ -250,13 +260,7 @@ class WorkflowDetail(generics.RetrieveUpdateDestroyAPIView):
         delete the workflow.
         """
         workflow = self.get_object()
-
-        for plg_inst in workflow.plugin_instances.all():
-            if plg_inst.status == 'started':
-                cancel_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceAppJob')  # call async task
-            
-            plg_inst.status = 'cancelled'
-            plg_inst.save()
+        cancel_plugin_instances(workflow.plugin_instances.all())
         return super(WorkflowDetail, self).destroy(request, *args, **kwargs)
 
 

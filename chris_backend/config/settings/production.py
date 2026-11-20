@@ -9,7 +9,7 @@ from django_auth_ldap.config import LDAPSearch, GroupOfNamesType
 from .common import *  # noqa
 from environs import Env, EnvError
 from core.storage import verify_storage_connection
-from core.cache import verify_cache_connection
+from core.cache import set_location, verify_cache_connection
 
 # Normally you should not import ANYTHING from Django directly
 # into your settings, but ImproperlyConfigured is an exception.
@@ -188,36 +188,21 @@ PFDCM_ADDRESS = get_secret('PFDCM_ADDRESS')
 
 # CELERY SETTINGS
 # ------------------------------------------------------------------------------
+# (the rest in common.py)
 CELERY_BROKER_URL = get_secret('CELERY_BROKER_URL')
-
-#: Only add pickle to this list if your broker is secured
-#: from unwanted access (see userguide/security.html)
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-
-# Worker settings
-# messages to prefetch at a time multiplied by the number of concurrent processes
-# default is 4 (four messages for each process)
-CELERYD_PREFETCH_MULTIPLIER = 2
 
 
 # CACHE SETTINGS (see common.py)
 # ------------------------------------------------------------------------------
-# Optional until a feature needs the cache: without a URL nothing is cached, no process
-# connects to a cache server and the helpers in core/cache.py go ahead without their locks,
-# markers and slots. Otherwise a Redis-protocol server of the cache's own, apart from the
-# Celery broker's: the start-up check refuses the broker's host and port as written,
-# whatever the database, so an IP address or an alias gets past it. For example
-# redis://chris-cache:6379/0. TLS options and socket timeouts (above 0, at most 5 s)
-# can go in its query string, retry options cannot.
-_cache_url = get_secret('CACHE_URL', default='')
-
-if _cache_url:
-    CACHES['default']['LOCATION'] = _cache_url  # noqa: F405
-    verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
-else:
-    CACHES['default']['BACKEND'] = (  # noqa: F405
-        'django.core.cache.backends.dummy.DummyCache')
+# Required: the status-check markers and the beat task's lock live there. A
+# Redis-protocol server of the cache's own, apart from the Celery broker's: the start-up
+# check refuses the broker's host and port as written, whatever the database, so an IP
+# address or an alias gets past it. For example redis://chris-cache:6379/0. TLS options
+# and socket timeouts (above 0, at most 5 s) can go in its query string, retry options
+# cannot. Its credentials move into OPTIONS, where Celery's settings dump masks the
+# password (not the user name), which it shows inside a URL.
+set_location(CACHES['default'], get_secret('CACHE_URL'))  # noqa: F405
+verify_cache_connection(CACHES['default'], CELERY_BROKER_URL)  # noqa: F405
 
 
 # REVERSE PROXY

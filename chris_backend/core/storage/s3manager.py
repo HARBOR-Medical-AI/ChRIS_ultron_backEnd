@@ -85,18 +85,22 @@ class S3Manager(StorageManager):
                 logger.error(str(e))
                 raise
 
-    def ls(self, path: str) -> List[str]:
+    def ls(self, path: str, limit: Optional[int] = None) -> List[str]:
         """
-        Return a list of object keys in the bucket with the given path as prefix.
+        Return a list of object keys in the bucket with the given path as prefix, of
+        ``limit`` keys at most when given: a request per 1,000 of them.
         """
         l_ls = []
         if not path:
             return l_ls
         client = self.__get_client()
+        paging = {} if limit is None else {
+            'PaginationConfig': {'MaxItems': limit, 'PageSize': min(limit, 1000)}}
         for i in range(5):
+            l_ls = []  # a try again lists from the start
             try:
                 paginator = client.get_paginator('list_objects_v2')
-                pages = paginator.paginate(Bucket=self.bucket_name, Prefix=path)
+                pages = paginator.paginate(Bucket=self.bucket_name, Prefix=path, **paging)
                 for page in pages:
                     for obj in page.get('Contents', []):
                         l_ls.append(obj['Key'])

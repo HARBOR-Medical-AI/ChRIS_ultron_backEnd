@@ -11,6 +11,7 @@ from plugins.models import PluginMeta, Plugin, ComputeResource
 from plugininstances.models import PluginInstance
 from feeds.models import Feed, Tag, Tagging
 from feeds.serializers import TaggingSerializer, FeedSerializer
+from core.serializers import save_validated_fields
 
 
 COMPUTE_RESOURCE_URL = settings.COMPUTE_RESOURCE_URL
@@ -138,6 +139,30 @@ class FeedSerializerTests(SerializerTests):
         super(FeedSerializerTests, self).setUp()
         feed = Feed.add_jobs_status_count(Feed.objects.all()).get(name=self.feedname)
         self.feed_serializer = FeedSerializer(feed)
+
+    def test_update_saves_only_the_fields_the_request_changes(self):
+        """
+        Test whether overriden update method leaves alone what the request did not
+        change: a deletion requested since it read the feed.
+        """
+        feed = self.feed_serializer.instance
+        Feed.objects.filter(pk=feed.pk).update(deletion_status='pending')
+
+        self.feed_serializer.update(feed, {'name': 'renamed'})
+
+        feed = Feed.objects.get(pk=feed.pk)
+        self.assertEqual((feed.name, feed.deletion_status), ('renamed', 'pending'))
+
+    def test_save_validated_fields_sets_a_to_many_relation_too(self):
+        feed = self.feed_serializer.instance
+        other = User.objects.create_user(username='other',
+                                         password='other-pass')  # nosec B106 - a test user
+
+        save_validated_fields(feed, {'name': 'renamed', 'shared_users': [other]})
+
+        feed = Feed.objects.get(pk=feed.pk)
+        self.assertEqual(feed.name, 'renamed')
+        self.assertEqual(list(feed.shared_users.all()), [other])
 
     def test_get_started_jobs(self):
         """

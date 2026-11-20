@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import statistics
 import time
 from collections import Counter
@@ -23,7 +24,7 @@ from . import classifier, environment, escalation, metrics, report, topologies
 from .broker import BrokerClient
 from .chris_api import ChrisApi, ChrisApiError
 from .config import PluginPins, Tier, load_pins, load_tier, step_for, tier_fingerprint
-from .docker_client import DockerClient
+from .docker_client import DockerClient, service_name
 from .pg_stats import (SERVER_START_KEY, PgStatStatements, counter_delta, counter_windows,
                        max_deltas, server_counters, server_counters_error)
 from .executor import build_feeds
@@ -56,7 +57,27 @@ SAMPLER_DOCKER_TIMEOUT_S = 10.0
 #: snapshot waits this long to include them
 RUN_STATS_SETTLE_S = 11.0
 
-RESTART_SERVICES = ("chris", "worker-mains", "worker-periodic", "celery-scheduler")
+#: CUBE's own services: the run refuses to start when any of them is missing (a queue
+#: nobody consumes leaves its scenarios hanging to their timeout) and restarts them when
+#: health does not come back after a failure
+RESTART_SERVICES = ("chris", "worker-mains", "worker-register", "worker-heavy",
+                    "worker-background", "worker-periodic", "celery-scheduler")
+
+#: the Celery workers among them, whose log volume each scenario records
+WORKER_SERVICES = tuple(s for s in RESTART_SERVICES if s.startswith("worker-"))
+
+#: what pfcon logs when Docker refuses a second container for one job
+PFCON_CONFLICT = b"already in use"
+
+#: the container Docker refused, in that line: the job's own (the plugin job) or one of
+#: its other jobs', named with a suffix
+_CONFLICT_CONTAINER = re.compile(rb'name \\?"/?([^"\\]+?)\\?" is already in use')
+_JOB_SUFFIXES = {b"-copy": "copy", b"-upload": "upload", b"-delete": "delete"}
+
+#: the jobs of a plugin instance's run, a second submission of which is a duplicate the
+#: lost updates of HARBOR-planning #152 made; the remote cleanup's delete job is not one
+#: of them (its check and its run task can both submit it, which CUBE takes as done)
+RUN_JOBS = ("plugin", "copy", "upload")
 
 
 class BenchmarkRunner:
@@ -89,6 +110,11 @@ class BenchmarkRunner:
         
         self.broker = BrokerClient(broker_host, int(broker_port or 6379))
         self.pg_stats = PgStatStatements(self.docker)
+
+        missing = missing_services(self.docker, RESTART_SERVICES)
+        if missing:
+            raise RuntimeError(f"[bench] CUBE services not running: {', '.join(missing)}. "
+                               f"Start the stack with 'just bench-start'.")
         
         self.pins = pins
         self.plugins = {role: resolve_plugin(self.api, name)
@@ -145,16 +171,19 @@ class BenchmarkRunner:
         db_deltas = self._db_deltas(before_counts, feeds)   # before cleanup deletes them
         red = metrics.red_rollup(self._sink.requests())
         resources = metrics.resource_rollup(samples[0])
-        queues = metrics.queue_rollup(samples[1])
-        
-        classification = apply_build_errors(
-            classifier.classify(poll, red, self.tier.thresholds), build_errors)
+        queues = metrics.queue_rollup(samples[1], metrics.pending_ttl_s())
+        cancels = metrics.cancel_evidence(poll.timelines)
+
+        classification = apply_orphan_cancels(
+            apply_build_errors(classifier.classify(poll, red, self.tier.thresholds),
+                               build_errors),
+            cancels["orphan_cancels"])
 
         result = ScenarioResult(
             params=params, classification=classification, makespan_s=poll.makespan_s,
             feeds=feeds, timelines=poll.timelines, red=red, resources=resources,
             db_deltas=db_deltas, started_at=started, ended_at=ended, queues=queues,
-            notes=build_errors, sampler=sampler.summary())
+            notes=build_errors, sampler=sampler.summary(), cancels=cancels)
 
         db_cleanup_end = None
         if self.cleanup:
@@ -162,6 +191,8 @@ class BenchmarkRunner:
             db_cleanup_end = self._db_snapshot()
 
         result.db_counters = counter_windows(db_start, db_workload_end, db_cleanup_end)
+        # after cleanup, so that the deletion's log lines count too
+        result.logs = log_evidence(self.docker, started)
 
         # persist after cleanup so delete/quiesce traffic reaches api_requests.jsonl
         # and cleanup anomalies land in the scenario's notes
@@ -184,7 +215,9 @@ class BenchmarkRunner:
             "resources": result.resources, "phases": phases,
             "db_deltas": result.db_deltas,
             "feeds": [f.feed_id for f in result.feeds], "notes": result.notes,
-            "queues": result.queues, "db_counters": result.db_counters,
+            "queues": result.queues, "status_queue_bound": status_queue_bound(result.params),
+            "db_counters": result.db_counters, "logs": result.logs,
+            "cancels": result.cancels,
             "observer": {            # the harness's own measurement traffic, made visible
                 "poll_requests": sum(1 for r in requests if r.endpoint_class == "poll"),
                 "poll_every_s": poll_every,
@@ -207,8 +240,11 @@ class BenchmarkRunner:
         
         self.store.append_jsonl("status_samples.jsonl", (
             {"scenario": sid, "instance_id": tl.instance_id, "node": tl.node_key,
-             "role": tl.role.value if tl.role else None,
-             "first_seen": tl.first_seen, "final_status": tl.final_status}
+             "role": tl.role.value if tl.role else None, "feed_id": tl.feed_id,
+             "parent_ids": list(tl.parent_ids),
+             "first_seen": tl.first_seen, "history": tl.history,
+             "final_status": tl.final_status, "error_code": tl.error_code,
+             "submitted": tl.submitted}
             for tl in result.timelines))
 
     def _on_level(self, level: LevelResult) -> None:
@@ -332,7 +368,7 @@ class BenchmarkRunner:
         # were sampled differently
         env["sampler"] = sampler_record(
             STATS_INTERVAL_S, QUEUE_INTERVAL_S if self.broker.available else None,
-            SAMPLER_WORKERS)
+            SAMPLER_WORKERS, queues=self.broker.queues if self.broker.available else ())
 
         env["attribution"] = {
             "resource_sampling": True if self.sampler_docker.available
@@ -396,6 +432,107 @@ def apply_build_errors(classification: Classification, build_errors: list) -> Cl
     return classification
 
 
+def missing_services(docker: DockerClient, services: tuple[str, ...]) -> list[str]:
+    """
+    The ``services`` that have no running container; none when Docker cannot tell.
+    """
+    if not docker.available:
+        return []
+    return [s for s in services if docker.find_service(s) is None]
+
+
+def apply_orphan_cancels(classification: Classification, orphans: list) -> Classification:
+    """
+    A child cancelled before it ran under parents that all finished is a lost update
+    (``metrics.cancel_evidence``): a hard failure, named for its cause beside the
+    cancellation it already is.
+    """
+    if not orphans:
+        return classification
+    return Classification(Verdict.FAIL,
+                          classification.criteria + (f"orphan_cancel:{len(orphans)}",))
+
+
+def status_queue_bound(params: ScenarioParams) -> int | None:
+    """
+    The most status checks a scenario can queue once each running instance has at most
+    one pending: its instances that can run at once (``None`` for a shape that cannot be
+    built).
+    """
+    try:
+        topology = topologies.build(params.topology, params)
+    except ValueError:
+        return None
+    return params.feeds * topologies.max_width(topology)
+
+
+def conflicting_jobs(lines: list[bytes]) -> Counter:
+    """
+    The containers Docker refused in pfcon's ``already in use`` lines, by the kind of job
+    they are for: ``plugin``, ``copy``, ``upload`` or ``delete``, and ``unknown`` for a
+    line that names none.
+    """
+    kinds = Counter()
+
+    for line in lines:
+        match = _CONFLICT_CONTAINER.search(line)
+        if match is None:
+            kinds["unknown"] += 1
+            continue
+        name = match.group(1)
+        kinds[next((kind for suffix, kind in _JOB_SUFFIXES.items()
+                    if name.endswith(suffix)), "plugin")] += 1
+    return kinds
+
+
+def log_evidence(docker: DockerClient | None, since: float,
+                 workers: tuple[str, ...] = WORKER_SERVICES) -> dict:
+    """
+    What the services' logs show since the epoch time ``since``:
+
+    * ``worker_log_bytes``: the bytes each Celery worker logged, running or stopped since,
+      and ``worker_logs_unread``: the ``workers`` whose log could not be read, or that had
+      no container, which that total leaves out;
+    * ``pfcon_conflicts``: the duplicate submissions pfcon refused of a run's jobs
+      (``RUN_JOBS``), and of jobs its line does not name (``unknown``: not shown to be the
+      cleanup's), and ``pfcon_conflicts_by_job`` all the containers it refused by job
+      (``conflicting_jobs``), summed over pfcon's containers; ``None`` when pfcon's log
+      could not be read.
+
+    ``{}`` when Docker is not available; a log that cannot be read is left out, since
+    instrumentation must never end a scenario.
+    """
+    if docker is None or not docker.available:
+        return {}
+
+    try:
+        containers = docker.service_containers(all_states=True)
+    except Exception:                                 # noqa: BLE001 - best-effort evidence
+        return {}
+
+    worker_bytes: dict[str, int] = {}
+    unread = set(workers)
+    by_job = None
+
+    for container in containers:
+        service = service_name(container)
+
+        with contextlib.suppress(Exception):
+            if service in workers:
+                size, _ = docker.log_volume(container, since)
+                worker_bytes[service] = worker_bytes.get(service, 0) + size
+                unread.discard(service)
+            elif service == "pfcon":
+                _, lines = docker.log_volume(container, since, PFCON_CONFLICT)
+                by_job = (by_job or Counter()) + conflicting_jobs(lines)
+
+    conflicts = (None if by_job is None
+                 else sum(by_job[job] for job in (*RUN_JOBS, "unknown")))
+    return {"worker_log_bytes": worker_bytes, "worker_logs_unread": sorted(unread),
+            "pfcon_conflicts": conflicts,
+            "pfcon_conflicts_by_job": None if by_job is None else dict(by_job)}
+
+
 def effective_poll_cadence(base: float, feeds: int) -> float:
     """
     Observation cadence for a scenario. The poller issues one search per feed per
@@ -451,7 +588,21 @@ def _level_row(level: LevelResult) -> dict:
         for tl in r.timelines:
             if tl.final_status:
                 final[tl.final_status] += 1
-    
+
+    cancels = [r.cancels or metrics.cancel_evidence(r.timelines) for r in reps]
+    # a count over fewer repeats than the row shows would read as fewer conflicts
+    conflicts = [(r.logs or {}).get("pfcon_conflicts") for r in reps]
+    by_job = Counter()
+    for r in reps:
+        by_job.update((r.logs or {}).get("pfcon_conflicts_by_job") or {})
+    # the worker log volumes of the repeat that logged the most, whose total they add up
+    # to; no total when a repeat left a worker's log unread, which could be the largest
+    worker_bytes = max((lg for lg in ((r.logs or {}).get("worker_log_bytes") for r in reps)
+                        if lg), key=lambda lg: sum(lg.values()), default=None)
+    unread = sorted({s for r in reps for s in (r.logs or {}).get("worker_logs_unread", ())})
+    status_fresh = [((r.queues or {}).get("status") or {}).get("depth_peak_fresh")
+                    for r in reps]
+
     return {
         "topology": level.topology, "axis": level.axis, "level": level.level,
         "verdict": level.verdict.value, "criteria": list(level.criteria),
@@ -471,6 +622,24 @@ def _level_row(level: LevelResult) -> dict:
         "peak_mem_anon_bytes": peaks["anon"],
         "cpu_throttled_s": peaks["throttled"],
         "peak_queue_depth": peak_queue,
+        "status_queue_bound": status_queue_bound(reps[0].params) if reps else None,
+        # the status queue's peak over the samples whose every check was still alive
+        # (None unless every repeat sampled the status queue, and read the wait of its
+        # oldest message whenever it held any)
+        "status_queue_peak_fresh": (max(status_fresh) if status_fresh
+                                    and None not in status_fresh else None),
+        # the evidence of lost updates and duplicate submissions, added up over the
+        # repeats (None unless pfcon's log was read in every one); the log volumes are
+        # the largest repeat's (None when no worker log could be read)
+        "pfcon_conflicts": (sum(conflicts) if conflicts and None not in conflicts
+                            else None),
+        "pfcon_conflicts_by_job": dict(by_job),
+        "orphan_cancels": sum(len(c["orphan_cancels"]) for c in cancels),
+        "masked_cancels": sum(len(c["masked_cancels"]) for c in cancels),
+        "worker_log_bytes": worker_bytes or {},
+        "worker_logs_unread": unread,
+        "worker_log_bytes_total": (sum(worker_bytes.values()) if worker_bytes
+                                   and not unread else None),
         "registered_output_bytes": max(
             (r.db_deltas.get("registered_output_bytes", 0) for r in reps), default=0),
         "db_counters": _db_counters_rollup(reps),

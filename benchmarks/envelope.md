@@ -17,8 +17,15 @@ artificial dev cap.
 |---|---|---|
 | `CUBE_UVICORN_WORKERS` | `4` | `uvicorn --workers` on the `chris` service |
 | `CUBE_CPUS` / `CUBE_MEM_LIMIT` | `4` / `4g` | `chris` CPU and memory limits |
-| `CUBE_WORKER_MAINS_CONCURRENCY` | `4` | `celery -c` on `worker-mains` (job submission parallelism) |
+| `CUBE_WORKER_MAINS_CONCURRENCY` | `4` | `celery -c` on `worker-mains` (the `submit` and `status` queues: job submissions, status checks and cancels) |
 | `CUBE_WORKER_CPUS` / `CUBE_WORKER_MEM_LIMIT` | `4` / `4g` | `worker-mains` CPU and memory |
+| `CUBE_WORKER_REGISTER_CONCURRENCY` | `2` | `celery -c` on `worker-register` (the `register` queue: every output registration starts there, and one of `CUBE_CELERY_REGISTER_FAST_MAX_FILES` files at most ends there) |
+| `CUBE_WORKER_REGISTER_CPUS` / `CUBE_WORKER_REGISTER_MEM_LIMIT` | `1` / `1g` | `worker-register` CPU and memory |
+| `CUBE_CELERY_REGISTER_FAST_MAX_FILES` | `100` | the most files a registration on `worker-register` registers itself; one of more files goes on to `register_large` (0 to 9,999) |
+| `CUBE_WORKER_HEAVY_CONCURRENCY` | `4` | `celery -c` on `worker-heavy` (the `register_large` and `delete` queues: the registrations of more files, and deletions) |
+| `CUBE_WORKER_HEAVY_CPUS` / `CUBE_WORKER_HEAVY_MEM_LIMIT` | `4` / `4g` | `worker-heavy` CPU and memory |
+| `CUBE_WORKER_BACKGROUND_CONCURRENCY` | `2` | `celery -c` on `worker-background` (the `cleanup` and `pacs` queues: remote cleanup, PACS queries and registration, DICOMweb indexing) |
+| `CUBE_WORKER_BACKGROUND_CPUS` / `CUBE_WORKER_BACKGROUND_MEM_LIMIT` | `1` / `1g` | `worker-background` CPU and memory |
 | `CUBE_DB_POOL_MIN_SIZE` | `2` | psycopg pool `min_size` (per process) |
 | `CUBE_DB_POOL_MAX_SIZE` | `10` | psycopg pool `max_size` (per process) |
 | `CUBE_DB_POOL_TIMEOUT` | `10` | psycopg pool acquire timeout (s) |
@@ -34,6 +41,8 @@ artificial dev cap.
 | `CUBE_CELERY_POLL_INTERVAL` | `2.0` | Celery-beat scheduling/status poll cadence (s) — sweep `{2, 4, 8}` |
 | `CUBE_DEBUG` | `false` | Django `DEBUG` on `chris` and the Celery services (see below) |
 | `CUBE_CACHE_URL` | `redis://chris-cache:6379/0` | the shared cache (`CACHES['default']`) of `chris` and the Celery services; earlier runs did not record it, so `bench-compare` reports it as a caution against them |
+| `CUBE_CELERY_PENDING_TTL` | `60` | how long a status check's message and its marker live (s) |
+| `CUBE_CELERY_VISIBILITY_TIMEOUT` | `3600` | when the broker gives a late-acknowledged task (a registration) out again (s); above the hard limits of `register` and `register_large` |
 
 **Why `DEBUG` is off:** production runs with `DEBUG = False`, and `DEBUG` changes what is
 measured: every SQL statement goes through Django's query recorder, the debug toolbar's
@@ -112,12 +121,41 @@ which `bench-compare` reads as `chris-broker` in their limits and in a trend's `
 over from before, and `bench-compare` shows it as it is. The broker's volume, `dragonflydata`,
 is now `chris_broker_data`.
 
-**Why the 2.0 s floor for the Celery poll interval:** the periodic tasks are guarded by `skip_if_running`
-(`plugininstances/tasks.py`), which spends ~1 s in a broker-wide `inspect().active()`
-broadcast on every invocation. At a cadence ≤ ~1 s consecutive invocations overlap and
-can each see the other as "running" → they *mutually skip* and scheduling stalls
-(observed: instances stuck in `waiting` for 44–116 s at `1.0`). Until that guard is
-reworked, do not benchmark below `2.0`.
+**The Celery poll interval:** every baseline ran at `2.0` or above. Until HARBOR-planning #152
+the scheduling task was guarded by `skip_if_running`, which spent ~1 s in a broker-wide
+`inspect().active()` broadcast on every invocation, so at a cadence of ~1 s or less consecutive
+invocations saw each other as running and skipped (instances stuck in `waiting` for 44–116 s
+at `1.0`). It now takes a lock in the shared cache (`core.tasks.single_instance`), a
+millisecond, so nothing stops a shorter interval; compare runs at the same one. Since #152 a
+registration that ends an instance `finishedSuccessfully` also schedules the ready waiting
+instances of its feed itself. Runs from before lost no interval per hop either: the beat's
+scheduling task ran about 1 s after each tick's status checks (that `inspect()`), once their
+inline registrations had ended (REPORT.md § 17).
+
+**The Celery queues:** one per class of task (`chris_backend/core/celery.py`), consumed by five
+workers: `worker-mains` (`submit`, `status`), `worker-register` (`register`), `worker-heavy`
+(`register_large`, `delete`), `worker-background` (`cleanup`, `pacs`) and `worker-periodic`
+(`periodic`). Every registration starts on `register`, which counts what it would register with
+bounded listings and sends one of more than `CUBE_CELERY_REGISTER_FAST_MAX_FILES` files on to
+`register_large`, so that registrations of many files never hold the slots of those of few; so
+does one that reaches the 5-minute soft time limit of `register`. The harness samples each
+queue's depth every 0.5 s (`queue_depths.jsonl`, `peak_queue_depth`). By hand, on a running
+stack:
+
+```bash
+just bench-compose 'exec chris-broker redis-cli LLEN status'
+just bench-compose 'exec worker-mains python manage.py queuestats'  # every queue, the wait of its next message, and the messages workers hold
+```
+
+`worker-heavy` shares its four slots between large registrations and deletions, so four long
+deletions hold up the large registrations (not the short ones). A status check is published
+once per running instance at most and lives `CUBE_CELERY_PENDING_TTL` seconds (60), so while
+the `status` queue's oldest message is younger than that its status checks stay under the
+instances that can run at once (`status_queue_bound` in the level rows, against
+`status_queue_peak_fresh`); an expired check stays in the list until a worker pops it, beside
+the one published in its place, and the cancel tasks travel on that queue too. The time limits
+of each queue (`CUBE_CELERY_TIME_LIMITS_<QUEUE>`) are not benchmark knobs: they travel in each
+task's message, so a change would have to reach every CUBE service.
 
 Set any of them inline, e.g.:
 
@@ -128,7 +166,16 @@ CUBE_UVICORN_WORKERS=8 CUBE_DB_POOL_MAX_SIZE=20 CUBE_DB_MAX_CONNECTIONS=500 \
 
 **Connection budget:** each `uvicorn` worker and each Celery worker process holds its own
 pool of up to `CUBE_DB_POOL_MAX_SIZE` connections, so keep
-`CUBE_DB_MAX_CONNECTIONS ≥ (uvicorn_workers + celery_processes) × pool_max + headroom`.
+`CUBE_DB_MAX_CONNECTIONS ≥ (uvicorn_workers + celery_processes) × pool_max + headroom`. The
+defaults run fourteen Celery worker processes (4 + 2 + 4 + 2 + 2) and the beat
+(`celery-scheduler`, whose scheduler reads the database) beside four `uvicorn` workers: 190
+connections at most, against 300.
+
+**CPU limits add up to more than the box:** with the defaults the services' limits total 22.5
+CPUs on the benchmark box's 16. They are ceilings, not reservations: a level where they bind
+together shows as the services' CPU adding up to the box's 16 CPUs while none reaches its own
+limit, and in latency; throttling (`cpu_throttled_s` in the level rows) shows only a service
+held at its own limit.
 
 `postgres/cube.conf` (below) also preloads `pg_stat_statements` on both stacks (the harness
 snapshots every statement per scenario); this is measurement instrumentation, not part of the

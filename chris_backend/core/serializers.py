@@ -1,11 +1,37 @@
 
 from rest_framework import serializers
+from rest_framework.utils import model_meta
 
 from drf_spectacular.utils import OpenApiTypes, extend_schema_field
 
 from collectionjson.fields import ItemLinkField
 from .models import ChrisInstance, FileDownloadToken, ChrisFile, ChrisLinkFile
 from .utils import get_file_resource_link
+
+
+def save_validated_fields(instance, validated_data):
+    """
+    Update ``instance`` as ``ModelSerializer.update`` does, but save only the fields in
+    ``validated_data``: a whole save would write back what another request or a task
+    changed since this request read the instance (the state of its deletion, say).
+    Returns the instance.
+    """
+    relations = model_meta.get_field_info(instance).relations
+    to_many = {}
+
+    for attr, value in validated_data.items():
+        if attr in relations and relations[attr].to_many:
+            to_many[attr] = value
+        else:
+            setattr(instance, attr, value)
+
+    fields = [attr for attr in validated_data if attr not in to_many]
+    if fields:
+        instance.save(update_fields=fields)
+
+    for attr, value in to_many.items():
+        getattr(instance, attr).set(value)
+    return instance
 
 
 class ChrisInstanceSerializer(serializers.HyperlinkedModelSerializer):

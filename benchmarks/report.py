@@ -30,7 +30,9 @@ def render(summary: dict, levels: list[dict]) -> str:
 
 def render_levels_csv(levels: list[dict]) -> str:
     cols = ["topology", "axis", "level", "verdict", "makespan_median_s", "makespan_max_s",
-            "worst_p95_ms", "errors", "status_5xx", "completed", "criteria"]
+            "worst_p95_ms", "errors", "status_5xx", "completed", "criteria",
+            "pfcon_conflicts", "orphan_cancels", "masked_cancels", "worker_log_bytes_total",
+            "status_queue_bound", "status_queue_peak_fresh"]
     
     rows = [",".join(cols)]
     
@@ -92,11 +94,59 @@ def _approach_curves(levels: list[dict]) -> list[str]:
               "; ".join(r.get("criteria", []))] for r in rows])
         
         out.append("")
+        out += _evidence_note(rows)
         out += _peak_cpu_note(rows)
         out += _peak_io_note(rows)
         out += _db_counters_note(rows)
         out += _sampler_note(rows)
     return out
+
+
+def _evidence_note(rows: list[dict]) -> list[str]:
+    """
+    The levels that show a lost update or a duplicate job submission, the status checks
+    queued beyond the bound one pending check per running instance gives, and the Celery
+    workers' log volume at the highest level reached (HARBOR-planning #152). Nothing for
+    runs that predate these measurements.
+    """
+    out = []
+    shown = (("pfcon_conflicts",
+              "duplicate job submissions pfcon refused ('already in use')"),
+             ("orphan_cancels", "children cancelled under parents that all finished"),
+             ("masked_cancels", "instances seen cancelled that then showed another status"))
+
+    for key, label in shown:
+        hits = [f"{r.get('level')}: {r[key]}" for r in rows if r.get(key)]
+        if hits:
+            out.append(f"**{label.capitalize()}** at level(s) {', '.join(hits)}.")
+
+    deletes = [f"{r.get('level')}: {r['pfcon_conflicts_by_job']['delete']}" for r in rows
+               if (r.get("pfcon_conflicts_by_job") or {}).get("delete")]
+    if deletes:
+        out.append(f"_The remote cleanup's delete job was submitted twice at once (its "
+                   f"check and its run task; no failure) at level(s) {', '.join(deletes)}_")
+
+    over = []
+
+    for r in rows:
+        bound, peak = r.get("status_queue_bound"), r.get("status_queue_peak_fresh")
+        if bound is not None and peak is not None and peak > bound:
+            over.append(f"{r.get('level')}: {peak} > {bound}")
+    if over:
+        out.append(f"**Status queue above one check per running instance** while no "
+                   f"check in it had expired (cancels travel there too) at level(s) "
+                   f"{', '.join(over)}.")
+
+    last = rows[-1] if rows else {}
+    if last.get("worker_log_bytes_total") is not None:
+        per = ", ".join(f"{k} {_human_bytes(v)}"
+                        for k, v in (last.get("worker_log_bytes") or {}).items())
+        out.append(f"_Celery workers logged {_human_bytes(last['worker_log_bytes_total'])} "
+                   f"in a scenario of level {last.get('level')} ({per})_")
+    elif last.get("worker_logs_unread"):
+        out.append(f"_The Celery workers' log volume at level {last.get('level')} is "
+                   f"unknown: {', '.join(last['worker_logs_unread'])} could not be read_")
+    return [line for item in out for line in (item, "")]
 
 
 _SAMPLER_TROUBLE = tuple(f.name for f in fields(SamplerSummary) if f.metadata.get("trouble"))

@@ -29,13 +29,16 @@ Five codebase facts drive the design; ignoring any of them produces uninterpreta
 
 ### 3.1 Scheduling is poll-gated
 
-The plugin-instance lifecycle is advanced by two Celery-beat tasks (`schedule_waiting_plugin_instances`, `check_running_plugin_instances_exec_status`), each firing every `CUBE_CELERY_POLL_INTERVAL` — **default 5.0 s** (`chris_backend/core/celery.py:56`). A linear chain of depth *N* with instant plugins is bounded below by ~*N × (a few × poll_interval)*, so for fast jobs the poller **dominates** makespan. The benchmark must decompose makespan by phase (§9.2) and sweep the poll interval (`{2s, 4s, 8s}`) to separate poller cost from CUBE's true capacity. **Floor: 2 s** — the periodic tasks' `skip_if_running` guard spends ~1 s in an `inspect().active()` broker broadcast per invocation, so at sub-2 s cadences consecutive invocations overlap and mutually skip, stalling the scheduler itself (measured: 44–116 s `waiting` stalls at 1 s).
+The plugin-instance lifecycle is advanced by two Celery-beat tasks (`schedule_waiting_plugin_instances`, `check_running_plugin_instances_exec_status`), each firing every `CUBE_CELERY_POLL_INTERVAL` — **default 5.0 s** (`POLL_INTERVAL` in `chris_backend/core/celery.py`). Since HARBOR-planning #152 a registration that ends an instance `finishedSuccessfully` schedules the ready waiting instances of its feed itself, so only the copy- and app-status hops of a chain wait on the poll. Runs from before lost no interval there either: the scheduling task ran about 1 s after each tick's status checks (its guard's `inspect()`, below), once their inline registrations had ended (REPORT.md § 17). A linear chain of depth *N* with instant plugins is bounded below by ~*N × (a few × poll_interval)*, so for fast jobs the poller **dominates** makespan. The benchmark must decompose makespan by phase (§9.2) and sweep the poll interval (`{2s, 4s, 8s}`) to separate poller cost from CUBE's true capacity. **Floor: 2 s** on runs before HARBOR-planning #152 — the periodic tasks' `skip_if_running` guard spent ~1 s in an `inspect().active()` broker broadcast per invocation, so at sub-2 s cadences consecutive invocations overlapped and mutually skipped, stalling the scheduler itself (measured: 44–116 s `waiting` stalls at 1 s). Since #152 the scheduling task skips a run through a lock in the shared cache (`single_instance`, `chris_backend/core/tasks.py`) and the poll publishes one status check per running instance at most (`enqueue_once`), which removes that broadcast; the floor has not been measured again.
 
 ### 3.2 Parallelism has fixed ceilings
 
 | **Component** | **Setting** | **Meaning** |
 |---|---|---|
-| `worker-mains` | `celery worker -c 4 -Q main1,main2` | ≤ 4 concurrent submissions/status calls |
+| `worker-mains` | `celery worker -c 4 -Q submit,status` | ≤ 4 concurrent submissions/status checks |
+| `worker-register` | `celery worker -c 2 -Q register --disable-prefetch` | ≤ 2 concurrent registrations of 100 files at most, and the count that sends larger ones on |
+| `worker-heavy` | `celery worker -c 4 -Q register_large,delete --disable-prefetch` | ≤ 4 concurrent registrations of more files and deletions, shared |
+| `worker-background` | `celery worker -c 2 -Q cleanup,pacs --disable-prefetch` | ≤ 2 concurrent remote cleanups and PACS tasks, shared |
 | `worker-periodic` | `celery worker -c 2 -Q periodic` | ≤ 2 concurrent periodic scans |
 | `pfcon` | `gunicorn -w 8 -t 120` | ≤ 8 concurrent compute-side calls |
 | `chris` | `manage.py runserver` | dev server — **must switch to `uvicorn`** (§3.4) |
@@ -182,7 +185,7 @@ services:
     environment:
       CUBE_CELERY_POLL_INTERVAL: "${CUBE_CELERY_POLL_INTERVAL:-2.0}"
   worker-mains:
-    command: celery -A core worker -c ${CUBE_WORKER_MAINS_CONCURRENCY:-4} -l info -Q main1,main2
+    command: celery -A core worker -c ${CUBE_WORKER_MAINS_CONCURRENCY:-4} -l info -Q submit,status
     cpus: ${CUBE_WORKER_CPUS:-4}
     mem_limit: ${CUBE_WORKER_MEM_LIMIT:-4g}
   db:
@@ -215,7 +218,7 @@ end-to-end makespan per feed; **per-phase decomposition** (`created → waiting 
 
 ### 9.3 Resources (USE) and backpressure
 
-CPU/mem, block-I/O deltas and peak pids per container — `chris`, `worker-mains`, `worker-periodic`, `db`, the broker, the cache, `pfcon`, and plugin-job containers (label `org.chrisproject.miniChRIS=plugininstance`) — read every 1 s, start to start, via the Docker SDK (`docker_client.py` against the mounted socket): one-shot stats reads, a few milliseconds each and made concurrently, with each container's CPU over the second since its previous reading — the ~1 s window of Docker's own figure, short enough not to average away the 2 s Celery beat's bursts. A plugin job's first reading gives its CPU since it started. The **Celery queue depths** (`LLEN main1/main2/periodic`, `broker.py`) have a timer of their own, every 0.5 s, under the beat's period: a sustained rise on `main2` means status checks are produced faster than workers consume them — backpressure shows here before CPU graphs make it obvious. Report peak and mean, and how the sampling went (ticks, late ticks, failed reads, plugin-job containers seen) in `report.md` and the level rows; `environment.json` records the sampler's settings (`benchmarks/envelope.md` § "Knobs (env vars, with defaults)", "Resource sampling"). Runs without that record read each container in turn with a call that blocks 1–2 s, about every 2 s × the number of containers, so their peaks are lower bounds.
+CPU/mem, block-I/O deltas and peak pids per container — `chris`, the five Celery workers (`worker-mains`, `worker-register`, `worker-heavy`, `worker-background`, `worker-periodic`), `db`, the broker, the cache, `pfcon`, and plugin-job containers (label `org.chrisproject.miniChRIS=plugininstance`) — read every 1 s, start to start, via the Docker SDK (`docker_client.py` against the mounted socket): one-shot stats reads, a few milliseconds each and made concurrently, with each container's CPU over the second since its previous reading — the ~1 s window of Docker's own figure, short enough not to average away the 2 s Celery beat's bursts. A plugin job's first reading gives its CPU since it started. The **Celery queue depths** (`LLEN` of each of CUBE's queues, `broker.py`: `submit`, `status`, `register`, `register_large`, `delete`, `cleanup`, `pacs`, `periodic`; `main1`, `main2`, `periodic` before HARBOR-planning #152) have a timer of their own, every 0.5 s, under the beat's period, with the wait of the `status` queue's oldest message: a sustained rise on `status` means status checks are produced faster than workers consume them — backpressure shows here before CPU graphs make it obvious. Report peak and mean, and how the sampling went (ticks, late ticks, failed reads, plugin-job containers seen) in `report.md` and the level rows; `environment.json` records the sampler's settings (`benchmarks/envelope.md` § "Knobs (env vars, with defaults)", "Resource sampling"). Runs without that record read each container in turn with a call that blocks 1–2 s, about every 2 s × the number of containers, so their peaks are lower bounds.
 
 ### 9.4 DB / state deltas and query attribution
 
@@ -339,8 +342,8 @@ All phases (1–7) are implemented.
 
 **Codebase:**
 
-- `chris_backend/core/celery.py:56` — `CUBE_CELERY_POLL_INTERVAL` default and beat schedule.
-- `chris_backend/plugininstances/tasks.py` — `skip_if_running` guard (the 2 s poll-interval floor, §3.1).
+- `chris_backend/core/celery.py` — `CUBE_CELERY_POLL_INTERVAL` default (`POLL_INTERVAL`), the queues and the beat schedule.
+- `chris_backend/core/tasks.py` — `single_instance` and `enqueue_once`, which replaced the `skip_if_running` guard behind the 2 s poll-interval floor (§3.1).
 - `chris_backend/plugininstances/enums.py` — plugin-instance status set.
 - `chris_backend/plugininstances/serializers.py:279` — `ts` `plugininstances` parent validation.
 - `docker-compose.yml` — worker `-c`, pfcon `-w`, `runserver`, `fslink`, `JOB_LABELS`.

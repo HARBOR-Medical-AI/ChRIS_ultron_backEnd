@@ -22,7 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Callable
 
-from .broker import BrokerClient
+from .broker import STATUS_QUEUE, BrokerClient
 from .docker_client import (ContainerRef, DockerClient, StatsRead, counters_went_back,
                             resource_sample, short_window)
 from .metrics import MetricSink
@@ -38,12 +38,15 @@ METHOD = "one-shot reads, CPU between consecutive readings"
 READ_BUDGET = 0.8
 
 
-def sampler_record(interval: float, queue_interval: float | None, workers: int) -> dict:
+def sampler_record(interval: float, queue_interval: float | None, workers: int,
+                   queues: tuple[str, ...] = ()) -> dict:
     """
-    The sampler's settings as ``environment.json`` records them.
+    The sampler's settings as ``environment.json`` records them, with the Celery queues it
+    read: a run whose queues were named otherwise (CUBE's renamed them, HARBOR-planning
+    #152) differs in it.
     """
     return {"method": METHOD, "interval_s": interval, "queue_interval_s": queue_interval,
-            "workers": workers}
+            "workers": workers, "queues": list(queues)}
 
 
 
@@ -295,4 +298,7 @@ class StatsSampler:
 
         now = time.time()
         for queue, depth in depths.items():
-            self._sink.record_queue(QueueSample(now, queue, depth))
+            # the status queue's wait tells its expired checks from pending ones
+            waited = (self._broker.oldest_wait(queue, now)
+                      if queue == STATUS_QUEUE and depth else None)
+            self._sink.record_queue(QueueSample(now, queue, depth, waited))

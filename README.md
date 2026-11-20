@@ -186,7 +186,9 @@ just lint                 # new issues on this branch, uncommitted changes inclu
 just lint --all           # every issue in the changed files
 just lint-fix             # let Ruff fix new unused imports and f-strings without placeholders
 just lint-fix --unsafe    # ... and unused variables
-just lint-test            # the tests of scripts/lint.py
+just format               # Ruff's default style on the lines this branch changed, new files whole
+just format-check         # what `just format` would change, as a diff
+just lint-test            # the tests of scripts/lint.py, scripts/reformat.py and scripts/repo.py
 ```
 
 An image built before these tools were added says so and needs `just build` first. `just lint`
@@ -287,17 +289,14 @@ just openapi-split > /dev/null
 
 See https://chrisproject.org/docs/run/helm
 
-### Shared cache: `CACHE_URL` is optional for now
+### Shared cache: `CACHE_URL` is required
 
-CUBE's shared cache (`core/cache.py`) runs on a Redis-protocol server of its own, whose URL the
-API server, the Celery workers and beat all read from `CACHE_URL`. Nothing uses the cache yet,
-so a deployment can leave `CACHE_URL` unset or empty: nothing is cached, no process connects to
-a cache server, and the helpers would go ahead without their locks, markers and bounded
-counters, logging one warning per process the first time something calls them. It will become
-required with the first feature that uses the cache, so a deployment whose stack has no such
-server, e.g. one with RabbitMQ as the Celery broker, should plan to add one.
-
-When `CACHE_URL` is set, the server needs to be:
+CUBE's shared cache (`core/cache.py`) runs on a Redis-protocol server of its own, whose URL
+the API server, the Celery workers and beat all read from `CACHE_URL`; CUBE refuses to start
+without it. The pending markers of the status checks and of the remote cleanup's tasks, and
+the locks of the scheduling task and of each instance's container deletion, live there. A
+deployment whose stack has no such server, e.g. one with RabbitMQ as the Celery broker, needs
+to add one. The server needs to be:
 
 - **Its own server.** Not the Celery broker's, whatever the database: one server has one
   memory limit and one eviction policy, so a full cache would refuse the broker's writes and
@@ -311,7 +310,10 @@ When `CACHE_URL` is set, the server needs to be:
 - **The URL.** `redis://[[user]:password@]host:6379/<db>`, `rediss://` for TLS, or
   `unix:///path/to.sock?db=<db>`, with a logical database. TLS options and socket timeouts
   (above 0, at most 5 s; 0.5 s by default) can go in its query string, retry options cannot.
-  Percent-encode a `/`, `#`, `?` or `@` in the credentials.
+  Percent-encode a `/`, `#`, `?` or `@` in the credentials. CUBE moves the credentials into
+  the cache's `OPTIONS` so that Celery's settings dump (`celery report`, `inspect conf`) masks
+  the password (the user name stays visible); with several servers in the URL they must all
+  have the same ones.
 - **Its permissions.** A user the server's ACL limits needs the commands the helpers send
   (`PING`, `SET`, `DEL`, `ZREM`, `SCRIPT LOAD`, `SCRIPT EXISTS` and `EVALSHA`, and `SELECT` when
   the database is not 0) and those their scripts run (`GET`, `DEL`, `TIME`, `PEXPIREAT` and the
@@ -321,7 +323,9 @@ At start-up CUBE checks the server and refuses to start on a wrong configuration
 cache backend, the broker's host and port, a URL it cannot parse or use or without a database,
 retries or a timeout out of bounds, a refused password, or a server that refuses its scripts. A
 server that does not answer, or a full Dragonfly, only gets a warning: CUBE starts without it,
-and the helpers go ahead without their locks, markers and bounded counters until it answers.
+and the helpers go ahead without their locks, markers and bounded counters until it answers;
+each process's helpers log a warning when a call first finds it down, and again every 5
+minutes while their calls keep failing.
 Most TLS mistakes are in that case (a refused certificate, or `redis://` against `rediss://`), so
 read that warning if the server should be up; a TLS-only Dragonfly answers a plain-text URL's
 password with an error, which is refused.

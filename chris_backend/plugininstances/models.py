@@ -1,25 +1,54 @@
 
 import logging
+from dataclasses import dataclass
 
 from django.db import models
+from django.db.models import F
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
-from django.utils import timezone
 
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from core.models import AsyncDeletableModel, ChrisFolder
+from core.models import AsyncDeletableModel, ChrisFolder, ChrisInstance
 from feeds.models import Feed
 from plugins.models import ComputeResource, Plugin, PluginParameter
 from plugins.fields import CPUField, MemoryField
 from plugins.fields import MemoryInt, CPUInt
 from workflows.models import Workflow
-from plugininstances.enums import (ACTIVE_STATUSES, INACTIVE_STATUSES, STATUS_CHOICES,
-                                   REMOTE_CLEANUP_STATUS_CHOICES)
+from plugininstances.enums import (ACTIVE_STATUSES, ARM_REMOTE_CLEANUP, INACTIVE_STATUSES,
+                                   REMOTE_CLEANUP_STATUS_CHOICES, REMOTE_CLEANUP_STATUSES,
+                                   REMOTE_JOB_STATUSES, STATUS_CHOICES, STATUSES)
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StatusWrite:
+    """
+    The outcome of a conditional write of a plugin instance: whether this caller made it
+    (true as a bool), and a status: when it won, the one it wrote, or for a write of other
+    fields the one the caller's object holds, which may be older than the row's; when it
+    lost, the one another writer left in the database row, None when the row is gone.
+    """
+    won: bool
+    status: str | None
+
+    def __bool__(self):
+        return self.won
+
+
+def _statuses(source, known=STATUSES):
+    """
+    ``source`` (a status or several) as a list, refusing a name that is not a status:
+    a typo would make a conditional write lose every time.
+    """
+    sources = [source] if isinstance(source, str) else list(source)
+
+    if not sources or set(sources) - known:
+        raise ValueError(f'not a list of statuses: {source!r}')
+    return sources
 
 
 def get_default_job_status_summary() -> dict:
@@ -148,7 +177,7 @@ class PluginInstance(AsyncDeletableModel):
 
         if self.output_folder is None:
             self.output_folder = self._save_output_folder()
-            self.save()
+            super(PluginInstance, self).save(update_fields=['output_folder'])
 
     def _save_feed(self):
         """
@@ -250,16 +279,130 @@ class PluginInstance(AsyncDeletableModel):
         """
         return str(self.output_folder.path)
 
-    def set_status(self, status):
-        self.status = status
+    # -- conditional writes ------------------------------------------------------------
+    # Several tasks and API requests can act on one instance at once. Therefore the
+    # instance status is only ever written by transition() (cancel() included): one
+    # UPDATE conditional on the status the writer expects. What else a task writes is
+    # conditional too, on the status (update_if_status()) or, for the remote cleanup, on
+    # the cleanup's own status (move_remote_cleanup(), arm_remote_cleanup()), but for the
+    # retry counters (increment()); a writer that lost does not do what would have
+    # followed.
 
-        if status == 'scheduled':
-            now = timezone.now()
-            self.start_date = now  # save scheduling date
-            self.end_date = now
-            self.save(update_fields=['start_date', 'end_date', 'status'])
-        else:
-            self.save(update_fields=['status'])
+    def transition(self, to, source, **fields):
+        """
+        Move this instance to status ``to`` if the database has it in one of the statuses
+        ``source`` (one or a list), writing ``fields`` in the same UPDATE. Returns a
+        ``StatusWrite``: when it won, this object has the values written; when it lost, it
+        is left as it was and the result says what status the row has.
+        """
+        sources = _statuses(source)
+        _statuses(to)
+        return self._write({'status__in': sources}, {'status': to, **fields})
+
+    def cancel(self, source=None, job_id=None, **fields):
+        """
+        Move this instance to 'cancelled' from the statuses ``source`` (the active
+        ones by default), writing ``fields``, with its remote cleanup armed in the same
+        UPDATE when the database row is in a status with a job in the remote compute
+        (``REMOTE_JOB_STATUSES``): the status a caller read may be stale by then.
+        The periodic task handle_remote_cleanup submits the cleanup's jobs. The cancel
+        that wins logs the final status, naming the instance's jobs ``job_id`` (read
+        from the ``ChrisInstance`` when not given, a query: a caller that cancels many
+        reads the prefix once). Returns the ``StatusWrite``.
+        """
+        sources = _statuses(source or ACTIVE_STATUSES)
+        remote = [s for s in sources if s in REMOTE_JOB_STATUSES]
+        local = [s for s in sources if s not in REMOTE_JOB_STATUSES]
+        attempts = [(statuses, armed) for statuses, armed in
+                    ((remote, ARM_REMOTE_CLEANUP), (local, {})) if statuses]
+        written = StatusWrite(False, self.status)
+
+        # a row moves forward only: out of a local status into a remote one, and out of
+        # that into a terminal one, so the third round finds it where it stays. A loss
+        # with the row still in one of ``sources`` means it moved between the UPDATE and
+        # the read of its status: the other half of ``sources`` gets its turn.
+        for _ in range(3):
+            for statuses, armed in attempts:
+                written = self.transition('cancelled', statuses, **fields, **armed)
+
+                if written:
+                    self.log_final_status(job_id)
+                if written or written.status not in sources:
+                    return written
+        return written
+
+    def log_final_status(self, job_id=None):
+        """
+        Log the terminal status, and the error code if any, that a write has just given
+        this instance: the line that tells how it ended, which only the writer that won
+        logs. ``job_id`` is the id of its jobs in the remote compute, read from the
+        ``ChrisInstance`` when not given.
+        """
+        if job_id is None:
+            job_id = ChrisInstance.load().job_id_prefix + str(self.id)
+        error_code = self.error_code
+        logger.info(f"Saved plugin instance final status for job {job_id} as "
+                    f"'{self.status}'"
+                    + (f' with error code {error_code}' if error_code else ''))
+
+    def update_if_status(self, source, **fields):
+        """
+        Write ``fields``, which may not include the status, if the database has this
+        instance in one of the statuses ``source``. Returns a ``StatusWrite`` as
+        ``transition`` does.
+        """
+        if 'status' in fields:
+            raise ValueError('only transition() writes the status')
+        return self._write({'status__in': _statuses(source)}, fields)
+
+    def move_remote_cleanup(self, to, source, **fields):
+        """
+        Move this instance's ``remote_cleanup_status`` to ``to`` if the database has it in
+        one of ``source`` (one or a list), writing ``fields`` (not the status) in the same
+        UPDATE. Returns whether it moved; when it did, this object has the values written.
+        """
+        sources = _statuses(source, REMOTE_CLEANUP_STATUSES)
+        _statuses(to, REMOTE_CLEANUP_STATUSES)
+        if 'status' in fields:
+            raise ValueError('only transition() writes the status')
+        return bool(self._write({'remote_cleanup_status__in': sources},
+                                {'remote_cleanup_status': to, **fields}))
+
+    def arm_remote_cleanup(self, rearm=False):
+        """
+        Start this instance's remote cleanup, if it has ended (a terminal status) and its
+        cleanup has not started, or with ``rearm`` has ended too. Returns whether it
+        started it.
+        """
+        sources = ['notStarted', 'complete', 'failed'] if rearm else ['notStarted']
+        return bool(self._write(
+            {'status__in': INACTIVE_STATUSES, 'remote_cleanup_status__in': sources},
+            ARM_REMOTE_CLEANUP))
+
+    def increment(self, field):
+        """
+        Add one to the counter ``field`` in the database and return its new value, which
+        this object then has too.
+        """
+        type(self).objects.filter(pk=self.pk).update(**{field: F(field) + 1})
+        self.refresh_from_db(fields=[field])
+        return getattr(self, field)
+
+    def _write(self, condition, values):
+        """
+        UPDATE this instance's database row with ``values`` where ``condition`` holds and
+        mirror them into this object when it did.
+        """
+        written = type(self).objects.filter(pk=self.pk, **condition).update(**values)
+
+        if written:
+            for name, value in values.items():
+                setattr(self, name, value)
+            return StatusWrite(True, self.status)
+
+        status = type(self).objects.filter(pk=self.pk).values_list('status',
+                                                                   flat=True).first()
+        return StatusWrite(False, status)
 
 
 @receiver(post_delete, sender=PluginInstance)
@@ -339,9 +482,14 @@ class PluginInstanceFilter(FilterSet):
 
 
 class PluginInstanceLock(models.Model):
+    """
+    The registration of a plugin instance's output files: when it first started, and
+    the token of the run that owns it, the newest (PluginInstanceAppJob.register_output).
+    """
     plugin_inst = models.OneToOneField(PluginInstance, on_delete=models.CASCADE,
                                        related_name='lock')
     start_date = models.DateTimeField(auto_now_add=True)
+    owner_token = models.CharField(max_length=32, blank=True)
 
     def __str__(self):
         return str(self.plugin_inst.id)

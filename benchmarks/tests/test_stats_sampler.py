@@ -454,7 +454,10 @@ def test_an_unavailable_broker_is_not_sampled():
 
 def test_sampler_record_names_the_method_and_its_settings():
     assert sampler_record(1.0, 0.5, 8) == {  # nosec B101 - pytest assertion
-        "method": METHOD, "interval_s": 1.0, "queue_interval_s": 0.5, "workers": 8}
+        "method": METHOD, "interval_s": 1.0, "queue_interval_s": 0.5, "workers": 8,
+        "queues": []}
+    record = sampler_record(1.0, 0.5, 8, queues=("submit", "status"))
+    assert record["queues"] == ["submit", "status"]  # nosec B101 - pytest assertion
 
 
 # -- against the stack -------------------------------------------------------------------------

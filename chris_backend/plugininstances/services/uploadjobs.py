@@ -5,16 +5,14 @@ environment (ChRIS / pfcon interface) as well as deleting them when finished.
 """
 
 import logging
-import json
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
 
 from django.utils import timezone
-from django.db.utils import IntegrityError
 
 from core.utils import json_zip2str
-from plugininstances.models import PluginInstance, PluginInstanceLock
+from plugininstances.models import PluginInstance
 from .abstractjobs import PluginInstanceJob
 
 
@@ -27,11 +25,13 @@ class PluginInstanceUploadJob(PluginInstanceJob):
     upload job related to a plugin instance.
     """
 
+    status = 'uploading'
+
     def run(self):
         """
         Run the plugin instance upload job via a call to a remote pfcon service.
         """
-        if self.c_plugin_inst.status == 'cancelled':
+        if not self.is_runnable():
             return
 
         job_id = self.str_job_id
@@ -45,32 +45,27 @@ class PluginInstanceUploadJob(PluginInstanceJob):
 
         pfcon_url = self.pfcon_client.url
 
-        logger.info(f'Submitting upload job {job_id} to pfcon url -->{pfcon_url}<--, '
-                    f'description: {json.dumps(job_descriptors, indent=4)}')
+        logger.info(f'Submitting upload job {job_id} to pfcon url -->{pfcon_url}<--')
         try:
             d_resp = self._submit(JobType.UPLOAD, job_id, job_descriptors)
         except PfconRequestException as e:
-            logger.error(f'[CODE01,{job_id}]: Error submitting upload job to pfcon url '
-                         f'-->{pfcon_url}<--, detail: {str(e)}')
+            d_resp = self.submitted_elsewhere(JobType.UPLOAD, 'upload', e)
 
-            self.c_plugin_inst.upload_retry_count += 1
+            if d_resp is None:
+                retries = self.c_plugin_inst.increment('upload_retry_count')
 
-            if self.c_plugin_inst.upload_retry_count > PluginInstance.MAX_UPLOAD_RETRIES:
-                self.c_plugin_inst.error_code = 'CODE01'
-                self.c_plugin_inst.status = 'cancelled'  # giving up 
-                self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-                self.schedule_remote_cleanup()
-            else:
-                self.c_plugin_inst.save(update_fields=['upload_retry_count'])
-                self.run()  # retry
+                if retries > PluginInstance.MAX_UPLOAD_RETRIES:
+                    self.end('cancelled', 'uploading', 'CODE01')  # giving up
+                else:
+                    self.run()  # retry
+                return
         else:
             logger.info(f'Successfully submitted upload job {job_id} to pfcon url '
-                        f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
+                        f'-->{pfcon_url}<--')
 
-            # update the job status and summary
-            self.c_plugin_inst.summary = self.get_job_status_summary(d_resp)
-            self.c_plugin_inst.raw = json_zip2str(d_resp)
-            self.c_plugin_inst.save()
+        # update the job status and summary
+        self.submitted(summary=self.get_job_status_summary(d_resp),
+                       raw=json_zip2str(d_resp))
 
     def check_exec_status(self):
         """
@@ -85,9 +80,7 @@ class PluginInstanceUploadJob(PluginInstanceJob):
             if self._job_has_timeout():
                 logger.error(f'[CODE13,{job_id}]: Error, upload job exceeded maximum '
                              f'execution time')
-                self.c_plugin_inst.error_code = 'CODE13'
-                self.cancel_exec()
-                return self.c_plugin_inst.status
+                return self.cancel_exec('CODE13', 'uploading').status
 
             pfcon_url = self.pfcon_client.url
             logger.info(f'Sending job status request to pfcon url -->{pfcon_url}<-- for '
@@ -99,23 +92,18 @@ class PluginInstanceUploadJob(PluginInstanceJob):
                              f'url -->{pfcon_url}<--, detail: {str(e)}')
                 return self.c_plugin_inst.status  # return, periodic task will retry later
 
-            logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                        f' for upload job {job_id}: {json.dumps(d_resp, indent=4)}')
-
             status = d_resp['compute']['status']
-            logger.info(f'Current upload job {job_id} remote status = {status}')
+            logger.info('Current upload job %s remote status = %s %s', job_id, status,
+                        d_resp['compute'].get('message') or '')
             logger.info(f'Current upload job {job_id} plugin instance DB status = '
                         f'{self.c_plugin_inst.status}')
 
-            summary = self.get_job_status_summary(d_resp)
-            self.c_plugin_inst.summary = summary
-            raw = json_zip2str(d_resp)
-            self.c_plugin_inst.raw = raw
-
-            # only update (atomically) if still in upload phase to avoid concurrency problems
-            PluginInstance.objects.filter(
-                id=self.c_plugin_inst.id,
-                status=self.c_plugin_inst.status).update(summary=summary, raw=raw)
+            # only while uploading: another task may have moved it on meanwhile
+            written = self.c_plugin_inst.update_if_status(
+                'uploading', summary=self.get_job_status_summary(d_resp),
+                raw=json_zip2str(d_resp))
+            if not written:
+                return written.status
 
             if status == 'finishedSuccessfully':
                 self.handle_finished_successfully_status()
@@ -124,15 +112,6 @@ class PluginInstanceUploadJob(PluginInstanceJob):
             elif status == 'undefined':
                 self.handle_undefined_status()
         return self.c_plugin_inst.status
-
-    def cancel_exec(self):
-        """
-        Cancel a plugin instance upload job execution. It connects to the remote service
-        to cancel job and schedules remote cleanup.
-        """
-        self.c_plugin_inst.status = 'cancelled'
-        self.c_plugin_inst.save(update_fields=['status'])
-        self.schedule_remote_cleanup()
 
     def delete(self):
         """
@@ -157,55 +136,17 @@ class PluginInstanceUploadJob(PluginInstanceJob):
 
     def handle_finished_successfully_status(self):
         """
-        Handle the 'finishedSuccessfully' status returned by the remote compute.
-        Delegates to PluginInstanceAppJob to fetch file metadata from pfcon, verify
-        files in storage and register them with the DB. The files registration
-        must execute only once.
+        Handle the 'finishedSuccessfully' status returned by the remote compute: the task
+        that moves the instance on, to 'registeringFiles', has a task of its own register
+        the files the upload job fetched (the registration asks the remote how the plugin
+        job ended).
         """
-        plg_inst_lock = PluginInstanceLock(plugin_inst=self.c_plugin_inst)
-        try:
-            plg_inst_lock.save()
-        except IntegrityError:
-            # another async task has already entered the lock section of the code
-            # only update (atomically) if status='started' to avoid concurrency problems
-            PluginInstance.objects.filter(
-                id=self.c_plugin_inst.id,
-                status='uploading').update(status='registeringFiles', 
-                                         end_date=timezone.now())
-        else:
-            # only one concurrent async task should execute this lock section of the code
-            self.c_plugin_inst.status = 'registeringFiles'
-            self.c_plugin_inst.save(update_fields=['status'])
-
-            job_id = self.str_job_id
-            logger.info(f'Successfully finished plugin instance upload job {job_id}')
-
-            pfcon_url = self.pfcon_client.url
-            logger.info(f'Sending job status request to pfcon url -->{pfcon_url}<-- for '
-                        f'plugin job {job_id}')
-            try:
-                d_resp = self._get_status(JobType.PLUGIN, job_id)
-            except PfconRequestException as e:
-                logger.error(f'[CODE02,{job_id}]: Error getting plugin job status at '
-                             f'pfcon url -->{pfcon_url}<-- while registering files, '
-                             f'detail: {str(e)}')
-                
-                self.c_plugin_inst.status = 'cancelled'
-                self.c_plugin_inst.error_code = 'CODE02'
-                self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-                self.schedule_remote_cleanup()
-            else:
-                logger.info(f'Successful job status response from pfcon url '
-                            f'-->{pfcon_url}<-- for plugin job {job_id}: '
-                            f'{json.dumps(d_resp, indent=4)} while registering files')
-                
-                from .pluginjobs import PluginInstanceAppJob
-                app_job = PluginInstanceAppJob(self.c_plugin_inst)  
-                
-                if d_resp['compute']['status'] == 'finishedSuccessfully':
-                    app_job.register_output_files_on_success()
-                elif d_resp['compute']['status'] == 'finishedWithError':
-                    app_job.register_output_files_on_error()
+        # the sweep of stuck registrations counts from end_date, so it starts here
+        if self.c_plugin_inst.transition('registeringFiles', 'uploading',
+                                         end_date=timezone.now()):
+            logger.info(f'Successfully finished plugin instance upload job '
+                        f'{self.str_job_id}')
+            self.enqueue_registration()
 
     def handle_finished_with_error_status(self):
         """
@@ -215,29 +156,22 @@ class PluginInstanceUploadJob(PluginInstanceJob):
 
         logger.error(f'[CODE18,{job_id}]: Error while running upload job, remote compute '
                      f'returned finishedWithError status for job {job_id}')
-        
-        self.c_plugin_inst.status = 'cancelled'
-        self.c_plugin_inst.error_code = 'CODE18'
-        self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-        self.schedule_remote_cleanup()
+
+        self.end('cancelled', 'uploading', 'CODE18')
 
     def handle_undefined_status(self):
         """
         Handle the 'undefined' status returned by the remote compute.
         """
-        self.c_plugin_inst.upload_retry_count += 1
+        retries = self.c_plugin_inst.increment('upload_retry_count')
 
-        if self.c_plugin_inst.upload_retry_count > PluginInstance.MAX_UPLOAD_RETRIES:
+        if retries > PluginInstance.MAX_UPLOAD_RETRIES:
             job_id = self.str_job_id
 
             logger.error(f'[CODE18,{job_id}]: Error while running upload job, remote '
                         f'compute returned undefined status for job {job_id} and '
                         f'exceeded max upload retries')
-            
-            self.c_plugin_inst.status = 'cancelled'
-            self.c_plugin_inst.error_code = 'CODE18'
-            self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-            self.schedule_remote_cleanup()
+
+            self.end('cancelled', 'uploading', 'CODE18')
         else:
-            self.c_plugin_inst.save(update_fields=['upload_retry_count'])
-            self.run()  # retry
+            self.enqueue_run('PluginInstanceUploadJob')  # resubmit
