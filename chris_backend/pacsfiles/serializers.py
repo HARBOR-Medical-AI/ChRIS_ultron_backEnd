@@ -150,6 +150,8 @@ class PACSSeriesSerializer(serializers.HyperlinkedModelSerializer):
                   'SeriesInstanceUID', 'SeriesDescription', 'pacs_name',
                   'pacs_identifier',  'deletion_status', 'deletion_requested_at',
                   'deletion_error', 'folder')
+        # the deletion's state is the deletion tasks' to write
+        read_only_fields = ('deletion_status', 'deletion_requested_at', 'deletion_error')
 
     def create(self, validated_data):
         """

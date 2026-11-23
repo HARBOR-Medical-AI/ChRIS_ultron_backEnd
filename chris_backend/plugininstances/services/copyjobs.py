@@ -7,7 +7,6 @@ environment (ChRIS / pfcon interface) as well as deleting them when finished.
 import logging
 import os
 import time
-import json
 
 from pfconclient.client import JobType
 from pfconclient.exceptions import PfconRequestException
@@ -19,7 +18,6 @@ from core.utils import json_zip2str
 from core.models import  ChrisFile
 from plugininstances.models import PluginInstance
 from .abstractjobs import PluginInstanceJob
-from .pluginjobs import PluginInstanceAppJob
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +29,8 @@ class PluginInstanceCopyJob(PluginInstanceJob):
     copy job related to a plugin instance.
     """
 
+    status = 'copying'
+
     def __init__(self, plugin_instance):
         super().__init__(plugin_instance)
         self.l_plugin_inst_param_instances = self.c_plugin_inst.get_parameter_instances()
@@ -39,10 +39,10 @@ class PluginInstanceCopyJob(PluginInstanceJob):
         """
         Run the plugin instance copy job via a call to a remote pfcon service.
         """
-        if self.c_plugin_inst.status == 'cancelled':
+        if not self.is_runnable():
             return
 
-        job_id = self.str_job_id        
+        job_id = self.str_job_id
         plugin = self.c_plugin_inst.plugin
         plugin_type = plugin.meta.type
         inputdirs = []
@@ -58,10 +58,7 @@ class PluginInstanceCopyJob(PluginInstanceJob):
                 inputdirs.append(self.get_previous_output_path())
         except Exception as e:
             logger.error(f'[CODE01,{job_id}]: Error creating copy job, detail: {str(e)}')
-            self.c_plugin_inst.status = 'cancelled'  # giving up
-            self.c_plugin_inst.error_code = 'CODE01'
-            self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-            self.schedule_remote_cleanup()
+            self.end('cancelled', 'copying', 'CODE01')  # giving up
             return
 
         output_dir = self.c_plugin_inst.get_output_path()
@@ -80,37 +77,29 @@ class PluginInstanceCopyJob(PluginInstanceJob):
 
         pfcon_url = self.pfcon_client.url
 
-        logger.info(f'Submitting copy job {job_id} to pfcon url -->{pfcon_url}<--, '
-                    f'description: {json.dumps(job_descriptors, indent=4)}')
+        logger.info(f'Submitting copy job {job_id} to pfcon url -->{pfcon_url}<--')
         try:
             d_resp = self._submit(JobType.COPY, job_id, job_descriptors)
         except PfconRequestException as e:
-            logger.error(f'[CODE01,{job_id}]: Error submitting copy job to pfcon url '
-                         f'-->{pfcon_url}<--, detail: {str(e)}')
-            
-            self.c_plugin_inst.copy_retry_count += 1
+            d_resp = self.submitted_elsewhere(JobType.COPY, 'copy', e)
 
-            if self.c_plugin_inst.copy_retry_count > PluginInstance.MAX_COPY_RETRIES:
-                self.c_plugin_inst.error_code = 'CODE01'
-                self.c_plugin_inst.status = 'cancelled'  # giving up
-                self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-                self.schedule_remote_cleanup()
-            else:
-                self.c_plugin_inst.save(update_fields=['copy_retry_count'])
-                self.run()  # retry
+            if d_resp is None:
+                retries = self.c_plugin_inst.increment('copy_retry_count')
+
+                if retries > PluginInstance.MAX_COPY_RETRIES:
+                    self.end('cancelled', 'copying', 'CODE01')  # giving up
+                else:
+                    self.run()  # retry
+                return
         else:
             logger.info(f'Successfully submitted copy job {job_id} to pfcon url '
-                        f'-->{pfcon_url}<--, response: {json.dumps(d_resp, indent=4)}')
-            
-            # update the job status and summary
-            self.c_plugin_inst.summary = self.get_job_status_summary(d_resp)
-            self.c_plugin_inst.raw = json_zip2str(d_resp)
+                        f'-->{pfcon_url}<--')
 
-            # https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/408
-            now = timezone.now()
-            self.c_plugin_inst.start_date = now
-            self.c_plugin_inst.end_date = now
-            self.c_plugin_inst.save()
+        # update the job status and summary
+        # https://github.com/HARBOR-Medical-AI/ChRIS_ultron_backEnd/issues/408
+        now = timezone.now()
+        self.submitted(summary=self.get_job_status_summary(d_resp),
+                       raw=json_zip2str(d_resp), start_date=now, end_date=now)
 
     def check_exec_status(self):
         """
@@ -125,9 +114,7 @@ class PluginInstanceCopyJob(PluginInstanceJob):
             if self._job_has_timeout():
                 logger.error(f'[CODE13,{job_id}]: Error, copy job exceeded maximum '
                              f'execution time')
-                self.c_plugin_inst.error_code = 'CODE13'
-                self.cancel_exec()
-                return self.c_plugin_inst.status
+                return self.cancel_exec('CODE13', 'copying').status
 
             pfcon_url = self.pfcon_client.url
             logger.info(f'Sending job status request to pfcon url -->{pfcon_url}<-- for '
@@ -139,23 +126,18 @@ class PluginInstanceCopyJob(PluginInstanceJob):
                              f'url -->{pfcon_url}<--, detail: {str(e)}')
                 return self.c_plugin_inst.status  # return, periodic task will retry later
 
-            logger.info(f'Successful job status response from pfcon url -->{pfcon_url}<--'
-                        f' for copy job {job_id}: {json.dumps(d_resp, indent=4)}')
-
             status = d_resp['compute']['status']
-            logger.info(f'Current copy job {job_id} remote status = {status}')
+            logger.info('Current copy job %s remote status = %s %s', job_id, status,
+                        d_resp['compute'].get('message') or '')
             logger.info(f'Current copy job {job_id} plugin instance DB status = '
                         f'{self.c_plugin_inst.status}')
 
-            summary = self.get_job_status_summary(d_resp)
-            self.c_plugin_inst.summary = summary
-            raw = json_zip2str(d_resp)
-            self.c_plugin_inst.raw = raw
-
-            # only update (atomically) if still in copy phase to avoid concurrency problems
-            PluginInstance.objects.filter(
-                id=self.c_plugin_inst.id,
-                status=self.c_plugin_inst.status).update(summary=summary, raw=raw)
+            # only while still copying: another task may have moved it on meanwhile
+            written = self.c_plugin_inst.update_if_status(
+                'copying', summary=self.get_job_status_summary(d_resp),
+                raw=json_zip2str(d_resp))
+            if not written:
+                return written.status
 
             if status == 'finishedSuccessfully':
                 self.handle_finished_successfully_status()
@@ -164,15 +146,6 @@ class PluginInstanceCopyJob(PluginInstanceJob):
             elif status == 'undefined':
                 self.handle_undefined_status()
         return self.c_plugin_inst.status
-
-    def cancel_exec(self):
-        """
-        Cancel a plugin instance copy job execution. It connects to the remote service
-        to cancel job and schedules remote cleanup.
-        """
-        self.c_plugin_inst.status = 'cancelled'
-        self.c_plugin_inst.save(update_fields=['status'])
-        self.schedule_remote_cleanup()
 
     def delete(self):
         """
@@ -248,18 +221,18 @@ class PluginInstanceCopyJob(PluginInstanceJob):
         Handle the 'finishedSuccessfully' status returned by the remote compute.
         """
         job_id = self.str_job_id
-        
+
         logger.info(f'Successfully finished plugin instance copy job {job_id}')
-        
-        # data successfully copied so update instance summary
-        self.c_plugin_inst.summary['pushPath']['status'] = True
-        now = timezone.now()
-        self.c_plugin_inst.start_date = now  # save scheduling date
-        self.c_plugin_inst.end_date = now
-        self.c_plugin_inst.status = 'scheduled'
-        self.c_plugin_inst.save()
-        plg_inst_app_job = PluginInstanceAppJob(self.c_plugin_inst)
-        plg_inst_app_job.run()
+
+        # data successfully copied so update instance summary; only the task that moves
+        # the instance on submits its app job, on the queue of submissions
+        summary = self.c_plugin_inst.summary
+        summary['pushPath']['status'] = True
+        now = timezone.now()  # save scheduling date
+
+        if self.c_plugin_inst.transition('scheduled', 'copying', summary=summary,
+                                         start_date=now, end_date=now):
+            self.enqueue_run('PluginInstanceAppJob', moved_to='scheduled')
 
     def handle_finished_with_error_status(self):
         """
@@ -269,29 +242,20 @@ class PluginInstanceCopyJob(PluginInstanceJob):
 
         logger.error(f'[CODE18,{job_id}]: Error while running copy job, remote compute '
                      f'returned finishedWithError status for job {job_id}')
-        
-        self.c_plugin_inst.status = 'cancelled'
-        self.c_plugin_inst.error_code = 'CODE18'
-        self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-        self.schedule_remote_cleanup()
+
+        self.end('cancelled', 'copying', 'CODE18')
 
     def handle_undefined_status(self):
         """
         Handle the 'undefined' status returned by the remote compute.
         """
-        self.c_plugin_inst.copy_retry_count += 1
-
-        if self.c_plugin_inst.copy_retry_count > PluginInstance.MAX_COPY_RETRIES:
+        if self.c_plugin_inst.increment('copy_retry_count') > PluginInstance.MAX_COPY_RETRIES:
             job_id = self.str_job_id
 
             logger.error(f'[CODE18,{job_id}]: Error while running copy job, remote '
                         f'compute returned undefined status for job {job_id} and '
                         f'exceeded max copy retries')
-            
-            self.c_plugin_inst.status = 'cancelled'
-            self.c_plugin_inst.error_code = 'CODE18'
-            self.c_plugin_inst.save(update_fields=['status', 'error_code'])
-            self.schedule_remote_cleanup()
+
+            self.end('cancelled', 'copying', 'CODE18')
         else:
-            self.c_plugin_inst.save(update_fields=['copy_retry_count'])
-            self.run()  # retry
+            self.enqueue_run('PluginInstanceCopyJob')  # resubmit

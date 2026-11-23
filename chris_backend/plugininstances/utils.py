@@ -1,13 +1,16 @@
 
-from .tasks import run_plugin_instance_job
+from core.models import ChrisInstance
+
+from .tasks import schedule_plugin_instance
 from .models import PluginInstance, ACTIVE_STATUSES
+from .enums import STATUSES
 
 
 def run_if_ready(plg_inst, previous):
     """
-    Set the status of ``plg_inst`` accordingly depending on the status of its previous
-    plugin instance. Plugin instances of type 'ts' also consider the status of each of
-    its possibly multiple parents.
+    Set the status of ``plg_inst``, just created, accordingly depending on the status of
+    its previous plugin instance. Plugin instances of type 'ts' also consider the status
+    of each of its possibly multiple parents.
     """
     parent_ids = []
     if plg_inst.plugin.meta.type == 'ts':
@@ -21,32 +24,55 @@ def run_if_ready(plg_inst, previous):
 
         for parent in parents:
             if parent.status in ACTIVE_STATUSES:
-                plg_inst.set_status('waiting')
+                plg_inst.transition('waiting', 'created')
                 all_parents_finished = False
                 break
             if parent.status in ('finishedWithError', 'cancelled'):
-                plg_inst.set_status('cancelled')
+                plg_inst.cancel('created')
                 all_parents_finished = False
                 break
 
         if all_parents_finished:
-            if plg_inst.compute_resource.compute_requires_copy_job:
-                plg_inst.set_status('copying')
-                run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceCopyJob')
-            else:
-                plg_inst.set_status('scheduled')
-                run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceAppJob')
+            schedule_plugin_instance(plg_inst, 'created')
 
     elif previous is None or previous.status == 'finishedSuccessfully':
-        if plg_inst.compute_resource.compute_requires_copy_job:
-            plg_inst.set_status('copying')
-            run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceCopyJob')
-        else:
-            plg_inst.set_status('scheduled')
-            run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceAppJob')
+        schedule_plugin_instance(plg_inst, 'created')
 
     elif previous.status in ACTIVE_STATUSES:
-        plg_inst.set_status('waiting')
+        plg_inst.transition('waiting', 'created')
 
     elif previous.status in ('finishedWithError', 'cancelled'):
-        plg_inst.set_status('cancelled')
+        plg_inst.cancel('created')
+
+
+def cancel_plugin_instances(plg_insts, source=None):
+    """
+    Cancel these plugin instances from the statuses ``source``, by default whatever their
+    status but 'cancelled', each with its remote cleanup armed in the same UPDATE when it
+    may have a job in the remote compute (``PluginInstance.cancel``). Returns how many it
+    moved to 'cancelled'.
+    """
+    source = source or STATUSES - {'cancelled'}
+    prefix = ChrisInstance.load().job_id_prefix  # once, for every final status logged
+    return sum(bool(inst.cancel(source, job_id=f'{prefix}{inst.id}'))
+               for inst in plg_insts)
+
+
+def cancel_plugin_instance_tree(plg_inst):
+    """
+    Cancel an active plugin instance and, once it is cancelled (by this call or before),
+    every descendant whatever its status: their input can no longer be trusted. Returns
+    the instance's ``StatusWrite``: lost with another status when it ended otherwise
+    meanwhile, and then nothing changes.
+    """
+    cancelled = plg_inst.cancel()
+
+    if not cancelled and cancelled.status != 'cancelled':
+        return cancelled
+
+    if not cancelled:  # cancelled before: what the response shows
+        plg_inst.refresh_from_db(fields=['status'])
+
+    cancel_plugin_instances([inst for inst in plg_inst.get_descendant_instances()
+                             if inst.id != plg_inst.id])
+    return cancelled

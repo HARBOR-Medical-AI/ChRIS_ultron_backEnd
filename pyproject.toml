@@ -53,7 +53,7 @@ dev = [
     "flake8>=7.3",  # used by `just lint` for the pyflakes Codacy's Prospector runs
     "bandit>=1.9.4",  # used by `just lint`
     "dodgy>=0.2.1",  # used by `just lint` and Codacy's Prospector
-    "ruff>=0.17.3",  # used by `just lint-fix`
+    "ruff>=0.17.3",  # used by `just lint-fix` and `just format`
     "daphne>=4.2.3",  # required by (django) channels.testing
 ]
 

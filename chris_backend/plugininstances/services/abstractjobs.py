@@ -1,12 +1,25 @@
 """
-Abstract job manager module that provides the base interface for submitting 
-and checking the execution status of jobs running in a remote compute 
+Abstract job manager module that provides the base interface for submitting
+and checking the execution status of jobs running in a remote compute
 environment (ChRIS / pfcon interface) as well as deleting them when finished.
+
+Several tasks can act on one plugin instance at once (overlapping status checks, a cancel
+from the API, a redelivered task). Thus the job classes never save an instance whole:
+every write of its status is a transition (``PluginInstance.transition``) from the
+statuses the writer expects, its other fields are written while it is in the status the
+writer expects (``update_if_status``) but for the retry counters, and the remote cleanup
+moves on only from the step it expects (``move_remote_cleanup``). Only the task that won
+a transition does what follows it (submit the next job, the remote cleanup's first one);
+a cancel that lost to another task's end makes sure the cleanup is scheduled. A task that
+alone moves the instance on from the status a transition wrote goes out through
+``publish_or_cancel``, which cancels the instance with CODE01 when it cannot be published.
 """
 
 import logging
 import io
 import abc
+import json
+import re
 
 from pfconclient import client as pfcon
 from pfconclient.client import JobType
@@ -18,20 +31,68 @@ from django.utils import timezone
 
 from core.storage import connect_storage
 from core.models import ChrisInstance
+from plugininstances.enums import ARM_REMOTE_CLEANUP, INACTIVE_STATUSES
 
 
 logger = logging.getLogger(__name__)
 
+# the name of an environment variable set in a job description or printed in a job's logs
+_VARIABLE = re.compile(r'(?<![A-Za-z0-9_])([A-Z0-9_]+)=')
+_VALUE = re.compile(r'\S*')
+
+
+def mask_tokens(text):
+    """
+    ``text`` without the value of any environment variable whose name has the word TOKEN
+    (``CHRIS_USER_TOKEN=...``), also one inside another's value, in one pass.
+    """
+    out, end = [], 0
+
+    for match in _VARIABLE.finditer(text):
+        if match.start() >= end and 'TOKEN' in match[1].split('_'):
+            out += [text[end:match.end()], '********']
+            end = _VALUE.match(text, match.end()).end()
+    return ''.join(out) + text[end:]
+
+
+class LogJson:
+    """
+    A job description or a pfcon response for a DEBUG log line: formatted as JSON only
+    when the line is emitted, without the value of an environment variable that holds a
+    token (CHRIS_USER_TOKEN gives the job its owner's API access) in any of its strings:
+    the description's environment, or the job's logs in a response.
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    def __str__(self):
+        return json.dumps(self._masked(self.data), default=str)
+
+    @classmethod
+    def _masked(cls, data):
+        if isinstance(data, str):
+            return mask_tokens(data)
+        if isinstance(data, dict):
+            return {key: cls._masked(value) for key, value in data.items()}
+        if isinstance(data, (list, tuple)):
+            return [cls._masked(value) for value in data]
+        return data
+
 
 class PluginInstanceJob(abc.ABC):
     """
-    ``PluginInstanceJob`` provides an interface for managing remote jobs related to a 
+    ``PluginInstanceJob`` provides an interface for managing remote jobs related to a
     plugin instance.
 
-    ``PluginInstanceJob`` methods implement helper functions for submitting and checking 
-    the status of jobs required during the full flow of running a plugin instance's app 
+    ``PluginInstanceJob`` methods implement helper functions for submitting and checking
+    the status of jobs required during the full flow of running a plugin instance's app
     on a remote compute environment.
     """
+
+    #: the status a plugin instance is in while this job runs; None for a job that runs
+    #: after the instance's terminal status
+    status = None
 
     def __init__(self, plugin_instance: ChrisInstance):
 
@@ -65,13 +126,152 @@ class PluginInstanceJob(abc.ABC):
         """
         ...
  
-    @abc.abstractmethod
-    def cancel_exec(self):
+    def cancel_exec(self, error_code='', source=None):
         """
-        Cancel the job's execution. It connects to the remote compute service
-        to cancel the job.
+        Cancel the plugin instance from the statuses ``source`` (any active one by
+        default; a status check gives the one it checked), with ``error_code`` when given,
+        and make sure its remote cleanup is scheduled: ``PluginInstance.cancel`` arms it
+        in the same UPDATE when the instance may have a job in the remote compute, and
+        logs the final status, and this then submits the cleanup's first job. An instance
+        that another writer has already ended only gets its cleanup scheduled, if nothing
+        did. Returns the ``StatusWrite``.
         """
-        ...
+        fields = {'error_code': error_code} if error_code else {}
+        ended = self.c_plugin_inst.cancel(source, job_id=self.str_job_id, **fields)
+
+        if ended:
+            if self.c_plugin_inst.remote_cleanup_status == 'deletingData':
+                self._submit_remote_cleanup()
+        elif ended.status in INACTIVE_STATUSES:
+            self.schedule_remote_cleanup()
+        return ended
+
+    def end(self, to, source, error_code='', **fields):
+        """
+        Move the plugin instance from the statuses ``source``, in which it has or may
+        have a job in the remote compute, to the terminal status ``to``, with
+        ``error_code`` when given and ``fields``, and its remote cleanup armed in the same
+        UPDATE; the winner then logs the final status and submits the cleanup's first
+        job. Returns the ``StatusWrite``.
+        """
+        if error_code:
+            fields['error_code'] = error_code
+
+        ended = self.c_plugin_inst.transition(to, source, **fields, **ARM_REMOTE_CLEANUP)
+
+        if ended:
+            self.log_final_status()
+            self._submit_remote_cleanup()
+        return ended
+
+    def log_final_status(self):
+        """
+        Log the terminal status, and the error code if any, that this job's write has
+        just given the plugin instance: the line that tells how the instance ended.
+        """
+        self.c_plugin_inst.log_final_status(self.str_job_id)
+
+    def is_runnable(self):
+        """
+        Whether the plugin instance is in the status this job runs in: a task for one that
+        another task has moved on, or cancelled, submits nothing.
+        """
+        if self.c_plugin_inst.status == self.status:
+            return True
+
+        logger.info(f'Not running {type(self).__name__} {self.str_job_id}: the plugin '
+                    f'instance is {self.c_plugin_inst.status}, not {self.status}')
+        return False
+
+    def submitted(self, to=None, **fields):
+        """
+        Record what a successful submission returned (``fields``), moving the plugin
+        instance to the status ``to`` when given, as long as it is still in this job's
+        status. When it is not and it was cancelled meanwhile, the job just submitted may
+        be the only one left in the remote, so its cleanup is scheduled again, also after it
+        completed; another status means another task got there first, and nothing is left
+        to do. Returns the ``StatusWrite``.
+        """
+        if to is None:
+            written = self.c_plugin_inst.update_if_status(self.status, **fields)
+        else:
+            written = self.c_plugin_inst.transition(to, self.status, **fields)
+
+        if not written and written.status == 'cancelled':
+            self.schedule_remote_cleanup(rearm=True)
+        return written
+
+    def enqueue_run(self, job_class_name, moved_to=None):
+        """
+        Have a task submit the job of the class named ``job_class_name`` for the plugin
+        instance: the status checks of the copy, plugin and upload jobs never submit one
+        themselves. ``moved_to`` is the status the caller has just moved the instance to,
+        where only that task moves it on: a task that cannot be published then cancels the
+        instance (publish_or_cancel). Without it, a publish that fails only raises: the
+        next status check submits a job again, as the periodic task does the remote
+        cleanup's. The delete job of the remote cleanup has a task of its own, on the
+        cleanup's queue, and its status check, on that queue too, submits it again itself
+        when the remote does not have it.
+        """
+        from plugininstances.tasks import (publish_or_cancel,
+                                           run_plugin_instance_cleanup_job,
+                                           run_plugin_instance_job)
+
+        if job_class_name == 'PluginInstanceDeleteJob':
+            run_plugin_instance_cleanup_job.delay(self.c_plugin_inst.id)
+        elif moved_to is None:
+            run_plugin_instance_job.delay(self.c_plugin_inst.id, job_class_name)
+        else:
+            publish_or_cancel(self.c_plugin_inst, moved_to, run_plugin_instance_job.delay,
+                              self.c_plugin_inst.id, job_class_name,
+                              job_id=self.str_job_id)
+
+    def enqueue_registration(self):
+        """
+        Have a task register the plugin instance's output files, on the queue of
+        registrations: a status check never registers them itself. The caller has just moved
+        the instance to 'registeringFiles', where only that task moves it on, so a task that
+        cannot be published cancels the instance (publish_or_cancel).
+        """
+        from plugininstances.tasks import publish_or_cancel, register_plugin_instance_output
+
+        publish_or_cancel(self.c_plugin_inst, 'registeringFiles',
+                          register_plugin_instance_output.delay, self.c_plugin_inst.id,
+                          job_id=self.str_job_id)
+        logger.info(f'Queued the registration of the output files of job {self.str_job_id}: '
+                    f'its task, on the register queue or the one it sends it on to, saves '
+                    f'the final status')
+
+    def submitted_elsewhere(self, job_type: JobType, kind: str,
+                            error: PfconRequestException) -> dict | None:
+        """
+        After a submission of the ``kind`` job (copy, plugin, upload, data delete) that
+        raised ``error``: the remote's status response for the job when another task (or
+        an earlier try of this one that timed out) submitted it, which is no failure (a
+        warning), or None, with the CODE01 error, when the remote has no such job.
+        """
+        job_id, pfcon_url = self.str_job_id, self.pfcon_client.url
+        d_resp = self.job_exists(job_type)
+
+        if d_resp is None:
+            logger.error(f'[CODE01,{job_id}]: Error submitting {kind} job to pfcon url '
+                         f'-->{pfcon_url}<--, detail: {str(error)}')
+        else:
+            logger.warning(f'Submitting {kind} job {job_id} to pfcon url -->{pfcon_url}<-- '
+                           f'failed ({str(error)}), but pfcon has the job: another task, '
+                           f'or an earlier try of this one, submitted it')
+        return d_resp
+
+    def job_exists(self, job_type: JobType) -> dict | None:
+        """
+        The remote's status response for this job, or None when it has none (or does not
+        answer): a submission that failed may still have created the job, as when two
+        tasks submitted it at once and the remote refused only the second container.
+        """
+        try:
+            return self._get_status(job_type, self.str_job_id)
+        except PfconRequestException:
+            return None
 
     @abc.abstractmethod
     def delete(self):
@@ -132,23 +332,23 @@ class PluginInstanceJob(abc.ABC):
                 d_jobStatusSummary['compute']['return']['job_logs'] = logs[-1800:]
         return d_jobStatusSummary
 
-    def schedule_remote_cleanup(self):
+    def schedule_remote_cleanup(self, rearm=False):
         """
         Schedule a remote cleanup operation to delete storeBase data and all containers
-        from the remote compute environment. This sets the remote_cleanup_status to
-        'deletingData' and schedules a PluginInstanceDeleteJob celery task.
+        from the remote compute environment, for a plugin instance in a terminal status
+        whose cleanup has not started (or, with ``rearm``, has ended: a job submitted after
+        it). Sets the remote_cleanup_status to 'deletingData' and submits the first
+        PluginInstanceDeleteJob. Returns whether this call scheduled it.
         """
-        from plugininstances.tasks import run_plugin_instance_job
+        if not self.c_plugin_inst.arm_remote_cleanup(rearm=rearm):
+            return False
 
-        job_id = self.str_job_id
-        logger.info(f'Scheduling remote cleanup for job {job_id}')
+        self._submit_remote_cleanup()
+        return True
 
-        self.c_plugin_inst.remote_cleanup_status = 'deletingData'
-        self.c_plugin_inst.remote_cleanup_retry_count = 0
-        self.c_plugin_inst.save(update_fields=['remote_cleanup_status',
-                                               'remote_cleanup_retry_count'])
-        run_plugin_instance_job.delay(self.c_plugin_inst.id,
-                                      'PluginInstanceDeleteJob')
+    def _submit_remote_cleanup(self):
+        logger.info(f'Scheduling remote cleanup for job {self.str_job_id}')
+        self.enqueue_run('PluginInstanceDeleteJob')
 
     def delete_all_remote_containers(self) -> bool:
         """
@@ -180,6 +380,12 @@ class PluginInstanceJob(abc.ABC):
                 all_succeeded = False
         return all_succeeded
     
+    #: what pfcon answers only once it has accepted a request's token (it checks the
+    #: token before any job endpoint and refuses a bad one with 401,
+    #: ``PfconRequestInvalidTokenException``): no such job, or one that must wait for
+    #: another of the instance. Refreshing the token cannot change those answers.
+    ANSWERS_AFTER_AUTH = (404, 409)
+
     def _refresh_compute_resource_auth_token(self):
         """
         Get a new auth token from a remote pfcon service and update the DB.
@@ -189,13 +395,16 @@ class PluginInstanceJob(abc.ABC):
                                             cr.compute_password)
         self.pfcon_client.set_auth_token(token)
         cr.compute_auth_token = token
-        cr.save()
+        cr.save(update_fields=['compute_auth_token'])
 
     def _submit(self, job_type: JobType, job_id: str, job_descriptors: dict, 
                 dfile: io.BytesIO | None = None, timeout: int = 200) -> dict:
         """
-        Submit job to a remote pfcon service.
+        Submit job to a remote pfcon service. The job's description and pfcon's response
+        are logged at DEBUG.
         """
+        logger.debug('Description of %s job %s: %s', job_type.value, job_id,
+                     LogJson(job_descriptors))
         try:
             d_resp = self.pfcon_client.submit_job(job_type, job_id, job_descriptors, 
                                                   dfile, timeout)
@@ -205,8 +414,8 @@ class PluginInstanceJob(abc.ABC):
             self._refresh_compute_resource_auth_token()
             d_resp = self.pfcon_client.submit_job(job_type, job_id, job_descriptors, 
                                                   dfile, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK
@@ -224,11 +433,13 @@ class PluginInstanceJob(abc.ABC):
                 self._refresh_compute_resource_auth_token()
                 d_resp = self.pfcon_client.submit_job(job_type, job_id, job_descriptors, 
                                                     dfile, timeout)
+        logger.debug('pfcon response to %s job %s: %s', job_type.value, job_id,
+                     LogJson(d_resp))
         return d_resp
 
     def _get_status(self, job_type: JobType, job_id: str, timeout: int = 100) -> dict:
         """
-        Get job status from a remote pfcon service.
+        Get job status from a remote pfcon service. pfcon's response is logged at DEBUG.
         """
         try:
             d_resp = self.pfcon_client.get_job_status(job_type, job_id, timeout)
@@ -237,8 +448,8 @@ class PluginInstanceJob(abc.ABC):
                         f'{job_id} from pfcon url -->{self.pfcon_client.url}<--')
             self._refresh_compute_resource_auth_token()
             d_resp = self.pfcon_client.get_job_status(job_type, job_id, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK
@@ -250,6 +461,8 @@ class PluginInstanceJob(abc.ABC):
                                 f'resubmitting job status request')
                 self._refresh_compute_resource_auth_token()
                 d_resp = self.pfcon_client.get_job_status(job_type, job_id, timeout)
+        logger.debug('pfcon status response for %s job %s: %s', job_type.value, job_id,
+                     LogJson(d_resp))
         return d_resp
 
     def _delete(self, job_type: JobType, job_id: str, timeout: int = 200):
@@ -263,8 +476,8 @@ class PluginInstanceJob(abc.ABC):
                         f'job {job_id} from pfcon url -->{self.pfcon_client.url}<--')
             self._refresh_compute_resource_auth_token()
             self.pfcon_client.delete_job(job_type, job_id, timeout)
-        except PfconRequestException:
-            if self.pfcon_client.requires_copy_job:
+        except PfconRequestException as e:
+            if self.pfcon_client.requires_copy_job or e.code in self.ANSWERS_AFTER_AUTH:
                 raise
             else:  # legacy behavior
                 # FIXME HACK (for legacy storage)

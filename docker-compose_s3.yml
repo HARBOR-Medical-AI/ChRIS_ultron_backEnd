@@ -21,6 +21,33 @@ services:
       s3-service:
         condition: service_started
 
+  worker-register:
+    environment:
+      STORAGE_ENV: "s3"
+      AWS_REQUEST_CHECKSUM_CALCULATION: "when_required"
+      AWS_RESPONSE_CHECKSUM_VALIDATION: "when_required"
+    depends_on:
+      s3-service:
+        condition: service_started
+
+  worker-heavy:
+    environment:
+      STORAGE_ENV: "s3"
+      AWS_REQUEST_CHECKSUM_CALCULATION: "when_required"
+      AWS_RESPONSE_CHECKSUM_VALIDATION: "when_required"
+    depends_on:
+      s3-service:
+        condition: service_started
+
+  worker-background:
+    environment:
+      STORAGE_ENV: "s3"
+      AWS_REQUEST_CHECKSUM_CALCULATION: "when_required"
+      AWS_RESPONSE_CHECKSUM_VALIDATION: "when_required"
+    depends_on:
+      s3-service:
+        condition: service_started
+
   worker-periodic:
     environment:
       STORAGE_ENV: "s3"

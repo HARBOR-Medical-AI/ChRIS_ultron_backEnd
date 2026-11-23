@@ -1,4 +1,6 @@
 
+from itertools import islice
+import os
 from pathlib import Path
 import shutil
 from typing import Union, List, Dict, AnyStr, Optional
@@ -23,11 +25,33 @@ class FilesystemManager(StorageManager):
     def create_container(self) -> None:
         self.__base.mkdir(exist_ok=True, parents=True)
 
-    def ls(self, path_prefix: str) -> List[str]:
+    def ls(self, path_prefix: str, limit: Optional[int] = None) -> List[str]:
         if self.obj_exists(path_prefix):
             return [path_prefix]
+        if limit is not None:
+            return list(islice(self.__files_under(self.__base / path_prefix), limit))
         all_paths = (self.__base / path_prefix).rglob('*')
         return [str(p.relative_to(self.__base)) for p in all_paths if p.is_file()]
+
+    def __files_under(self, top: Path):
+        """
+        The files under ``top`` that ``rglob`` finds (symbolic links to files, but not
+        the trees of links to directories), relative to the base, read lazily one
+        directory at a time: unlike ``rglob``, which reads each directory whole, it stops
+        reading once its caller has enough.
+        """
+        dirs = [top]
+        while dirs:
+            try:
+                entries = os.scandir(dirs.pop())
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            with entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs.append(entry.path)
+                    elif entry.is_file():
+                        yield str(Path(entry.path).relative_to(self.__base))
 
     def path_exists(self, path: str) -> bool:
         return (self.__base / path).exists()

@@ -20,6 +20,7 @@ from benchmarks.run_bench import (RUN_STATS_SETTLE_S, BenchmarkRunner, _filter_t
                                   build_workload_manifest, effective_poll_cadence,
                                   make_scenario_params, pin_mismatch_message,
                                   pin_mismatches, resolve_plugin)
+from benchmarks.broker import CELERY_QUEUES
 from benchmarks.stats_sampler import sampler_record
 
 
@@ -378,7 +379,7 @@ def _run_runner(monkeypatch, tmp_path, snapshots, sleeps):
     runner.tier = load_tier("smoke")
     runner.store = ResultsStore(tmp_path)
     runner.api = SimpleNamespace(auth_mode="token")
-    runner.broker = SimpleNamespace(available=True)
+    runner.broker = SimpleNamespace(available=True, queues=CELERY_QUEUES)
     runner.pg_stats = SimpleNamespace(available=False,
                                       unavailable_reason="psql: connection refused")
     runner.plugins = {}
@@ -550,7 +551,7 @@ def test_committed_pin_pins_every_workload_plugin():
     assert names <= set(load_pins().plugins)  # nosec B101 - pytest assertion
 
 
-def _connect(monkeypatch, tmp_path, registered, images=None):
+def _connect(monkeypatch, tmp_path, registered, images=None, missing=()):
     """
     A runner over fakes of everything __init__ connects to: ``registered`` (name ->
     get_plugin result; a missing name is a plugin CUBE does not have) as CUBE's workload
@@ -563,7 +564,9 @@ def _connect(monkeypatch, tmp_path, registered, images=None):
         return registered[name]
 
     docker = SimpleNamespace(available=images is not None,
-                             image_info=lambda ref: (images or {}).get(ref))
+                             image_info=lambda ref: (images or {}).get(ref),
+                             find_service=lambda service: (
+                                 None if service in missing else object()))
     monkeypatch.setattr(run_bench, "ChrisApi",
                         lambda *a, **k: SimpleNamespace(get_plugin=get_plugin))
     monkeypatch.setattr(run_bench, "wait_for_health", lambda api, timeout: True)
@@ -600,6 +603,21 @@ def test_runner_refuses_to_start_on_other_registrations(monkeypatch, tmp_path):
         _connect(monkeypatch, tmp_path, registered)
 
 
+def test_runner_refuses_to_start_without_a_worker_of_cube_s(monkeypatch, tmp_path):
+    registered = _pinned_by_name()
+    images = {p["dock_image"]: IMAGE for p in registered.values()}
+
+    with pytest.raises(RuntimeError, match="not running: worker-heavy, worker-background"):
+        _connect(monkeypatch, tmp_path, registered, images,
+                 missing=("worker-heavy", "worker-background"))
+
+
+def test_missing_services_says_none_when_docker_cannot_tell():
+    docker = SimpleNamespace(available=False, find_service=None)
+
+    assert run_bench.missing_services(docker, ("chris",)) == []  # nosec B101 - pytest assertion
+
+
 def test_runner_refuses_to_start_when_a_pinned_image_is_absent(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="is not present"):
         _connect(monkeypatch, tmp_path, _pinned_by_name(), images={})
@@ -623,7 +641,8 @@ def test_run_records_how_it_samples(monkeypatch, tmp_path):
     env = _run_runner(monkeypatch, tmp_path, [{}, {}], []).run()["environment"]
 
     assert env["sampler"] == sampler_record(  # nosec B101 - pytest assertion
-        run_bench.STATS_INTERVAL_S, run_bench.QUEUE_INTERVAL_S, run_bench.SAMPLER_WORKERS)
+        run_bench.STATS_INTERVAL_S, run_bench.QUEUE_INTERVAL_S, run_bench.SAMPLER_WORKERS,
+        queues=CELERY_QUEUES)
     assert env["attribution"]["resource_sampling"] is True  # nosec B101 - pytest assertion
 
 

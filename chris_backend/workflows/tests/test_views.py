@@ -8,9 +8,11 @@ from django.contrib.auth.models import Group, User
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework import status
+from kombu.exceptions import OperationalError
 
 from core.tests.query_counts import QueryCountAssertionsMixin
 from pipelines.models import Pipeline, PluginPiping, DEFAULT_PIPING_PARAMETER_MODELS
+from plugininstances import tasks
 from plugininstances.models import PluginInstance
 from plugins.models import ComputeResource
 from plugins.models import PluginMeta, Plugin
@@ -161,7 +163,7 @@ class WorkflowListViewTests(ViewTests):
                                             "compute_resource_name": "host"}])}]}})
 
         plg_instances_count = PluginInstance.objects.count()
-        with mock.patch('plugininstances.utils.run_plugin_instance_job') as run_job_mock:
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job'):
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(self.create_read_url, data=post,
                                         content_type=self.content_type)
@@ -202,7 +204,7 @@ class WorkflowListViewTests(ViewTests):
                                          "title": "Inst_ts",
                                          "compute_resource_name": "host"}])}]}})
 
-        with mock.patch('plugininstances.utils.run_plugin_instance_job'):
+        with mock.patch('plugininstances.tasks.run_plugin_instance_job'):
             self.client.login(username=self.username, password=self.password)
             response = self.client.post(self.create_read_url, data=post,
                                         content_type=self.content_type)
@@ -285,6 +287,7 @@ class WorkflowDetailViewTests(ViewTests):
         owner = User.objects.get(username=self.username)
         (workflow, tf) = Workflow.objects.get_or_create(
             title='Workflow2', pipeline=pipeline, owner=owner)
+        self.workflow = workflow
         self.read_update_delete_url = reverse("workflow-detail",
                                               kwargs={"pk": workflow.id})
 
@@ -328,6 +331,28 @@ class WorkflowDetailViewTests(ViewTests):
         response = self.client.delete(self.read_update_delete_url)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(Workflow.objects.count(), 0)
+
+    def test_workflow_delete_cancels_its_instances_and_arms_their_remote_cleanup(self):
+        owner = User.objects.get(username=self.username)
+        plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
+        instances = {}
+        for status_ in ('started', 'finishedSuccessfully'):
+            inst = PluginInstance.objects.create(
+                plugin=plugin, owner=owner, workflow=self.workflow, title=status_,
+                compute_resource=self.compute_resource)
+            PluginInstance.objects.filter(pk=inst.pk).update(status=status_)
+            instances[status_] = inst.pk
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.delete(self.read_update_delete_url)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        rows = dict((pk, (s, c)) for pk, s, c in PluginInstance.objects.filter(
+            pk__in=instances.values()).values_list('pk', 'status', 'remote_cleanup_status'))
+        # the one that had a job in the remote gets its cleanup armed in the same UPDATE
+        self.assertEqual(rows, {instances['started']: ('cancelled', 'deletingData'),
+                                instances['finishedSuccessfully']: ('cancelled',
+                                                                    'notStarted')})
 
     def test_workflow_delete_failure_unauthenticated(self):
         response = self.client.delete(self.read_update_delete_url)
@@ -575,3 +600,30 @@ class WorkflowListPerformCreateHelperTests(ViewTests):
         with mock.patch('workflows.views.run_if_ready') as run_mock:
             self.view._dispatch_runs(plugin_instances_dict)
         self.assertEqual(run_mock.call_count, len(plugin_instances_dict))
+
+    def test__dispatch_runs_cancels_what_is_left_when_a_run_cannot_be_published(self):
+        nodes = self._make_canonical_nodes()
+        tree, root_id, inst_data = WorkflowList._build_inst_templates(
+            self.pipeline, nodes)
+        plugin_instances_dict = self.view._create_plugin_instance_tree(
+            tree, root_id, inst_data, self.previous_plugin_inst, self.workflow)
+
+        with mock.patch.object(tasks.run_plugin_instance_job, 'delay',
+                               side_effect=OperationalError('broker gone')), \
+                self.assertLogs('plugininstances.tasks', 'ERROR') as logs, \
+                self.assertRaises(tasks.PublishError):
+            self.view._dispatch_runs(plugin_instances_dict)
+
+        # the root, whose run task went nowhere, says why; nothing stays in 'created'
+        ended = {inst.pk: (inst.status, inst.error_code)
+                 for inst in PluginInstance.objects.filter(workflow=self.workflow)}
+        root = plugin_instances_dict[root_id]
+        self.assertEqual(ended.pop(root.pk), ('cancelled', 'CODE01'))
+        self.assertTrue(ended)
+        self.assertEqual(set(ended.values()), {('cancelled', '')})
+        self.assertIn('[CODE01,', logs.output[0])
+        # the ts instance's parents were rewritten before any run: it names instances
+        ts_inst = plugin_instances_dict[self.pips[2].id]
+        param = ts_inst.string_param.filter(plugin_param__name='plugininstances').first()
+        self.assertEqual(param.value, f"{plugin_instances_dict[self.pips[0].id].id},"
+                                      f"{plugin_instances_dict[self.pips[1].id].id}")

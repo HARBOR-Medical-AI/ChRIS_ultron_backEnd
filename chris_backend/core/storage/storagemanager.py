@@ -22,9 +22,11 @@ class StorageManager(abc.ABC):
         """
         ...
 
-    def ls(self, path_prefix: str) -> List[str]:
+    def ls(self, path_prefix: str, limit: Optional[int] = None) -> List[str]:
         """
-        :returns: a list of all files under a given path prefix.
+        :returns: a list of all files under a given path prefix, or of ``limit`` of them
+                  at most (1 or more, in no given order): the listing stops there, however
+                  many there are.
         """
         ...
 

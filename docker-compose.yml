@@ -82,9 +82,57 @@ services:
       retries: 5
       start_period: 60s
 
+  # The Celery queues (core/celery.py) mapped onto five workers: short tasks, the
+  # registrations of few files, long tasks, background tasks and the beat's. The names of
+  # the queues are the contract; how many workers consume them is the deployment's choice.
+  # docker-compose_swift.yml, docker-compose_s3.yml, docker-compose.benchmark.yml, the
+  # justfile's bench-start and the benchmark harness (run_bench.py) name these services.
+  # benchmarks/broker.py names the queues.
   worker-mains:
     image: ${CUBE_IMAGE:-localhost/fnndsc/cube:dev}
-    command: celery -A core worker -c 4 -l info -Q main1,main2
+    command: celery -A core worker -c 4 -l info -Q submit,status
+    volumes: *CHRIS_VOLUMES
+    environment: *CHRIS_ENV
+    user: ${UID}:${GID}
+    profiles:
+      - cube
+    depends_on: *CHRIS_DEPENDS
+    networks:
+      - local
+
+  # Every registration starts on worker-register, which registers one of at most
+  # CUBE_CELERY_REGISTER_FAST_MAX_FILES files (100) itself and sends any other on to
+  # worker-heavy, so that registrations of many files never hold the slots of those of few
+  # (and one that reaches the 5-minute soft time limit of 'register' too).
+  # Registrations and deletions can take minutes to hours: --disable-prefetch so that a
+  # slot never holds a second task behind its running one. A registration is acknowledged
+  # once it ends. Therefore both workers stop with a cold shutdown after a short wait
+  # (REMAP_SIGTERM, CUBE_CELERY_SOFT_SHUTDOWN_TIMEOUT), which gives the broker its running
+  # registrations back at once (a running deletion, acknowledged when it started, is lost,
+  # as before); stop_grace_period leaves it the time.
+  worker-register: &REGISTER_WORKER
+    image: ${CUBE_IMAGE:-localhost/fnndsc/cube:dev}
+    command: celery -A core worker -c 2 -l info -Q register --disable-prefetch
+    volumes: *CHRIS_VOLUMES
+    environment:
+      <<: *CHRIS_ENV
+      REMAP_SIGTERM: SIGQUIT
+      CUBE_CELERY_SOFT_SHUTDOWN_TIMEOUT: "10"
+    stop_grace_period: 30s
+    user: ${UID}:${GID}
+    profiles:
+      - cube
+    depends_on: *CHRIS_DEPENDS
+    networks:
+      - local
+
+  worker-heavy:
+    <<: *REGISTER_WORKER
+    command: celery -A core worker -c 4 -l info -Q register_large,delete --disable-prefetch
+
+  worker-background:
+    image: ${CUBE_IMAGE:-localhost/fnndsc/cube:dev}
+    command: celery -A core worker -c 2 -l info -Q cleanup,pacs --disable-prefetch
     volumes: *CHRIS_VOLUMES
     environment: *CHRIS_ENV
     user: ${UID}:${GID}
@@ -327,6 +375,9 @@ services:
       # https://chrisproject.org/docs/oxidicom/deployment#environment-variables
       OXIDICOM_FILES_ROOT: /data
       OXIDICOM_CELERY_BROKER: redis://chris-broker:6379/0
+      # the queue of pacsfiles.tasks.register_pacs_series in core/celery.py (oxidicom's
+      # default is main2 which nothing consumes)
+      OXIDICOM_QUEUE_NAME: pacs
       OXIDICOM_NATS_ADDRESS: nats:4222
       OXIDICOM_SCP_AET: ChRIS
       OXIDICOM_SCP_PROMISCUOUS: "true"

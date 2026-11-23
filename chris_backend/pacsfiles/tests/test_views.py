@@ -13,7 +13,6 @@ from rest_framework import status
 
 from celery.contrib.testing.worker import start_worker
 from core.celery import app as celery_app
-from core.celery import task_routes
 
 from core.models import ChrisFolder
 from core.storage import connect_storage
@@ -104,9 +103,8 @@ class PACSTasksViewTests(TransactionTestCase):
     def setUpClass(cls):
         logging.disable(logging.WARNING)
         super().setUpClass()
-        # route tasks to this worker by using the default 'celery' queue
-        # that is exclusively used for the automated tests
-        celery_app.conf.update(task_routes=None)
+        # the test runner routes every task to the default 'celery' queue that only
+        # the tests use (core/testrunner.py)
         cls.celery_worker = start_worker(celery_app,
                                          concurrency=1,
                                          perform_ping_check=False)
@@ -116,8 +114,6 @@ class PACSTasksViewTests(TransactionTestCase):
     def tearDownClass(cls):
         super().tearDownClass()
         cls.celery_worker.__exit__(None, None, None)
-        # reset routes to the original queues
-        celery_app.conf.update(task_routes=task_routes)
         logging.disable(logging.NOTSET)
 
     def setUp(self):

@@ -1,6 +1,5 @@
 
 import logging
-from functools import wraps
 from datetime import timedelta
 
 from django.db.models import Q
@@ -8,9 +7,14 @@ from django.utils import timezone
 from django.conf import settings
 
 from celery import shared_task
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.signals import task_failure
 
-from .models import PluginInstance, INACTIVE_STATUSES
+from core.celery import CLEANUP, REGISTER_FAST_MAX_FILES, REGISTER_LARGE, time_limits
+from core.models import ChrisInstance
+from core.tasks import DedupedTask, single_instance
+
+from .models import PluginInstance
 from .services.pluginjobs import PluginInstanceAppJob
 from .services.copyjobs import PluginInstanceCopyJob
 from .services.uploadjobs import PluginInstanceUploadJob
@@ -20,37 +24,65 @@ from .services.deletejobs import PluginInstanceDeleteJob
 logger = logging.getLogger(__name__)
 
 
+# the remote cleanup's delete job has tasks of its own (run_plugin_instance_cleanup_job)
 JOB_CLASSES = {
     'PluginInstanceAppJob': PluginInstanceAppJob,
     'PluginInstanceCopyJob': PluginInstanceCopyJob,
     'PluginInstanceUploadJob': PluginInstanceUploadJob,
-    'PluginInstanceDeleteJob': PluginInstanceDeleteJob,
 }
 
 
-def skip_if_running(f):
+# the job class whose status check a plugin instance's status calls for
+CHECKED_JOB_CLASSES = {
+    'copying': 'PluginInstanceCopyJob',
+    'started': 'PluginInstanceAppJob',
+    'uploading': 'PluginInstanceUploadJob',
+}
+
+# how many times a registration that reached its soft time limit runs again
+REGISTRATION_RETRIES = 2
+
+#: how long a deletion of an instance's remote containers holds the instance's lock at
+#: most: the hard time limit of the cleanup's tasks, which ends a run sooner
+CONTAINER_DELETION_LOCK_TTL = time_limits(CLEANUP)[1]
+
+
+class PublishError(Exception):
     """
-    This decorator is supposed to ensure that a task is only running once across all
-    workers.
-    https://stackoverflow.com/questions/20894771/celery-beat-limit-to-single-task-instance-at-a-time
+    A task that had to go out could not be published (the broker does not answer), so the
+    work it was for was given up.
     """
-    task_name = f'{f.__module__}.{f.__name__}'
-    @wraps(f)
-    def wrapped(self, *args, **kwargs):
-        workers = self.app.control.inspect().active()
-        if workers is None:
-            logger.info('could not find worker for task %s (%s, %s), skipping',
-                        task_name, args, kwargs)
+
+
+def publish_or_cancel(plg_inst, status, publish, *args, job_id=None, **kwargs):
+    """
+    Publish a task for ``plg_inst`` by calling ``publish`` (the task's ``delay`` or
+    ``apply_async``) with ``args`` and ``kwargs``. The caller has just moved the instance
+    to ``status``, where only that task moves it on. When the task cannot be published
+    (the broker refused it through Celery's publish retries, or the soft time limit cut a
+    publish to a broker that hangs), nothing ever would: the instance is cancelled from
+    ``status`` with CODE01, its remote cleanup armed in the same UPDATE for the periodic
+    task to submit, and PublishError raised. A task the broker stored after all finds the
+    instance cancelled and does nothing; one that ran first has moved the instance on, so
+    the cancel loses and the publish counts as made (a WARNING, None returned).
+    ``job_id`` names its jobs in the log, read from the ``ChrisInstance`` when not given.
+    """
+    try:
+        return publish(*args, **kwargs)
+    except Exception as e:
+        job_id = job_id or ChrisInstance.load().job_id_prefix + str(plg_inst.id)
+        cancelled = plg_inst.cancel(status, job_id=job_id, error_code='CODE01')
+
+        if not cancelled and cancelled.status not in (None, 'cancelled'):
+            logger.warning(f'Publishing the task that moves the plugin instance of job '
+                           f'{job_id} on from {status} failed ({e!r}), but the task went '
+                           f'out: the instance is {cancelled.status} already')
             return None
-        for worker, tasks in workers.items():
-            for task in tasks:
-                if (task_name == task['name'] and tuple(args) == tuple(task['args']) and
-                        kwargs == task['kwargs'] and self.request.id != task['id']):
-                    logger.info('task %s (%s, %s) is running on %s, skipping',
-                                task_name, args, kwargs, worker)
-                    return None
-        return f(self, *args, **kwargs)
-    return wrapped
+
+        logger.error(f'[CODE01,{job_id}]: Error publishing the task that moves the plugin '
+                     f'instance on from {status}, detail: {e!r}')
+        raise PublishError(f'plugin instance {plg_inst.id} was cancelled: the task that '
+                           f'moves it on from {status} was not published') from e
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3})
@@ -87,7 +119,7 @@ def run_plugin_instance_job(plg_inst_id, job_class_name):
         plg_inst_job.run()
 
 
-@shared_task
+@shared_task(base=DedupedTask, dedupe_args=1)
 def check_plugin_instance_job_exec_status(plg_inst_id, job_class_name):
     """
     Check the execution status of a job for this plugin instance.
@@ -103,11 +135,22 @@ def check_plugin_instance_job_exec_status(plg_inst_id, job_class_name):
         plg_inst_job.check_exec_status()
 
 
-@shared_task
-def cancel_plugin_instance_job(plg_inst_id, job_class_name=None):
+#: how many times a cancel that failed (the database or the storage gone, say) tries again,
+#: after a random wait of up to one, two, then four seconds (Celery's backoff, jittered)
+CANCEL_RETRIES = 3
+
+
+@shared_task(autoretry_for=(Exception,), max_retries=CANCEL_RETRIES, retry_backoff=True)
+def cancel_plugin_instance_job(plg_inst_id, job_class_name=None, error_code='',
+                               source=None):
     """
-    Cancel the execution of the job corresponding to this plugin instance.
-    If job_class_name is not provided, it is auto-detected from the instance status.
+    Cancel the execution of the job corresponding to this plugin instance, from the
+    statuses ``source`` (any active one by default), with ``error_code`` when given, and
+    make sure its remote cleanup is scheduled.
+    If job_class_name is not provided it is auto-detected from the instance status.
+    A failure is tried again a few times, apart, and then left: the sweeps cancel an
+    instance still stuck in 'scheduled' or 'registeringFiles' later, while one in another
+    status stays as it is (HARBOR-planning #158).
     """
     try:
         plugin_inst = PluginInstance.objects.get(pk=plg_inst_id)
@@ -119,7 +162,7 @@ def cancel_plugin_instance_job(plg_inst_id, job_class_name=None):
             job_class_name = _detect_job_class_name(plugin_inst)
         job_class = JOB_CLASSES[job_class_name]
         plg_inst_job = job_class(plugin_inst)
-        plg_inst_job.cancel_exec()
+        plg_inst_job.cancel_exec(error_code, source)
 
 
 def _detect_job_class_name(plugin_inst):
@@ -139,75 +182,277 @@ def _detect_job_class_name(plugin_inst):
 
 
 @shared_task
-def delete_plugin_instance_containers_from_remote(plg_inst_id):
+def register_plugin_instance_output(plg_inst_id):
     """
-    Delete all remote containers for a plugin instance's job from the remote compute
-    environment. Updates cleanup status accordingly.
+    Register the output files of a plugin instance in 'registeringFiles', the status a
+    status check moved it to when its job ended, and end it (see
+    PluginInstanceAppJob.register_output), when they are REGISTER_FAST_MAX_FILES at most.
+    Any other registration goes on to register_large_plugin_instance_output, on a queue of
+    its own, so that registrations of many files never hold every slot of the worker of
+    this one's queue; so does one that reaches this queue's short soft time limit, as its
+    next attempt.
+
+    The messages of both are acknowledged once the task ends and run again when its worker
+    dies, so a delivery that a newer one overtook writes nothing. On the soft time limit of
+    register_large_plugin_instance_output a registration leaves the instance in
+    'registeringFiles' and runs again, until it has had REGISTRATION_RETRIES + 1 attempts
+    in all, then cancels it with CODE13.
+    """
+    job = _registration_job(plg_inst_id)
+    if job is None:
+        return
+
+    reason = _reason_to_send_on(job)
+    if reason:
+        publish_or_cancel(job.c_plugin_inst, 'registeringFiles',
+                          register_large_plugin_instance_output.delay, plg_inst_id,
+                          job_id=job.str_job_id)
+        logger.info(f'Sent the registration of the output files of job {job.str_job_id} '
+                    f'on to the {REGISTER_LARGE} queue: {reason}')
+        return
+    _register_output(register_plugin_instance_output, job,
+                     again=register_large_plugin_instance_output)
+
+
+@shared_task
+def register_large_plugin_instance_output(plg_inst_id):
+    """
+    Register the output files of a plugin instance as register_plugin_instance_output
+    does, for the registrations it sends on.
+    """
+    job = _registration_job(plg_inst_id)
+    if job is not None:
+        _register_output(register_large_plugin_instance_output, job)
+
+
+def _registration_job(plg_inst_id):
+    """
+    The app job of the plugin instance with id ``plg_inst_id``, or None when the instance
+    is gone or no longer registering files.
     """
     try:
         plugin_inst = PluginInstance.objects.get(pk=plg_inst_id)
     except PluginInstance.DoesNotExist:
-        logger.error(f"Plugin instance with id {plg_inst_id} not found when running "
-                     f"delete_plugin_instance_containers_from_remote task.")
+        # deleted (with its feed, say) while the task waited: nothing to register
+        logger.info(f'Plugin instance with id {plg_inst_id} not found when registering '
+                    f'its output files')
+        return None
+
+    if plugin_inst.status != 'registeringFiles':
+        return None  # registered and ended already, or cancelled
+    return PluginInstanceAppJob(plugin_inst)
+
+
+def _reason_to_send_on(job):
+    """
+    Why ``job``'s registration is not one for the register queue, or None when it is: it
+    registers REGISTER_FAST_MAX_FILES files at most
+    (PluginInstanceAppJob.registers_at_most).
+    A count that fails, even by the soft time limit, sends it on: the registration that
+    the other queue runs then reports what fails.
+    """
+    try:
+        if job.registers_at_most(REGISTER_FAST_MAX_FILES):
+            return None
+    except Exception:  # SoftTimeLimitExceeded included
+        logger.warning(f'Could not count the output files of job {job.str_job_id}',
+                       exc_info=True)
+        return 'its files could not be counted'
+
+    if not job.pfcon_client.pfcon_innetwork:
+        return 'the remote sends its output as a zip'
+    return (f'more than {REGISTER_FAST_MAX_FILES} files, or a link file among the objects '
+            f'of an input of a ts plugin')
+
+
+def _register_output(task, job, again=None):
+    """
+    Run ``job``'s registration in ``task``, and when it ends the instance
+    'finishedSuccessfully', schedule the ready waiting instances of its feed
+    (_schedule_followers). On its soft time limit run it again at once, as a message of
+    ``again`` when given (another task, which takes it as its next attempt), else of
+    ``task`` itself; once it has had REGISTRATION_RETRIES + 1 attempts, cancel the
+    instance with CODE13 instead. A run that a newer one or a cancel has overtaken does
+    neither.
+    """
+    try:
+        job.register_output()
+    except SoftTimeLimitExceeded:
+        attempt = task.request.retries
+        logger.error(f'Registration of the output files of plugin instance '
+                     f'{job.c_plugin_inst.id} reached its time limit '
+                     f'(attempt {attempt + 1})')
+
+        if job.registration_overtaken():
+            return  # a newer run, or a cancel, has it: this one tries nothing again
+        if attempt >= REGISTRATION_RETRIES:
+            job.give_up_registration('CODE13')
+        else:
+            # a message of its own rather than Task.retry, which turns a publish that
+            # fails into a Reject that no failure handler sees; and at once: a message
+            # with a countdown waits in its worker's memory outside the reserved tasks
+            # that --disable-prefetch counts, so that worker would take another task
+            # meanwhile and the next attempt would wait behind it
+            next_task = again if again is not None else task
+            publish_or_cancel(job.c_plugin_inst, 'registeringFiles', next_task.apply_async,
+                              (job.c_plugin_inst.id,), job_id=job.str_job_id,
+                              retries=attempt + 1)
+    else:
+        # the object's status is the final one only when this run's final write won
+        if job.c_plugin_inst.status == 'finishedSuccessfully':
+            _schedule_followers(job.c_plugin_inst)
+
+
+def _schedule_followers(plugin_inst):
+    """
+    Schedule at once the waiting instances of the feed of ``plugin_inst``, which just
+    finished successfully, that are ready now, rather than at the next pass of the beat's
+    schedule_waiting_plugin_instances, which a failure here leaves those still waiting to.
+    """
+    try:
+        schedule_ready_plugin_instances(feed_id=plugin_inst.feed_id)
+    except Exception:  # SoftTimeLimitExceeded included
+        logger.exception(f'Could not schedule the ready plugin instances of the feed of '
+                         f'plugin instance {plugin_inst.id}: the beat schedules those '
+                         f'still waiting')
+
+
+@shared_task
+def run_plugin_instance_cleanup_job(plg_inst_id):
+    """
+    Submit the data delete job of a plugin instance's remote cleanup.
+    """
+    plugin_inst = _cleanup_instance(plg_inst_id)
+    if plugin_inst is not None:
+        PluginInstanceDeleteJob(plugin_inst).run()
+
+
+@shared_task(base=DedupedTask)
+def check_plugin_instance_cleanup_job(plg_inst_id):
+    """
+    Check the data delete job of a plugin instance's remote cleanup, and submit it again
+    when it is not there.
+    """
+    plugin_inst = _cleanup_instance(plg_inst_id)
+    if plugin_inst is not None:
+        PluginInstanceDeleteJob(plugin_inst).check_exec_status()
+
+
+def _cleanup_instance(plg_inst_id):
+    try:
+        return PluginInstance.objects.get(pk=plg_inst_id)
+    except PluginInstance.DoesNotExist:
+        # deleted (with its feed, say) while the task waited: nothing to clean up
+        logger.info(f"Plugin instance with id {plg_inst_id} not found when running its "
+                    f"remote cleanup.")
+        return None
+
+
+@shared_task(base=DedupedTask)
+@single_instance(CONTAINER_DELETION_LOCK_TTL, key_args=1)
+def delete_plugin_instance_containers_from_remote(plg_inst_id):
+    """
+    Delete all remote containers for a plugin instance's job from the remote compute
+    environment. Updates cleanup status accordingly. One run per instance at a time: a
+    run can outlast the pending marker that keeps the periodic task from publishing
+    another one, and two would count each failure twice.
+    """
+    try:
+        plugin_inst = PluginInstance.objects.get(pk=plg_inst_id)
+    except PluginInstance.DoesNotExist:
+        logger.info(f"Plugin instance with id {plg_inst_id} not found when running "
+                    f"delete_plugin_instance_containers_from_remote task.")
         return
+
+    if plugin_inst.remote_cleanup_status != 'deletingContainers':
+        return  # another task has moved it on
 
     job = PluginInstanceDeleteJob(plugin_inst)
     if job.delete_all_remote_containers():
-        plugin_inst.remote_cleanup_status = 'complete'
+        job.complete('complete')
+    elif (plugin_inst.increment('remote_cleanup_retry_count') >
+          PluginInstance.MAX_REMOTE_CLEANUP_RETRIES):
+        job.complete('failed')
+
+
+@shared_task
+@single_instance(60)
+def schedule_waiting_plugin_instances():
+    """
+    Schedule the jobs of every plugin instance in 'waiting' whose parents all finished
+    successfully (schedule_ready_plugin_instances): those a registration that ended did
+    not schedule already.
+    """
+    schedule_ready_plugin_instances()
+
+
+def schedule_ready_plugin_instances(feed_id=None):
+    """
+    Schedule the jobs corresponding to the plugin instances in 'waiting' DB status, those
+    of the feed with id ``feed_id`` when given, whose previous plugin instance is in
+    'finishedSuccessfully' DB status. However, if the plugin instance is of type 'ts' all
+    the ancestor plugin instances with id in the list given by the plugininstances
+    parameter must also be in 'finishedSuccessfully' DB status. Each moves from 'waiting'
+    once, whoever else schedules it meanwhile (schedule_plugin_instance), and one that
+    cannot be scheduled (its compute resource deleted, say) is logged and stops no other;
+    a run task that cannot be published ends the pass (PublishError), which leaves the
+    others waiting for the next.
+    """
+    instances = PluginInstance.objects.filter(status='waiting',
+                                              previous__status='finishedSuccessfully')
+    if feed_id is not None:
+        instances = instances.filter(feed_id=feed_id)
+
+    for plg_inst in instances.select_related('plugin__meta', 'compute_resource'):
+        try:
+            if _ts_parents_finished(plg_inst):
+                schedule_plugin_instance(plg_inst, 'waiting')
+        except (SoftTimeLimitExceeded, PublishError):
+            raise  # with the broker gone the next ones would end the same: the pass ends
+        except Exception:
+            logger.exception(f'Could not schedule plugin instance {plg_inst.id}')
+
+
+def _ts_parents_finished(plg_inst):
+    """
+    Whether every instance of the 'plugininstances' parameter of ``plg_inst`` finished
+    successfully, when it is a 'ts' instance with that parameter (always true otherwise).
+    """
+    if plg_inst.plugin.meta.type != 'ts':
+        return True
+
+    param = plg_inst.string_param.filter(plugin_param__name='plugininstances').first()
+    if not (param and param.value):
+        return True
+
+    parent_ids = [int(parent_id) for parent_id in param.value.split(',')]
+    parents = PluginInstance.objects.filter(pk__in=parent_ids)
+    return all(parent.status == 'finishedSuccessfully' for parent in parents)
+
+
+def schedule_plugin_instance(plg_inst, source):
+    """
+    Move a plugin instance from the status ``source`` to the first status of its run on
+    its compute resource ('copying' when the resource needs a copy job, 'scheduled'
+    otherwise), from when its job's timeout counts, and, when this call moved it, have a
+    task submit that job. Returns the ``StatusWrite``.
+
+    When that task cannot be published nothing would ever submit the job, so the instance
+    is cancelled with CODE01 and PublishError raised (publish_or_cancel).
+    """
+    if plg_inst.compute_resource.compute_requires_copy_job:
+        to, job_class_name = 'copying', 'PluginInstanceCopyJob'
     else:
-        plugin_inst.remote_cleanup_retry_count += 1
-        if plugin_inst.remote_cleanup_retry_count > PluginInstance.MAX_REMOTE_CLEANUP_RETRIES:
-            plugin_inst.remote_cleanup_status = 'failed'
+        to, job_class_name = 'scheduled', 'PluginInstanceAppJob'
 
-    plugin_inst.save(update_fields=['remote_cleanup_status',
-                                     'remote_cleanup_retry_count'])
+    now = timezone.now()  # the scheduling date
+    moved = plg_inst.transition(to, source, start_date=now, end_date=now)
 
+    if moved:
+        publish_or_cancel(plg_inst, to, run_plugin_instance_job.delay, plg_inst.id,
+                          job_class_name)
+    return moved
 
-@shared_task(bind=True)
-@skip_if_running
-def schedule_waiting_plugin_instances(self):  # task is passed info about itself
-    """
-    Schedule the jobs corresponding to all plugin instances in 'waiting' DB status
-    and whose previous plugin instance is in 'finishedSuccessfully' DB status.
-    However, if the plugin instance is of type 'ts' all the ancestor plugin instances
-    with id in the list given by the plugininstances parameter must also be in
-    'finishedSuccessfully' DB status.
-    """
-    all_instances = PluginInstance.objects.filter(status='waiting',
-                                                  previous__status='finishedSuccessfully')
-    ts_instances = all_instances.filter(plugin__meta__type='ts')
-
-    for plg_inst in ts_instances:
-        param = plg_inst.string_param.filter(plugin_param__name='plugininstances').first()
-
-        if param and param.value:
-            parent_ids = [int(parent_id) for parent_id in param.value.split(',')]
-            parents = PluginInstance.objects.filter(pk__in=parent_ids)
-            finished = [parent.status == 'finishedSuccessfully' for parent in parents]
-
-            if all(finished):
-                _schedule_plugin_instance(plg_inst)
-        else:
-            _schedule_plugin_instance(plg_inst)
-
-    for plg_inst in all_instances.difference(ts_instances):
-        _schedule_plugin_instance(plg_inst)
-
-
-def _schedule_plugin_instance(plg_inst):
-    """
-    Schedule the appropriate job for a waiting plugin instance based on its compute
-    resource configuration.
-    """
-    cr = plg_inst.compute_resource
-
-    if cr.compute_requires_copy_job:
-        plg_inst.set_status('copying')
-        run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceCopyJob')
-    else:
-        plg_inst.set_status('scheduled')
-        run_plugin_instance_job.delay(plg_inst.id, 'PluginInstanceAppJob')
-        
 
 @shared_task
 def check_running_plugin_instances_exec_status():
@@ -222,18 +467,13 @@ def check_running_plugin_instances_exec_status():
     if settings.STORAGE_ENV not in ('filesystem', 'zipfile', 'fslink'):
         lookup = lookup | Q(status='uploading')
     
-    instances = PluginInstance.objects.filter(lookup)
-
-    for plg_inst in instances:
-        if plg_inst.status == 'copying':
-            check_plugin_instance_job_exec_status.delay(plg_inst.id, 
-                                                        'PluginInstanceCopyJob')  # call async task
-        elif plg_inst.status == 'started':
-            check_plugin_instance_job_exec_status.delay(plg_inst.id, 
-                                                        'PluginInstanceAppJob')
-        elif plg_inst.status == 'uploading':
-            check_plugin_instance_job_exec_status.delay(plg_inst.id, 
-                                                        'PluginInstanceUploadJob')
+    # one pending check per instance at most; in random order, so that when the workers
+    # fall behind the instances they get to are not always the same
+    instances = PluginInstance.objects.filter(lookup).order_by('?').values_list('id',
+                                                                               'status')
+    for plg_inst_id, status in instances:
+        check_plugin_instance_job_exec_status.enqueue_once(plg_inst_id,
+                                                           CHECKED_JOB_CLASSES[status])
 
 
 @shared_task
@@ -243,16 +483,16 @@ def handle_remote_cleanup():
     deletion from the remote compute environment.
     """
     # instances needing data deletion status check
-    deleting_data = PluginInstance.objects.filter(remote_cleanup_status='deletingData')
-    for plg_inst in deleting_data:
-        check_plugin_instance_job_exec_status.delay(plg_inst.id,
-                                                     'PluginInstanceDeleteJob')
+    deleting_data = PluginInstance.objects.filter(
+        remote_cleanup_status='deletingData').values_list('id', flat=True)
+    for plg_inst_id in deleting_data:
+        check_plugin_instance_cleanup_job.enqueue_once(plg_inst_id)
 
     # instances needing container deletion
     deleting_containers = PluginInstance.objects.filter(
-        remote_cleanup_status='deletingContainers')
-    for plg_inst in deleting_containers:
-        delete_plugin_instance_containers_from_remote.delay(plg_inst.id)
+        remote_cleanup_status='deletingContainers').values_list('id', flat=True)
+    for plg_inst_id in deleting_containers:
+        delete_plugin_instance_containers_from_remote.enqueue_once(plg_inst_id)
 
 
 @shared_task
@@ -264,29 +504,25 @@ def cancel_waiting_plugin_instances():
     any of those DB statuses.
     """
     lookup = Q(previous__status='finishedWithError') | Q(previous__status='cancelled')
-    PluginInstance.objects.filter(
-        status='waiting'
-    ).filter(lookup).update(status='cancelled')
+    waiting = PluginInstance.objects.filter(status='waiting')
+    stopped = {plg_inst.id: plg_inst for plg_inst in waiting.filter(lookup)}
 
-    ts_instances = PluginInstance.objects.filter(
-        status='waiting'
-    ).filter(plugin__meta__type='ts')
-
-    plg_inst_ids = []
-
-    for plg_inst in ts_instances:
+    for plg_inst in waiting.filter(plugin__meta__type='ts'):
         param = plg_inst.string_param.filter(plugin_param__name='plugininstances').first()
 
         if param and param.value:
             parent_ids = [int(parent_id) for parent_id in param.value.split(',')]
             parents = PluginInstance.objects.filter(pk__in=parent_ids)
 
-            for parent in parents:
-                if parent.status in ('finishedWithError', 'cancelled'):
-                    plg_inst_ids.append(plg_inst.id)
-                    break
+            if any(parent.status in ('finishedWithError', 'cancelled')
+                   for parent in parents):
+                stopped.setdefault(plg_inst.id, plg_inst)
 
-    PluginInstance.objects.filter(pk__in=plg_inst_ids).update(status='cancelled')
+    if stopped:
+        # one by one, from 'waiting' still: each cancel that wins logs the final status
+        prefix = ChrisInstance.load().job_id_prefix
+        for plg_inst in stopped.values():
+            plg_inst.cancel('waiting', job_id=f'{prefix}{plg_inst.id}')
 
 
 @shared_task
@@ -306,21 +542,22 @@ def delete_plugin_instances_jobs_from_remote():
 @shared_task
 def cancel_plugin_instances_stuck_in_lock():
     """
-    Collect all plugin instances for which the check_plugin_instance_job_exec_status 
-    async task is stuck or failed in the lock section of the code (e.g. because of a 
-    worker crash). Then schedule a new cancel request for all of them.
+    Collect all plugin instances that have been registering their output files for longer
+    than the cutoff (a registration task lost with its worker, say, or one queued behind
+    long deletions), and schedule for each a cancel that holds only while it is still
+    registering files.
     """
     cutoff = timezone.now() - timedelta(minutes=240)  # hardcoded cutoff delta
 
-    instances = PluginInstance.objects.filter(status='registeringFiles', 
-                                              lock__start_date__lt=cutoff)
+    # the transition to 'registeringFiles' stamps end_date, whether or not a task has
+    # started the registration since
+    instances = PluginInstance.objects.filter(status='registeringFiles',
+                                              end_date__lt=cutoff)
     for plg_inst in instances:
-        plg_inst.error_code = 'CODE18'
-        plg_inst.save(update_fields=['error_code'])
-
-        logger.error(f"Plugin instance with id {plg_inst.id} stuck in lock. Sending "
-                     f"cancelling task for it. ")
-        cancel_plugin_instance_job.delay(plg_inst.id)
+        logger.error(f"Plugin instance with id {plg_inst.id} stuck registering its "
+                     f"files. Sending cancelling task for it. ")
+        cancel_plugin_instance_job.delay(plg_inst.id, error_code='CODE18',
+                                         source='registeringFiles')
 
 
 @shared_task
@@ -335,12 +572,11 @@ def cancel_plugin_instances_stuck_in_scheduled_status():
     instances = PluginInstance.objects.filter(status='scheduled', start_date__lt=cutoff)
 
     for plg_inst in instances:
-        plg_inst.error_code = 'CODE18'
-        plg_inst.save(update_fields=['error_code'])
-
         logger.error(f"Plugin instance with id {plg_inst.id} stuck in scheduled status. "
                      f"Sending cancelling task for it. ")
-        cancel_plugin_instance_job.delay(plg_inst.id)
+        # from 'scheduled' only: its job may have been submitted since this read it
+        cancel_plugin_instance_job.delay(plg_inst.id, error_code='CODE18',
+                                         source='scheduled')
 
 
 @task_failure.connect
@@ -349,40 +585,32 @@ def cancel_plugin_inst_on_task_failure(sender=None, task_id=None, exception=None
                                        **other_kwargs):
     """
     Handler to cancel a plugin instance when related async tasks crash (e.g. because
-    of an uncaught exception).
+    of an uncaught exception, or a time limit). It runs in the worker's main process for a
+    task its pool lost, so it only sends a task: the cancel task cancels the instance
+    with CODE19 if it is still active and schedules its remote cleanup if nothing did.
+    A crashed remote cleanup is left to the periodic task that drives cleanups, and a
+    crashed cancel to its own retries: sending another at once would loop as fast as the
+    workers take it. A task that failed to publish the next one (PublishError) has
+    cancelled its instance itself, and the broker that refused that message would refuse
+    this one too.
     """
     # list of task names we want to handle
     handled_tasks = {
         'plugininstances.tasks.run_plugin_instance_job',
-        'plugininstances.tasks.cancel_plugin_instance_job',
+        'plugininstances.tasks.register_plugin_instance_output',
+        'plugininstances.tasks.register_large_plugin_instance_output',
     }
-    if sender.name not in handled_tasks:
-        return  # ignore other tasks
+    if sender.name not in handled_tasks or isinstance(exception, PublishError):
+        return  # ignore other tasks, and the instances cancelled already
 
     if not args:
         logger.warning(f"No args found for failed task {sender.name}")
         return
 
     plg_inst_id = args[0]
-
-    try:
-        plugin_inst = PluginInstance.objects.get(pk=plg_inst_id)
-    except PluginInstance.DoesNotExist:
-        logger.error(f"Plugin instance with id {plg_inst_id} does not exist for "
-                     f"cancelling after crash in task {sender.name}.")
-    else:
-        if plugin_inst.status in INACTIVE_STATUSES:
-            job_class_name = _detect_job_class_name(plugin_inst)
-            job_class = JOB_CLASSES[job_class_name]
-            plg_inst_job = job_class(plugin_inst)
-            plg_inst_job.schedule_remote_cleanup()
-        else:
-            plugin_inst.error_code = 'CODE19'
-            plugin_inst.save(update_fields=['error_code'])
-            
-            logger.info(f"Sending cancelling task for plugin instance with id  "
-                        f"{plg_inst_id} after crash in task {sender.name}")
-            cancel_plugin_instance_job.delay(plg_inst_id)
+    logger.info(f"Sending cancelling task for plugin instance with id {plg_inst_id} "
+                f"after crash in task {sender.name}")
+    cancel_plugin_instance_job.delay(plg_inst_id, error_code='CODE19')
 
 
 @shared_task  # toy task for testing celery stuff

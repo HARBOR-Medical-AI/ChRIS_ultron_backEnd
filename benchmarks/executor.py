@@ -64,7 +64,8 @@ def build_feed(api: ChrisApi, topology: Topology,
                 root_id = iid
 
             key_to_id[node.key] = iid
-            instances.append(InstanceRef(iid, feed_id, node.key, node.role))
+            parent_ids = tuple(key_to_id[p] for p in node.parents)
+            instances.append(InstanceRef(iid, feed_id, node.key, node.role, parent_ids))
     except (ChrisApiError, KeyError, ValueError) as exc:
         feed = (FeedRef(feed_id, root_id, tuple(i.instance_id for i in instances))
                 if feed_id is not None else None)

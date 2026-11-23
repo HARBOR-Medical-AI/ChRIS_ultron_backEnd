@@ -1,13 +1,11 @@
 """
 Tests for scripts/lint.py, run in the dev image by ``just lint-test``.
 
-A test that needs a repository makes one of its own in a temporary directory: master with
-the base files committed and a feature branch checked out on top of it.
+A test that needs a repository makes one of its own (test_repo.RepositoryTestCase).
 """
 
 import io
 import json
-import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -16,6 +14,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import lint
+import repo
+from test_repo import RepositoryTestCase
 
 
 def edit(row, col, end_row, end_col, content=""):
@@ -83,10 +83,6 @@ class HelperTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(lint.subject(message, line), expected)
 
-    def test_a_missing_tool_is_a_failure_not_a_traceback(self):
-        with self.assertRaisesRegex(lint.LintError, "not installed"):
-            lint.run(["cube-lint-no-such-tool"])
-
 
 class AdvisoriesTests(unittest.TestCase):
 
@@ -116,10 +112,10 @@ class AdvisoriesTests(unittest.TestCase):
         self.assertEqual(issues[0].hint, "just lock-upgrade urllib3")
 
     def test_an_audit_that_fails_or_prints_no_json_is_a_failure(self):
-        for effect in (lint.LintError("uv audit exited 2: offline"), ["not json"]):
+        for effect in (repo.ToolError("uv audit exited 2: offline"), ["not json"]):
             with self.subTest(effect=effect), \
                     mock.patch.object(lint, "run", side_effect=effect), \
-                    self.assertRaisesRegex(lint.LintError, "could not be audited"):
+                    self.assertRaisesRegex(repo.ToolError, "could not be audited"):
                 lint.advisories(self.tree, ["uv.lock"])
 
 
@@ -157,40 +153,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(lines[row].index(message), lines[row + 1].index(hint))
 
 
-class RepositoryTestCase(unittest.TestCase):
+class LintTestCase(RepositoryTestCase):
     """
-    Tests in a repository of their own, with the working directory at its top.
+    A repository of its own, and lint.py's ``main`` run in it.
     """
-
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.addCleanup(os.chdir, os.getcwd())
-        self.root = Path(directory.name)
-        os.chdir(self.root)
-        lint.git("init", "-q", "-b", "master")
-
-        for key, value in (("user.name", "lint test"), ("user.email", "lint@test"),
-                           ("commit.gpgsign", "false")):
-            lint.git("config", key, value)
-
-    def write(self, files):
-        for name, text in files.items():
-            path = self.root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
-
-    def commit(self, files=None, message="base"):
-        self.write(files or {})
-        lint.git("add", "-A")
-        lint.git("commit", "-q", "--allow-empty", "-m", message)
-
-    def branch(self, base):
-        """
-        Commit ``base`` on master and check out a feature branch on top of it.
-        """
-        self.commit(base)
-        lint.git("checkout", "-q", "-b", "feature")
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -199,7 +165,7 @@ class RepositoryTestCase(unittest.TestCase):
         return status, out.getvalue(), err.getvalue()
 
 
-class BranchTests(RepositoryTestCase):
+class BranchTests(LintTestCase):
 
     def open(self):
         workdir = tempfile.TemporaryDirectory()
@@ -215,8 +181,8 @@ class BranchTests(RepositoryTestCase):
 
     def test_deleted_files_drop_out_and_renamed_ones_are_new(self):
         self.branch({"gone.py": "x = 1\n", "old.py": "x = 2\n"})
-        lint.git("rm", "-q", "gone.py")
-        lint.git("mv", "old.py", "new.py")
+        repo.git("rm", "-q", "gone.py")
+        repo.git("mv", "old.py", "new.py")
         branch = self.open()
 
         self.assertEqual(branch.files, ["new.py"])
@@ -230,14 +196,14 @@ class BranchTests(RepositoryTestCase):
 
     def test_unrelated_histories_say_so(self):
         self.branch({"a.py": "x = 1\n"})
-        lint.git("checkout", "-q", "--orphan", "other")
+        repo.git("checkout", "-q", "--orphan", "other")
         self.commit({"b.py": "x = 2\n"}, "unrelated")
 
-        with self.assertRaisesRegex(lint.LintError, "share no commit"):
+        with self.assertRaisesRegex(repo.ToolError, "share no commit"):
             self.open()
 
 
-class CheckTests(RepositoryTestCase):
+class CheckTests(LintTestCase):
 
     def test_a_moved_line_keeps_its_issue_old_and_a_new_one_is_reported(self):
         self.branch({"a.py": "import os\n\nx = 1\n"})
@@ -273,7 +239,7 @@ class CheckTests(RepositoryTestCase):
         self.assertIn("uv.lock could not be audited", err)
 
 
-class FixTests(RepositoryTestCase):
+class FixTests(LintTestCase):
 
     def test_the_new_issue_is_fixed_and_the_old_one_of_the_same_name_is_left(self):
         old = "def a():\n    import os  # old\n    return 1\n"

@@ -11,15 +11,16 @@ import re
 import socket
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
-from benchmarks.broker import BrokerClient, encode_command, parse_reply
+from benchmarks.broker import CELERY_QUEUES, BrokerClient, encode_command, parse_reply
 from benchmarks.docker_client import (CGROUP_COUNTERS_CMD, CONTAINER_START_KEY, DockerClient,
                                       parse_cgroup_counters)
 from benchmarks.environment import (ENVELOPE_KEYS, POSTGRES_SETTINGS, collect_environment,
                                     envelope)
-from benchmarks.metrics import MetricSink, queue_rollup
+from benchmarks.metrics import PENDING_TTL_S, MetricSink, pending_ttl_s, queue_rollup
 from benchmarks.models import QueueSample
 from benchmarks.pg_stats import (COUNTERS_SQL, SETTINGS_SQL, STATEMENT_COLUMNS,
                                  STATEMENTS_SQL, PgStatStatements, connection_states,
@@ -55,18 +56,20 @@ def test_broker_unreachable_degrades_to_empty():
 def test_depths_send_the_llens_together_on_one_connection():
     """
     A one-connection-at-a-time RESP server: the PING of the constructor, then one
-    connection carrying the three LLENs.
+    connection carrying an LLEN per queue.
     """
     server = socket.create_server(("127.0.0.1", 0))
     received = []
+    lengths = b"".join(b":%d\r\n" % n for n in range(1, len(CELERY_QUEUES) + 1))
 
     def serve():
-        for reply in (b"+PONG\r\n", b":1\r\n:22\r\n:333\r\n"):
+        for reply in (b"+PONG\r\n", lengths):
             conn, _ = server.accept()
             with conn:
                 data = b""
                 # a PING is 3 lines of RESP, each LLEN 5
-                while data.count(b"\r\n") < (3 if reply == b"+PONG\r\n" else 15):
+                lines = 3 if reply == b"+PONG\r\n" else 5 * len(CELERY_QUEUES)
+                while data.count(b"\r\n") < lines:
                     data += conn.recv(4096)
                 received.append(data)
                 conn.sendall(reply)
@@ -78,9 +81,11 @@ def test_depths_send_the_llens_together_on_one_connection():
     thread.join(2)
     server.close()
 
-    assert depths == {"main1": 1, "main2": 22, "periodic": 333}  # nosec B101 - pytest assertion
+    expected = {q: n for n, q in enumerate(CELERY_QUEUES, 1)}
+    assert depths == expected  # nosec B101 - pytest assertion
     assert received[1] == b"".join(  # nosec B101 - pytest assertion
-        encode_command("LLEN", q) for q in ("main1", "main2", "periodic"))
+        encode_command("LLEN", q) for q in CELERY_QUEUES)
+    assert "status" in CELERY_QUEUES and "main2" not in CELERY_QUEUES  # nosec B101 - pytest assertion
 
 
 def _one_reply_server(reply):
@@ -113,11 +118,17 @@ def test_depths_of_a_short_or_garbled_reply_are_empty():
 class FakeBroker:
     available = True
 
-    def __init__(self, depths):
+    def __init__(self, depths, waits=None):
         self._depths = depths
+        self._waits = waits or {}
+        self.asked = []
 
     def depths(self):
         return dict(self._depths)
+
+    def oldest_wait(self, queue, now):
+        self.asked.append(queue)
+        return self._waits.get(queue)
 
 
 def test_sampler_records_queue_depths():
@@ -135,6 +146,105 @@ def test_sampler_records_queue_depths():
 
     assert len(samples) == 1
     assert samples[0].queue == "main2" and samples[0].depth == 7
+
+
+def test_sampler_records_the_wait_of_a_busy_status_queue_alone():
+    class NoDocker:
+        def service_containers(self):
+            return []
+
+        def job_containers(self):
+            return []
+
+    for depths, asked in (({"status": 3, "submit": 2}, ["status"]), ({"status": 0}, [])):
+        broker = FakeBroker(depths, waits={"status": 12.5, "submit": 99.0})
+        sink = MetricSink()
+        StatsSampler(NoDocker(), sink, broker=broker)._sample_queues()
+        waits = {sample.queue: sample.waited_s for sample in sink.queues()}
+
+        assert broker.asked == asked  # nosec B101 - pytest assertion
+        assert waits == {q: (12.5 if q == "status" and asked else None) for q in depths}  # nosec B101 - pytest assertion
+
+
+def test_queue_rollup_s_fresh_peak_leaves_out_the_samples_with_an_expired_check():
+    samples = [QueueSample(0, "status", 0), QueueSample(1, "status", 5, 10.0),
+               QueueSample(2, "status", 40, PENDING_TTL_S + 15),
+               QueueSample(3, "status", 30, None),          # its wait unknown
+               QueueSample(4, "status", 6, PENDING_TTL_S - 1),
+               QueueSample(5, "status", 9, PENDING_TTL_S - 0.2),  # its replacement may be in
+               QueueSample(0, "submit", 4)]
+    roll = queue_rollup(samples)
+
+    assert roll["status"]["depth_peak"] == 40  # nosec B101 - pytest assertion
+    assert roll["status"]["depth_peak_fresh"] == 6  # nosec B101 - pytest assertion
+    assert "depth_peak_fresh" not in roll["submit"]  # nosec B101 - pytest assertion
+
+
+def test_queue_rollup_s_fresh_peak_follows_the_run_s_pending_ttl():
+    samples = [QueueSample(0, "status", 5, 15.0), QueueSample(1, "status", 9, 25.0)]
+
+    assert queue_rollup(samples, 20.0)["status"]["depth_peak_fresh"] == 5  # nosec B101 - pytest assertion
+    assert queue_rollup(samples, 120.0)["status"]["depth_peak_fresh"] == 9  # nosec B101 - pytest assertion
+
+
+def test_the_pending_ttl_is_the_one_the_envelope_gives_the_run():
+    assert pending_ttl_s({"CUBE_CELERY_PENDING_TTL": "20"}) == 20.0  # nosec B101 - pytest assertion
+    assert pending_ttl_s({}) == PENDING_TTL_S  # nosec B101 - pytest assertion
+    assert pending_ttl_s({"CUBE_CELERY_PENDING_TTL": "soon"}) == PENDING_TTL_S  # nosec B101 - pytest assertion
+
+
+def test_queue_rollup_s_fresh_peak_of_a_status_queue_that_stayed_empty_is_0():
+    samples = [QueueSample(0, "status", 0), QueueSample(1, "status", 0),
+               QueueSample(0, "submit", 0), QueueSample(0, "main2", 0)]
+    roll = queue_rollup(samples)
+
+    assert roll["status"]["depth_peak_fresh"] == 0  # nosec B101 - pytest assertion
+    assert "depth_peak_fresh" not in roll["submit"]  # nosec B101 - pytest assertion
+    assert "depth_peak_fresh" not in roll["main2"]  # nosec B101 - pytest assertion
+
+
+def test_queue_rollup_has_no_fresh_peak_for_a_status_queue_whose_waits_were_unread():
+    # messages without CUBE's stamp: the queue held some, and none's wait could be read
+    samples = [QueueSample(0, "status", 0), QueueSample(1, "status", 3, None)]
+
+    assert "depth_peak_fresh" not in queue_rollup(samples)["status"]  # nosec B101 - pytest assertion
+
+
+def test_oldest_wait_reads_the_stamp_of_the_message_a_worker_takes_next():
+    stamped = json.dumps({"body": "e30=", "headers": {"cube_published_at": 100.0}}).encode()
+    unstamped = json.dumps({"body": "e30=", "headers": {"task": "x"}}).encode()
+
+    for reply, wait in ((b"$%d\r\n%s\r\n" % (len(stamped), stamped), 12.5),
+                        (b"$%d\r\n%s\r\n" % (len(unstamped), unstamped), None),
+                        (b"$-1\r\n", 0.0),                   # emptied: nothing waits
+                        (b"$100\r\nshort\r\n", None),       # cut short
+                        (b"-ERR wrong type\r\n", None)):
+        server = _one_reply_server(reply)
+        client = BrokerClient("127.0.0.1", server.getsockname()[1], timeout=2.0)
+
+        assert client.oldest_wait("status", 112.5) == wait, reply  # nosec B101 - pytest assertion
+        server.close()
+
+
+def test_oldest_wait_asks_for_the_end_of_the_list_that_brpop_pops():
+    with mock.patch.object(BrokerClient, "_pipeline", return_value=[b"{}"]) as pipeline:
+        client = BrokerClient.__new__(BrokerClient)
+        client.unavailable_reason = None
+        client.oldest_wait("status", 1.0)
+
+    pipeline.assert_called_once_with([("LINDEX", "status", "-1")])
+
+
+def test_restart_service_waits_its_timeout_and_never_raises():
+    container = mock.Mock()
+    client = DockerClient.__new__(DockerClient)
+    client.find_service = lambda service: container if service == "worker-mains" else None
+
+    assert client.restart_service("worker-mains") is True  # nosec B101 - pytest assertion
+    container.restart.assert_called_once_with(timeout=30)
+    assert client.restart_service("gone") is False  # nosec B101 - pytest assertion
+    container.restart.side_effect = RuntimeError("the engine timed out")
+    assert client.restart_service("worker-mains") is False  # nosec B101 - pytest assertion
 
 
 def test_queue_rollup_peak_and_mean():
@@ -557,6 +667,9 @@ class ManifestDocker(JsonDocker):
         return {"db": {"cpus": 2.0, "mem_limit": 4294967296, "memswap_limit": None,
                        "shm_size": 1073741824}}
 
+    def service_commands(self):
+        return {"worker-mains": ["celery", "-A", "core", "worker", "-c", "4"]}
+
 
 def test_collect_environment_records_postgres_settings_limits_and_images():
     cache_url = "redis://chris-cache:6379/0"
@@ -571,6 +684,7 @@ def test_collect_environment_records_postgres_settings_limits_and_images():
     assert ids["chris-broker"] == "sha256:chris-broker"  # nosec B101 - pytest assertion
     assert ids["chris-cache"] == "sha256:chris-cache"  # nosec B101 - pytest assertion
     assert env["limits"]["db"]["shm_size"] == 1073741824  # nosec B101 - pytest assertion
+    assert env["commands"]["worker-mains"][-1] == "4"  # nosec B101 - pytest assertion
     assert knobs["CUBE_DB_SYNCHRONOUS_COMMIT"] == "on"  # nosec B101 - pytest assertion
     assert knobs["CUBE_CACHE_URL"] == cache_url  # nosec B101 - pytest assertion
     assert set(knobs) == set(ENVELOPE_KEYS)  # nosec B101 - pytest assertion

@@ -6,6 +6,7 @@ from drf_spectacular.utils import OpenApiTypes, extend_schema_field
 
 from collectionjson.fields import ItemLinkField
 from core.models import PathAccessError, validate_path_access
+from core.serializers import save_validated_fields
 from plugins.enums import TYPES
 from plugins.models import Plugin
 
@@ -76,6 +77,8 @@ class PluginInstanceSerializer(serializers.HyperlinkedModelSerializer):
                   'deletion_requested_at', 'deletion_error', 'previous', 'output_folder',
                   'feed', 'plugin', 'workflow', 'compute_resource',
                   'descendants', 'parameters', 'splits')
+        # the deletion's state is the deletion tasks' to write
+        read_only_fields = ('deletion_status', 'deletion_requested_at', 'deletion_error')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -83,6 +86,8 @@ class PluginInstanceSerializer(serializers.HyperlinkedModelSerializer):
         if self.instance is None: # on create
             self.fields['status'].read_only = True  # set to read-only before validation
         else: # on update
+            # the compute resource of an instance is not changed
+            self.fields['compute_resource_name'].read_only = True
             self.fields['gpu_limit'].read_only = True
             self.fields['number_of_workers'].read_only = True
             self.fields['cpu_limit'].read_only = True
@@ -93,6 +98,15 @@ class PluginInstanceSerializer(serializers.HyperlinkedModelSerializer):
         Overriden to get the "active" status of the plugin instance.
         """
         return obj.status in ACTIVE_STATUSES
+
+    def update(self, instance, validated_data):
+        """
+        Overriden to save only the fields the request changes and never the status, which
+        the view changes with a transition: a whole save would write back whatever a task
+        changed since the request read the instance.
+        """
+        validated_data.pop('status', None)
+        return save_validated_fields(instance, validated_data)
 
     def validate_previous(self, previous_id):
         """
