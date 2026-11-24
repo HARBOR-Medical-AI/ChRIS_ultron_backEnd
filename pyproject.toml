@@ -55,6 +55,11 @@ dev = [
     "dodgy>=0.2.1",  # used by `just lint` and Codacy's Prospector
     "ruff>=0.17.3",  # used by `just lint-fix` and `just format`
     "daphne>=4.2.3",  # required by (django) channels.testing
+    "mypy>=2.4.1",  # used by `just typecheck`
+    # Django's and DRF's type stubs and their mypy plugins (Django's reads the models); the
+    # extra keeps mypy at a version the plugins support
+    "django-stubs[compatible-mypy]>=6.1.2",
+    "djangorestframework-stubs[compatible-mypy]>=3.18.2",
 ]
 
 [tool.uv]
@@ -71,3 +76,28 @@ environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'darwin'",
 ]
+
+# mypy's settings for `just typecheck` (scripts/typecheck.py) which lists the errors a
+# branch adds. Most of CUBE is not annotated, so the bodies of unannotated functions are
+# checked too; `--strict` adds mypy's strict checks. `just typecheck --tests` drops the
+# last two exclusions. The Django plugin imports the settings module, so it names one
+# that imports without any service running.
+[tool.mypy]
+files = ["chris_backend", "scripts"]
+exclude = ["/migrations/", "/tests/", "^scripts/test_[^/]*\\.py$"]
+mypy_path = "chris_backend:scripts"
+explicit_package_bases = true
+check_untyped_defs = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+
+# installed packages that ship no type hints: their names are Any
+[[tool.mypy.overrides]]
+module = [
+    "boto3.*", "botocore.*", "celery.*", "channels.*", "chrisstoreclient.*",
+    "collection_json.*", "django_auth_ldap.*", "django_celery_beat.*", "django_filters.*",
+    "dodgy.*", "kombu.*", "ldap.*", "pfconclient.*", "six.*", "swiftclient.*",
+]
+ignore_missing_imports = true
+
+[tool.django-stubs]
+django_settings_module = "config.settings.common"

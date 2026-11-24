@@ -93,7 +93,7 @@ class AdvisoriesTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         (Path(directory.name) / "uv.lock").write_text(self.LOCK)
-        self.tree = lint.Tree(directory.name)
+        self.tree = repo.Tree(directory.name)
 
     def test_one_advisory_from_two_databases_is_one_issue_on_the_first_reference(self):
         vuln = {"dependency": {"name": "urllib3", "version": "2.7.0"},
@@ -122,10 +122,10 @@ class AdvisoriesTests(unittest.TestCase):
 class ReportTests(unittest.TestCase):
 
     def issue(self, path, line, rule, message, hint=""):
-        return lint.Issue(path, rule, f"text {line}", message, line, hint)
+        return repo.Issue(path, rule, f"text {line}", message, line, hint)
 
     def report(self, issues, new, show_all=False):
-        branch = SimpleNamespace(files=["a.py", "uv.lock"], base="0123456789ab",
+        branch = SimpleNamespace(files=["a.py", "uv.lock"], deleted=[], base="0123456789ab",
                                  ref="origin/master")
         out = io.StringIO()
         with redirect_stdout(out):
@@ -140,17 +140,16 @@ class ReportTests(unittest.TestCase):
 
         self.assertIn(" ?    4  uv audit", out)
         self.assertNotIn("'os' imported", out)
-        self.assertIn("1 issues there predate the branch", out)
+        self.assertIn("1 issues there predate the branch: `just lint --all` lists them", out)
         self.assertIn("1 advisories (? above)", out)
 
-    def test_a_hint_lines_up_with_its_message_whatever_the_rule_width(self):
-        long = self.issue("a.py", 1, "dodgy ssh_rsa_public_key", "a key", "remove it")
-        short = self.issue("uv.lock", 4, "uv audit", "an advisory", "just lock-upgrade x")
-        lines = self.report([long, short], [long, short]).splitlines()
+    def test_a_new_issue_fails_codacy_s_gate(self):
+        new = self.issue("a.py", 2, "pyflakes F401", "'os' imported but unused")
+        out = self.report([new], [new])
 
-        for message, hint in (("a key", "remove it"), ("an advisory", "just lock-upgrade")):
-            row = next(i for i, line in enumerate(lines) if line.endswith(message))
-            self.assertEqual(lines[row].index(message), lines[row + 1].index(hint))
+        self.assertIn("1 new issues in 2 files changed since 0123456789 (origin/master)",
+                      out)
+        self.assertIn("Codacy fails a pull request on any new issue", out)
 
 
 class LintTestCase(RepositoryTestCase):
@@ -163,44 +162,6 @@ class LintTestCase(RepositoryTestCase):
         with redirect_stdout(out), redirect_stderr(err):
             status = lint.main(list(argv))
         return status, out.getvalue(), err.getvalue()
-
-
-class BranchTests(LintTestCase):
-
-    def open(self):
-        workdir = tempfile.TemporaryDirectory()
-        self.addCleanup(workdir.cleanup)
-        return lint.Branch.open(None, workdir.name)
-
-    def test_changed_and_untracked_files_are_found_whatever_their_names(self):
-        self.branch({"plain.py": "x = 1\n"})
-        self.commit({"café.py": "x = 2\n"}, "unicode")
-        self.write({"tab\tname.py": "x = 3\n", "with space.py": "x = 4\n"})
-
-        self.assertEqual(self.open().files, ["café.py", "tab\tname.py", "with space.py"])
-
-    def test_deleted_files_drop_out_and_renamed_ones_are_new(self):
-        self.branch({"gone.py": "x = 1\n", "old.py": "x = 2\n"})
-        repo.git("rm", "-q", "gone.py")
-        repo.git("mv", "old.py", "new.py")
-        branch = self.open()
-
-        self.assertEqual(branch.files, ["new.py"])
-        self.assertEqual(branch.in_base(branch.files), [])
-
-    def test_a_base_without_files_is_an_empty_tree(self):
-        self.branch({})
-        self.write({"a.py": "x = 1\n"})
-
-        self.assertEqual(self.open().files, ["a.py"])
-
-    def test_unrelated_histories_say_so(self):
-        self.branch({"a.py": "x = 1\n"})
-        repo.git("checkout", "-q", "--orphan", "other")
-        self.commit({"b.py": "x = 2\n"}, "unrelated")
-
-        with self.assertRaisesRegex(repo.ToolError, "share no commit"):
-            self.open()
 
 
 class CheckTests(LintTestCase):

@@ -137,7 +137,19 @@ format *args: (run-script 'reformat.py' 'format' args)
 [group('(3) development')]
 format-check *args: (run-script 'reformat.py' 'check' args)
 
-# Test the scripts lint.py, reformat.py and repo.py (scripts/test_*.py) in the dev image.
+# mypy, with the Django and DRF plugins, checks the whole project twice: in a copy of the
+# working tree and in the tree of its merge-base with origin/master, both with [tool.mypy]
+# of pyproject.toml. Only the errors the working tree adds are listed. `--strict` adds
+# mypy's strict checks (advice: the recipe without it is the check), `--tests` checks the
+# test modules too, `--all` also lists the older errors of the changed files, `--base`
+# names another branch. See scripts/typecheck.py.
+#
+# List the mypy errors this branch adds.
+[group('(3) development')]
+typecheck *args: (run-script 'typecheck.py' 'check' args)
+
+# Run scripts/test_*.py in the dev image: the tests of the scripts in scripts/ and the
+# check that the Celery queues are named alike everywhere.
 [group('(3) development')]
 lint-test:
     @just storage={{ storage }} docker-compose --profile=cube run --rm --no-deps -T \

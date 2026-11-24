@@ -3,10 +3,13 @@ Tests for scripts/repo.py, run in the dev image by ``just lint-test``, and the r
 the tests of every script that reads a branch make their own.
 """
 
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import repo
@@ -128,6 +131,155 @@ class BranchFilesTests(RepositoryTestCase):
         repo.go_to_top()
 
         self.assertEqual(Path.cwd().resolve(), self.root.resolve())
+
+
+class BranchTests(RepositoryTestCase):
+
+    def open(self):
+        workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(workdir.cleanup)
+        return repo.Branch.open(None, workdir.name)
+
+    def test_changed_and_untracked_files_are_found_whatever_their_names(self):
+        self.branch({"plain.py": "x = 1\n"})
+        self.commit({"café.py": "x = 2\n"}, "unicode")
+        self.write({"tab\tname.py": "x = 3\n", "with space.py": "x = 4\n"})
+
+        self.assertEqual(self.open().files, ["café.py", "tab\tname.py", "with space.py"])
+
+    def test_deleted_files_drop_out_and_renamed_ones_are_new(self):
+        self.branch({"gone.py": "x = 1\n", "old.py": "x = 2\n", "kept.py": "x = 3\n"})
+        repo.git("rm", "-q", "gone.py")
+        repo.git("mv", "old.py", "new.py")
+        repo.git("rm", "-q", "--cached", "kept.py")  # untracked now, but still there
+        branch = self.open()
+
+        self.assertEqual(branch.files, ["kept.py", "new.py"])
+        self.assertEqual(branch.deleted, ["gone.py", "old.py"])
+        self.assertEqual(branch.in_base(branch.files), ["kept.py"])
+
+    def test_a_branch_that_only_deletes_files_has_its_base_extracted(self):
+        self.branch({"gone.py": "x = 1\n", "kept.py": "x = 2\n"})
+        repo.git("rm", "-q", "gone.py")
+        branch = self.open()
+
+        self.assertEqual((branch.files, branch.deleted), ([], ["gone.py"]))
+        self.assertTrue((branch.base_tree.root / "gone.py").is_file())
+
+    def test_a_base_without_files_is_an_empty_tree(self):
+        self.branch({})
+        self.write({"a.py": "x = 1\n"})
+
+        self.assertEqual(self.open().files, ["a.py"])
+
+    def test_unrelated_histories_say_so(self):
+        self.branch({"a.py": "x = 1\n"})
+        repo.git("checkout", "-q", "--orphan", "other")
+        self.commit({"b.py": "x = 2\n"}, "unrelated")
+
+        with self.assertRaisesRegex(repo.ToolError, "share no commit"):
+            self.open()
+
+
+class WorkingTreeCopyTests(RepositoryTestCase):
+
+    def copy(self):
+        workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(workdir.cleanup)
+        self.dest = Path(workdir.name) / "copy"
+        tree = repo.working_tree_copy(self.dest)
+        self.assertEqual(tree.root, self.dest)
+        return sorted(str(p.relative_to(self.dest)) for p in self.dest.rglob("*")
+                      if p.is_file() or p.is_symlink())
+
+    def test_the_copy_holds_what_git_sees_of_the_working_tree(self):
+        self.branch({".gitignore": "ignored.py\n__pycache__/\n", "kept.py": "x = 1\n",
+                     "gone.py": "x = 1\n", "pkg/edited.py": "x = 1\n"})
+        os.remove("gone.py")
+        self.write({"pkg/edited.py": "x = 2\n", "pkg/new.pyi": "y: int\n",
+                    "pkg/data.txt": "data\n", "ignored.py": "z = 1\n",
+                    "pkg/__pycache__/a.cpython-312.pyc": "",
+                    "nested/.git": "gitdir: /nowhere\n", "nested/n.py": "w = 1\n"})
+        os.symlink("kept.py", "link.py")
+
+        self.assertEqual(self.copy(), [".gitignore", "kept.py", "link.py", "pkg/data.txt",
+                                       "pkg/edited.py", "pkg/new.pyi"])
+        self.assertEqual((self.dest / "pkg/edited.py").read_text(), "x = 2\n")
+
+    def test_a_symbolic_link_is_copied_as_one(self):
+        self.branch({"kept.py": "x = 1\n"})
+        os.symlink("kept.py", "link.py")
+
+        self.assertEqual(self.copy(), ["kept.py", "link.py"])
+        self.assertEqual(os.readlink(self.dest / "link.py"), "kept.py")
+
+
+class ListIssuesTests(unittest.TestCase):
+
+    def issue(self, path, line, rule, message, hint=""):
+        return repo.Issue(path, rule, f"text {line}", message, line, hint)
+
+    def list(self, issues, new, show_all=False, **kwargs):
+        branch = SimpleNamespace(files=["a.py", "b.py"], deleted=["c.py"],
+                                 base="0123456789ab", ref="origin/master")
+        options = {"command": "check", "gate": "the gate", **kwargs}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            repo.list_issues(branch, issues, new, show_all, **options)
+        return out.getvalue()
+
+    def test_a_hint_lines_up_with_its_message_whatever_the_rule_width(self):
+        long = self.issue("a.py", 1, "dodgy ssh_rsa_public_key", "a key", "remove it")
+        short = self.issue("b.py", 4, "rule", "an issue", "do this")
+        lines = self.list([long, short], [long, short]).splitlines()
+
+        for message, hint in (("a key", "remove it"), ("an issue", "do this")):
+            row = next(i for i, line in enumerate(lines) if line.endswith(message))
+            self.assertEqual(lines[row].index(message), lines[row + 1].index(hint))
+
+    def test_every_line_of_a_hint_lines_up_with_the_message(self):
+        hinted = self.issue("a.py", 1, "rule", "an issue",
+                            "Possible variants:\n    def f()")
+        lines = self.list([hinted], [hinted]).splitlines()
+
+        row = next(i for i, line in enumerate(lines) if line.endswith("an issue"))
+        column = lines[row].index("an issue")
+        self.assertEqual(lines[row + 1], " " * column + "Possible variants:")
+        self.assertEqual(lines[row + 2], " " * column + "    def f()")
+
+    def test_of_two_issues_with_one_key_only_the_new_one_is_marked(self):
+        old, new = (repo.Issue("a.py", "rule", "return 'a'", "same", n) for n in (2, 6))
+        self.assertEqual(old, new)  # one key: file, rule, line text and message
+
+        out = self.list([old, new], [new], show_all=True)
+
+        self.assertIn("      2  rule", out)
+        self.assertIn(" *    6  rule", out)
+        self.assertIn("the gate (* above)", out)
+
+    def test_the_older_ones_are_counted_with_the_command_that_lists_them(self):
+        old = self.issue("a.py", 2, "rule", "old")
+        unsure = self.issue("b.py", 3, "rule", "maybe new")
+        out = self.list([old, unsure], [], unsure=[unsure], command="check --strict")
+
+        self.assertNotIn("old", out)
+        self.assertIn(" ?    3  rule", out)
+        self.assertIn("No new issues in 3 files changed since 0123456789 (origin/master)",
+                      out)
+        self.assertIn("1 issues there predate the branch: `just check --strict --all`", out)
+
+    def test_a_scope_names_where_the_new_ones_were_looked_for(self):
+        new = self.issue("d.py", 1, "rule", "broken")
+        out = self.list([new], [new], scope="the project")
+
+        self.assertIn("1 new issues in the project, 3 files changed since 0123456789", out)
+        self.assertIn("\nthe gate\n", out)
+
+        old = self.issue("a.py", 2, "rule", "old")
+        out = self.list([old], [], scope="the project")
+
+        self.assertIn("No new issues in the project, 3 files changed", out)
+        self.assertIn("1 issues of the changed files predate the branch", out)
 
 
 if __name__ == "__main__":

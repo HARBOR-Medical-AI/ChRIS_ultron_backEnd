@@ -188,7 +188,9 @@ just lint-fix             # let Ruff fix new unused imports and f-strings withou
 just lint-fix --unsafe    # ... and unused variables
 just format               # Ruff's default style on the lines this branch changed, new files whole
 just format-check         # what `just format` would change, as a diff
-just lint-test            # the tests of scripts/lint.py, scripts/reformat.py and scripts/repo.py
+just typecheck            # mypy errors this branch adds (Codacy runs no type checker)
+just typecheck --strict   # ... in strict mode, as advice
+just lint-test            # scripts/test_*.py: the scripts' tests and the queue-name check
 ```
 
 An image built before these tools were added says so and needs `just build` first. `just lint`

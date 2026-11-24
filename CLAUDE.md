@@ -46,6 +46,9 @@ just lint-fix [--unsafe]  # Ruff's fixes for the new pyflakes issues only, then 
 just format [--base REF]  # Ruff's default style on the lines changed since the merge-base (and
                           #   the statements they are in), files new to git whole
                           #   (scripts/reformat.py); `just format-check` prints the diff, exit 1
+just typecheck [--strict] [--tests] [--all] [--base REF]  # mypy errors the branch adds:
+                          #   the whole project, working tree vs merge-base, settings in
+                          #   [tool.mypy] (scripts/typecheck.py); exit 1 on any, 2 on failure
 just lint-test            # scripts/test_*.py, in the dev image (no stack)
 
 just lock                 # re-resolve both uv.lock files after editing a pyproject.toml
@@ -63,7 +66,8 @@ just bench-nuke           # bench-down, reap jobs, remove volumes (the dev stack
 The dev API is at http://localhost:8000/api/v1/ (superuser `chris`/`chris1234`, user
 `cube`/`cube1234`). `uv sync` on the host is only for editor/LSP support; tests need the stack.
 There is no lint configuration and no lint step in CI: Codacy checks pull requests, and its
-Python tools are dev dependencies for `just lint`.
+Python tools are dev dependencies for `just lint`. `[tool.mypy]` in `pyproject.toml` is for
+`just typecheck` only; Codacy runs no type checker.
 
 ## Testing conventions
 

@@ -24,17 +24,15 @@ status: 0 clean, 1 new issues, 2 failure. A git worktree cannot be checked this 
 """
 
 import argparse
-import io
 import json
 import re
 import sys
 import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from repo import ToolError, changed_files, git, go_to_top, merge_base, run
+from repo import Branch, ToolError, Tree, go_to_top, list_issues, run
 
 
 # Lockfiles and the uv project each belongs to.
@@ -53,55 +51,7 @@ PYLINT_RULES = """
 # A fix can leave another for the next pass, e.g. two names of one import statement.
 FIX_PASSES = 10
 
-# The width of the rule column in the report.
-RULE_WIDTH = 14
-
-
-@dataclass(frozen=True)
-class Issue:
-    path: str
-    rule: str
-    text: str
-    message: str
-    line: int = field(default=0, compare=False)
-    hint: str = field(default="", compare=False)
-
-
-class Tree:
-    """
-    A checkout of the repository: the working tree or an extracted commit. A ``frozen``
-    tree does not change, so each check's results on it are kept.
-    """
-
-    def __init__(self, root, frozen=False):
-        self.root = Path(root)
-        self.frozen = frozen
-        self._lines = {}
-        self._results = {}
-
-    def line(self, path, number):
-        if path not in self._lines:
-            try:
-                text = (self.root / path).read_text(errors="replace")
-                self._lines[path] = text.split("\n")
-            except OSError:
-                self._lines[path] = []
-
-        lines = self._lines[path]
-        return lines[number - 1].strip() if 0 < number <= len(lines) else ""
-
-    def issue(self, path, number, rule, message, hint=""):
-        return Issue(path, rule, self.line(path, number), message, number, hint)
-
-    def results(self, check, files):
-        if not self.frozen:
-            return check(self, files)
-
-        key = (check.__name__, tuple(files))
-
-        if key not in self._results:
-            self._results[key] = check(self, files)
-        return self._results[key]
+CODACY_GATE = "Codacy fails a pull request on any new issue"
 
 
 def bandit(tree, files):
@@ -224,43 +174,15 @@ def analyse(tree, files):
     return issues
 
 
-@dataclass
-class Branch:
+def compare(branch):
     """
-    The files changed since the merge-base, and the merge-base's tree to compare with.
+    Return the working tree's issues in the changed files, and those the base lacks.
     """
-
-    ref: str
-    base: str
-    files: list
-    base_tree: Tree
-
-    @classmethod
-    def open(cls, ref, workdir):
-        ref, base = merge_base(ref)
-        files, _ = changed_files(base)
-
-        # the archive of a commit without files holds a pax header alone, which tarfile
-        # refuses
-        if files and git("ls-tree", "--name-only", base).strip():
-            archive = git("archive", base, text=False)
-
-            with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-                tar.extractall(workdir, filter="data")
-        return cls(ref, base, files, Tree(workdir, frozen=True))
-
-    def in_base(self, files):
-        return [f for f in files if (self.base_tree.root / f).is_file()]
-
-    def compare(self):
-        """
-        Return the working tree's issues in the changed files, and those the base lacks.
-        """
-        with ThreadPoolExecutor(2) as pool:
-            head = pool.submit(analyse, Tree("."), self.files)
-            base = pool.submit(analyse, self.base_tree, self.in_base(self.files))
-            head, base = head.result(), set(base.result())
-        return head, [i for i in head if i not in base]
+    with ThreadPoolExecutor(2) as pool:
+        found = pool.submit(analyse, Tree("."), branch.files)
+        old = pool.submit(analyse, branch.base_tree, branch.in_base(branch.files))
+        head, base = found.result(), set(old.result())
+    return head, [i for i in head if i not in base]
 
 
 def report(branch, issues, new, show_all):
@@ -269,31 +191,9 @@ def report(branch, issues, new, show_all):
     the advisories of changed lockfiles that the base has too, marked ``?``.
     """
     new_set = set(new)
-    unsure = {i for i in issues if i.rule == "uv audit" and i not in new_set}
-    shown = issues if show_all else [*new, *unsure]
-    width = max([RULE_WIDTH, *(len(i.rule) for i in shown)])
-    path = None
-
-    for issue in sorted(shown, key=lambda i: (i.path, i.line, i.rule)):
-        if issue.path != path:
-            path = issue.path
-            print(f"\n{path}")
-
-        mark = "?" if issue in unsure else "*" if show_all and issue in new_set else " "
-        print(f" {mark}{issue.line:>5}  {issue.rule:<{width}} {issue.message}")
-
-        if issue.hint:
-            print(f"{'':{width + 10}}{issue.hint}")
-
-    where = f"{len(branch.files)} files changed since {branch.base[:10]} ({branch.ref})"
-    print(f"\n{len(new)} new issues in {where}" if new else f"\nNo new issues in {where}")
-
-    if new:
-        msg = "Codacy fails a pull request on any new issue"
-        print(msg + (" (* above)" if show_all else ""))
-    elif len(issues) > len(unsure) and not show_all:
-        print(f"{len(issues) - len(unsure)} issues there predate the branch: "
-              "`just lint --all` lists them")
+    unsure = [i for i in issues if i.rule == "uv audit" and i not in new_set]
+    list_issues(branch, issues, new, show_all, command="lint", gate=CODACY_GATE,
+                unsure=unsure)
 
     if unsure:
         print(f"{len(unsure)} advisories (? above) predate the branch here, but Codacy may "
@@ -308,7 +208,7 @@ def ruff_fixes(files, unsafe):
     """
     cmd = ["ruff", "check", "--isolated", "--no-cache", "--select=F",
            "--output-format=json"]
-    fixes = {}
+    fixes: dict[tuple, list] = {}
 
     for d in json.loads(run([*cmd, *files])):
         fix = d.get("fix")
@@ -391,7 +291,7 @@ def fix(branch, unsafe):
         new = [i for i in found if i not in old]
         kept = {(i.path, i.line) for i in found if i in old}
         fixes = ruff_fixes(sorted({i.path for i in new}), unsafe) if new else {}
-        chosen = {}
+        chosen: dict[str, list] = {}
 
         for issue in new:
             candidates = fixes.get((issue.path, issue.rule.split()[1],
@@ -420,7 +320,7 @@ def fix(branch, unsafe):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip())
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0].strip())
     parser.add_argument("command", choices=("check", "fix"))
     parser.add_argument("--base",
                         help="branch to compare with (origin/master, else master)")
@@ -443,7 +343,7 @@ def main(argv=None):
             if args.command == "fix":
                 fix(branch, args.unsafe)
 
-            issues, new = branch.compare()
+            issues, new = compare(branch)
             report(branch, issues, new, args.all)
             return 1 if new else 0
     except (ToolError, OSError, ValueError, KeyError, tarfile.TarError) as e:
