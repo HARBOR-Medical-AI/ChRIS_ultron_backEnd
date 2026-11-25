@@ -17,6 +17,7 @@ from django.test import SimpleTestCase, TestCase
 from pfconclient.client import JobType
 from rest_framework.authtoken.models import Token
 
+from core.storage import StorageObject
 from plugininstances import tasks
 from plugininstances.models import PluginInstance
 from plugininstances.services import pluginjobs
@@ -82,20 +83,17 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
     def test_a_registration_logs_one_line_whatever_its_files(self):
         inst = self.instance('registeringFiles')
         job = pluginjobs.PluginInstanceAppJob(inst)
-        names = [f'{inst.get_output_path()}/f{n}.txt' for n in range(5)]
+        output = inst.get_output_path()
+        names = [f'f{n}.txt' for n in range(5)]
         job._get_status = mock.Mock(return_value={'compute': {'status': 'finishedSuccessfully'}})
-        job._get_job_json_data = mock.Mock(return_value={})
-        job.check_files_from_json_exist = mock.Mock(
-            side_effect=lambda content: setattr(job, 'plugin_inst_output_files', set(names)))
-        job.storage_manager = mock.Mock(sanitize_obj_names=mock.Mock(return_value={}))
+        job._get_job_json_data = mock.Mock(
+            return_value={'job_output_path': output, 'rel_file_paths': names})
+        job.storage_manager = mock.Mock()  # objects of 1 byte each
+        job.storage_manager.walk.return_value = iter(
+            [StorageObject(f'{output}/{name}', 1) for name in names])
         job.enqueue_run = mock.Mock()
 
-        def inserted(files, **kwargs):  # rows of 1 byte each
-            return [mock.Mock(fname=mock.Mock(size=1)) for _ in files]
-
-        with mock.patch.object(pluginjobs.UserFile.objects, 'bulk_create',
-                               side_effect=inserted), \
-                self.assertLogs('plugininstances', 'INFO') as logs:
+        with self.assertLogs('plugininstances', 'INFO') as logs:
             job.register_output()
 
         registered = [line for line in logs.output if 'Registered' in line]
@@ -114,11 +112,12 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
         job.enqueue_run = mock.Mock()
 
         def listed_then_failed(content):
-            job.plugin_inst_output_files = {f'{inst.get_output_path()}/f{n}' for n in range(5)}
-            job.c_plugin_inst.error_code = 'CODE14'  # the step logs its own error
-            raise ValueError('Missing 1 files in storage')
+            for n in range(5):
+                job._expect(f'f{n}')
+            job.c_plugin_inst.error_code = 'CODE16'  # the step logs its own error
+            raise ValueError('Received another output path')
 
-        job.check_files_from_json_exist = mock.Mock(side_effect=listed_then_failed)
+        job.expect_json_files = mock.Mock(side_effect=listed_then_failed)
 
         with self.assertLogs('plugininstances', 'INFO') as logs:
             job.register_output()
@@ -138,8 +137,7 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
                     'compute': {'status': remote_status}})
                 job._get_job_json_data = mock.Mock(return_value={})
                 job.enqueue_run = mock.Mock()
-                job.check_files_from_json_exist = mock.Mock(
-                    side_effect=RuntimeError('database gone'))
+                job.expect_json_files = mock.Mock(side_effect=RuntimeError('database gone'))
 
                 with self.assertLogs('plugininstances', 'INFO') as logs:
                     job.register_output()
@@ -162,7 +160,7 @@ class RegistrationLogTests(PluginInstanceFixture, TestCase):
             PluginInstance.objects.get(pk=inst.pk).transition('cancelled',
                                                               'registeringFiles')
 
-        job.check_files_from_json_exist = mock.Mock(side_effect=cancelled_meanwhile)
+        job.expect_json_files = mock.Mock(side_effect=cancelled_meanwhile)
 
         with self.assertLogs('plugininstances.services', 'INFO') as logs:
             job.register_output()

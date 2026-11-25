@@ -999,8 +999,13 @@ class ChrisLinkFile(models.Model):
         storage_manager = connect_storage(settings)
 
         with io.StringIO(link_file_contents) as f:
-            if storage_manager.obj_exists(link_file_path):
-                storage_manager.delete_obj(link_file_path)
+            try:
+                if storage_manager.obj_exists(link_file_path):
+                    storage_manager.delete_obj(link_file_path)
+            except Exception as error:
+                if not storage_manager.is_missing(error):
+                    raise
+                # another task, writing the same link file, deleted it since
             storage_manager.upload_obj(link_file_path, f.read(),
                                        content_type='text/plain')
         self.fname.name = link_file_path

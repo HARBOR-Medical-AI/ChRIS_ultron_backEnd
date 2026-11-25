@@ -589,15 +589,16 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
         inst = self.instance('registeringFiles')
         job = self.overtaken(inst)
         job.storage_manager = mock.Mock()
-        job.plugin_inst_output_files = {f'{inst.get_output_path()}/sub/a.txt'}
+        job._expect('sub/a,b.txt')
         folders = ChrisFolder.objects.count()
 
         self.assertTrue(job.registration_overtaken())
         job._register_output_files()
 
+        job.storage_manager.walk.assert_not_called()
         job.storage_manager.sanitize_obj_names.assert_not_called()
         self.assertEqual(ChrisFolder.objects.count(), folders)
-        self.assertEqual(job.plugin_inst_output_files, set())
+        self.assertEqual(job._files_registered, 0)
 
     def test_a_run_overtaken_after_its_files_were_checked_writes_no_link_or_copy(self):
         inst = self.instance('registeringFiles')
@@ -605,7 +606,7 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
         job._registration_token = job._claim_registration()
         job.pfcon_client.pfcon_innetwork = True
         job._get_job_json_data = mock.Mock(return_value={})
-        job.check_files_from_json_exist = mock.Mock(
+        job.expect_json_files = mock.Mock(
             side_effect=lambda content: PluginInstanceLock.objects.filter(
                 plugin_inst_id=inst.pk).update(owner_token=NEWER_RUN))
         writers = ('_handle_unextpath_parameters',
@@ -653,8 +654,9 @@ class RegistrationTaskTests(PluginInstanceFixture, TestCase):
         link = f'{output}/in.chrislink'
 
         for step, call, storage in (
-                ('ls', lambda job: job.check_files_from_json_exist(
-                    {'job_output_path': output, 'rel_file_paths': ['out.txt']}), {}),
+                ('walk', lambda job: job.expect_json_files(
+                    {'job_output_path': output, 'rel_file_paths': ['out.txt']})
+                 or job._register_output_files(), {}),
                 ('upload_obj', lambda job: job.unpack_zip_file(archive.getvalue()), {}),
                 ('ls of a ts input', lambda job: job.find_all_storage_object_paths(
                     output, set(), set()), {'ls.side_effect': SoftTimeLimitExceeded()}),
@@ -761,14 +763,10 @@ class FollowerSchedulingTests(PluginInstanceFixture, TestCase):
         self.addCleanup(storage.delete_path, parent.get_output_path())
         storage.upload_obj(name, b'x')
 
-        def files_found(job, content):
-            job.plugin_inst_output_files = {name}
-
         job_class = tasks.PluginInstanceAppJob
+        found = {'job_output_path': parent.get_output_path(), 'rel_file_paths': ['a.txt']}
         with mock.patch.object(job_class, '_get_status', return_value=FINISHED), \
-                mock.patch.object(job_class, '_get_job_json_data', return_value={}), \
-                mock.patch.object(job_class, 'check_files_from_json_exist',
-                                  autospec=True, side_effect=files_found), \
+                mock.patch.object(job_class, '_get_job_json_data', return_value=found), \
                 mock.patch.object(job_class, 'enqueue_run'), \
                 mock.patch.object(tasks.run_plugin_instance_job, 'delay') as submit:
             tasks.register_plugin_instance_output(parent.pk)

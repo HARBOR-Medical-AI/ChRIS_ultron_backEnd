@@ -121,8 +121,6 @@ class PluginInstanceJob(abc.ABC):
         self.pfcon_client.requires_copy_job = cr.compute_requires_copy_job
         self.pfcon_client.requires_upload_job = cr.compute_requires_upload_job
 
-        self.plugin_inst_output_files = set()  # set of obj names in object storage
-
         self.storage_manager = connect_storage(settings)
         self.storage_env = settings.STORAGE_ENV
 

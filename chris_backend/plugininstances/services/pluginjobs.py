@@ -27,6 +27,8 @@ from rest_framework.authtoken.models import Token
 from core.utils import json_zip2str
 from core.models import (ChrisFolder, ChrisLinkFile, PathAccessError,
                          validate_path_access)
+from core.registration import FileRegistrar, FolderIndex, Stopped
+from core.storage import sanitized_path
 from plugininstances.models import PluginInstance, PluginInstanceLock
 from userfiles.models import UserFile
 from .abstractjobs import ARM_REMOTE_CLEANUP, PluginInstanceJob
@@ -46,9 +48,12 @@ class PluginInstanceAppJob(PluginInstanceJob):
     def __init__(self, plugin_instance):
         super().__init__(plugin_instance)
         self.l_plugin_inst_param_instances = self.c_plugin_inst.get_parameter_instances()
-        # the token of the registration this object runs, the link files it wrote and how
-        # many output files it registered
+        # the token of the registration this object runs, whether it resumes an earlier
+        # run's, the output files it expects (their paths in the output folder, sanitized),
+        # the link files it wrote and how many output files it registered
         self._registration_token = None
+        self._resume = False
+        self._expected = set()
         self._links_written = set()
         self._files_registered = 0
 
@@ -507,7 +512,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
                                      f'{storage_fname} to storage, detail: {str(e)}')
                         self.c_plugin_inst.error_code = 'CODE07'
                         raise ValueError(str(e))
-                    self.plugin_inst_output_files.add(storage_fname)
+                    self._expect(fname.lstrip('/'))
         except (ValueError, SoftTimeLimitExceeded):
             raise
         except Exception as e:
@@ -516,10 +521,11 @@ class PluginInstanceAppJob(PluginInstanceJob):
             self.c_plugin_inst.error_code = 'CODE04'
             raise
 
-    def check_files_from_json_exist(self, json_file_content):
+    def expect_json_files(self, json_file_content):
         """
-        Check whether all files listed in the job json file from the remote indeed
-        exist in storage.
+        Have the registration register the files that the job JSON file from the remote
+        lists in the output folder (it finds them in storage), once the JSON is checked to
+        be about this instance's output folder (CODE16).
         """
         job_id = self.str_job_id
         plg_inst_output_path = self.c_plugin_inst.get_output_path()
@@ -532,31 +538,19 @@ class PluginInstanceAppJob(PluginInstanceJob):
             self.c_plugin_inst.error_code = 'CODE16'
             raise ValueError(err_msg)
 
-        files_from_json = set([os.path.join(job_output_path, p) for p in
-                               json_file_content['rel_file_paths']])
+        for path in json_file_content['rel_file_paths']:
+            self._expect(path)
 
-        for i in range(60):  # list until every file is there, 60 times at most, 1 s apart
-            try:
-                files_in_storage = set(self.storage_manager.ls(job_output_path))
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as e:
-                logger.error(f'[CODE15,{job_id}]: Error while listing storage files '
-                             f'in {job_output_path}, detail: {str(e)}')
-                self.c_plugin_inst.error_code = 'CODE15'
-                raise
-
-            if files_from_json.issubset(files_in_storage):
-                break
-            if i == 59:
-                nmissing = len(files_from_json.difference(files_in_storage))
-                err_msg = f'Missing {nmissing} files in storage'
-                logger.error(f'[CODE14,{job_id}]: Inconsistency between received '
-                             f'JSON file and storage, detail: {err_msg}')
-                self.c_plugin_inst.error_code = 'CODE14'
-                raise ValueError(err_msg)
-            time.sleep(1)
-        self.plugin_inst_output_files = files_from_json
+    def _expect(self, path):
+        """
+        Have the registration register the file at ``path`` in the output folder, under
+        the path ``sanitize_obj_names`` gives it. Not a file whose name has nothing but
+        commas and white space (that renaming deletes it), nor a link file (a plugin may
+        not write one: the registration deletes it).
+        """
+        path = sanitized_path(path)
+        if path and not path.endswith('.chrislink'):
+            self._expected.add(path)
 
     def _handle_unextpath_parameters(self, unextpath_parameters_dict):
         """
@@ -611,42 +605,25 @@ class PluginInstanceAppJob(PluginInstanceJob):
             return
         self._links_written.add((path, parent_folder.path))
 
-        str_source_trace_dir = path.replace('/', '_')
+        name = path.replace('/', '_')
         try:
-            ChrisFolder.objects.get(path=path)
-        except ChrisFolder.DoesNotExist:
-            try:
-                if self.storage_manager.obj_exists(path):  # path is a file
-                    link_file = self._link_file(path, owner, parent_folder,
-                                                str_source_trace_dir)
-                    link_file.save(name=str_source_trace_dir)
-                    logger.debug(f'Creating link file -->'
-                                 f'{link_file.fname.name}<-- for job {job_id}')
-                    self.c_plugin_inst.size += link_file.fname.size
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as e:
-                logger.error(f'[CODE09,{job_id}]: Error while creating link file '
-                             f'to {path} from {parent_folder.path} in storage, '
-                             f'detail: {str(e)}')
-                self.c_plugin_inst.error_code = 'CODE09'
-                raise
-        else:  # path is a folder
-            try:
-                link_file = self._link_file(path, owner, parent_folder,
-                                            str_source_trace_dir)
-                link_file.save(name=str_source_trace_dir)
+            # a folder, or a file: a path that is neither gets no link file
+            if (ChrisFolder.objects.filter(path=path).exists()
+                    or self.storage_manager.obj_exists(path)):
+                link_file = self._save_link_file(
+                    self._link_file(path, owner, parent_folder, name), name)
                 logger.debug(f'Creating link file -->'
                              f'{link_file.fname.name}<-- for job {job_id}')
-                self.c_plugin_inst.size += link_file.fname.size
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as e:
-                logger.error(f'[CODE09,{job_id}]: Error while creating link file '
-                             f'to {path} from {parent_folder.path} in storage, '
-                             f'detail: {str(e)}')
-                self.c_plugin_inst.error_code = 'CODE09'
-                raise
+                # what it holds is the path it links
+                self.c_plugin_inst.size += len(link_file.path.encode())
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as e:
+            logger.error(f'[CODE09,{job_id}]: Error while creating link file '
+                         f'to {path} from {parent_folder.path} in storage, '
+                         f'detail: {str(e)}')
+            self.c_plugin_inst.error_code = 'CODE09'
+            raise
 
     @staticmethod
     def _link_file(path, owner, parent_folder, name):
@@ -665,6 +642,24 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
         if link_file.path != path:
             raise ValueError(f'{fname} links {link_file.path}, not {path}')
+        return link_file
+
+    @staticmethod
+    def _save_link_file(link_file, name):
+        """
+        Save ``link_file``, named ``name``, which writes its storage object, and return
+        it; or the row another run of the registration inserted since ``_link_file``
+        looked, when that row links the same path (raises when it links another).
+        """
+        try:
+            with transaction.atomic():
+                link_file.save(name=name)
+        except IntegrityError:
+            other = ChrisLinkFile.objects.get(fname=link_file.fname.name)
+            if other.path != link_file.path:
+                raise ValueError(f'{other.fname.name} links {other.path}, '
+                                 f'not {link_file.path}') from None
+            return other
         return link_file
 
     def _handle_unextpath_parameters_innetwork_filesystem(self, unextpath_parameters_dict):
@@ -712,18 +707,7 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     # set_trace(host = "0.0.0.0", port = 6900, term_size = (223, 60))
                     obj_output_path = obj_output_path_prefix + '/' + obj.replace(
                         path, '', 1).lstrip('/')
-                    try:
-                        if not self.storage_manager.obj_exists(obj_output_path):
-                            self.storage_manager.copy_obj(obj, obj_output_path)
-                    except SoftTimeLimitExceeded:
-                        raise
-                    except Exception as e:
-                        logger.error(f'[CODE09,{job_id}]: Error while copying file '
-                                     f'from {obj} to {obj_output_path} in storage, '
-                                     f'detail: {str(e)}')
-                        self.c_plugin_inst.error_code = 'CODE09'
-                        raise
-                    self.plugin_inst_output_files.add(obj_output_path)
+                    self._copy_to_output(obj, obj_output_path)
 
     def _handle_ts_unextracted_input_objs(self, d_ts_input_objs, group_by_instance):
         """
@@ -770,18 +754,33 @@ class PluginInstanceAppJob(PluginInstanceJob):
                     # also the one an earlier run created: the remote removed its file
                     self._create_chris_link_file(path, parent_folder)
                 else:
-                    try:
-                        if not self.storage_manager.obj_exists(obj_output_path):
-                            self.storage_manager.copy_obj(obj, obj_output_path)
-                    except SoftTimeLimitExceeded:
-                        raise
-                    except Exception as e:
-                        logger.error(f'[CODE09,{job_id}]: Error while copying file '
-                                     f'from {obj} to {obj_output_path} in storage, '
-                                     f'detail: {str(e)}')
-                        self.c_plugin_inst.error_code = 'CODE09'
-                        raise
-                    self.plugin_inst_output_files.add(obj_output_path)
+                    self._copy_to_output(obj, obj_output_path)
+
+    def _copy_to_output(self, obj, obj_output_path):
+        """
+        Copy the object at ``obj`` in storage to ``obj_output_path`` in the output folder,
+        which the registration then expects, unless an earlier run of the registration
+        copied it there (and renamed it, if its name has commas). A copy that fails is
+        logged and raised, with CODE09.
+        """
+        job_id = self.str_job_id
+        outputdir = self.c_plugin_inst.get_output_path()
+        path = obj_output_path[len(outputdir) + 1:]
+        renamed = f'{outputdir}/{sanitized_path(path)}'
+        try:
+            if not (self.storage_manager.obj_exists(obj_output_path)
+                    or (renamed != obj_output_path
+                        and self.storage_manager.obj_exists(renamed))):
+                self.storage_manager.copy_obj(obj, obj_output_path)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as e:
+            logger.error(f'[CODE09,{job_id}]: Error while copying file '
+                         f'from {obj} to {obj_output_path} in storage, '
+                         f'detail: {str(e)}')
+            self.c_plugin_inst.error_code = 'CODE09'
+            raise
+        self._expect(path)
 
     def handle_finished_successfully_status(self):
         """
@@ -880,15 +879,18 @@ class PluginInstanceAppJob(PluginInstanceJob):
         wins), with its remote cleanup.
 
         It may run more than once, one after another (a task redelivered after its worker
-        died) or at once (redelivered while it ran): each run claims the registration with
-        a token of its own, the newest wins, and only the run that owns it writes the final
-        status. What a run writes before is the same whatever the runs: files already
-        registered are left as they are and link files are written again.
+        died, the next attempt after a soft time limit) or at once (redelivered while it
+        ran): each run claims the registration with a token of its own, the newest wins,
+        and only the run that owns it writes the final status; an older run stops before
+        its next batch of files. What a run writes before is the same whatever the runs:
+        a run that follows another resumes it, inserting only the files without a row,
+        and link files are written again.
         """
         token = self._registration_token = self._claim_registration()
         started = time.monotonic()
         # the total of what this run registers: a run again counts every file again
         self.c_plugin_inst.size = 0
+        self._expected = set()
         self._links_written = set()
         self._files_registered = 0
         remote_status = self._remote_job_status()
@@ -937,11 +939,13 @@ class PluginInstanceAppJob(PluginInstanceJob):
     def _claim_registration(self):
         """
         Make this run the owner of the instance's registration, whose record keeps when
-        the first run started, and return the token that says so.
+        the first run started, and return the token that says so. A record there already
+        says that an earlier run started it, which this one resumes (``_resume``).
         """
         token = secrets.token_hex(16)
-        PluginInstanceLock.objects.update_or_create(plugin_inst_id=self.c_plugin_inst.pk,
-                                                    defaults={'owner_token': token})
+        (_, created) = PluginInstanceLock.objects.update_or_create(
+            plugin_inst_id=self.c_plugin_inst.pk, defaults={'owner_token': token})
+        self._resume = not created
         return token
 
     def _remote_job_status(self):
@@ -1033,16 +1037,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
             return 'cancelled'  # giving up
 
         try:
-            self._data_fetched()
-
-            if self.pfcon_client.pfcon_innetwork:
-                logger.info('Checking that all remote output files for job '
-                            '%s exist in file storage', job_id)
-                self.check_files_from_json_exist(job_file_content)
-            else:
-                logger.info('Uploading remote output files for job %s to '
-                            'file storage', job_id)
-                self.unpack_zip_file(job_file_content)
+            self._receive_output(job_file_content)
+            job_file_content = None  # what it lists is expected: not held twice
 
             if self.registration_overtaken():
                 return 'cancelled'  # what follows writes links and copies
@@ -1064,12 +1060,30 @@ class PluginInstanceAppJob(PluginInstanceJob):
                 self._handle_ts_unextracted_input_objs(d_ts_input_objs, tf)
 
             self._register_output_files()  # register output files in the DB
+        except Stopped:
+            return 'cancelled'  # overtaken: the final status is another's to write
         except SoftTimeLimitExceeded:
             raise
         except Exception:
             self._log_unreported_failure()
             return 'cancelled'  # giving up
         return 'finishedSuccessfully'
+
+    def _receive_output(self, job_file_content):
+        """
+        Record that the output data came back, and take what the remote sent: the job
+        JSON file of an in-network remote, which lists the files it wrote in storage, or
+        the zip file of another remote, whose files are uploaded to storage. Either way
+        the registration expects those files.
+        """
+        self._data_fetched()
+
+        if self.pfcon_client.pfcon_innetwork:
+            self.expect_json_files(job_file_content)
+        else:
+            logger.info('Uploading remote output files for job %s to file storage',
+                        self.str_job_id)
+            self.unpack_zip_file(job_file_content)
 
     def _log_unreported_failure(self):
         """
@@ -1141,18 +1155,11 @@ class PluginInstanceAppJob(PluginInstanceJob):
             self.c_plugin_inst.error_code = 'CODE03'
         else:
             try:
-                self._data_fetched()
-
-                if self.pfcon_client.pfcon_innetwork:
-                    logger.info('Checking that all remote output files for job %s '
-                                'exist in file storage', job_id)
-                    self.check_files_from_json_exist(job_file_content)
-                else:
-                    logger.info('Uploading remote output files for job %s to file '
-                                'storage', job_id)
-                    self.unpack_zip_file(job_file_content)
-
+                self._receive_output(job_file_content)
+                job_file_content = None  # what it lists is expected: not held twice
                 self._register_output_files()  # register output files in the DB
+            except Stopped:
+                pass  # overtaken: the final status is another's to write
             except SoftTimeLimitExceeded:
                 raise
             except Exception:
@@ -1170,93 +1177,128 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
     def _register_output_files(self):
         """
-        Internal method to register output files generated for the plugin instance with
-        the DB. Handles special cases:
-            - Files with names that only contain commas and white spaces are deleted.
-            - Folders with names that only contain commas and white spaces are removed
-            after moving their contents to the parent folder.
+        Register the output files the registration expects (those the remote wrote or
+        sent, and the copies this run made), with their sizes, in batches of rows
+        (core.registration), as one walk of the output folder in storage finds them:
+            - CUBE's own link files, which have rows already, are left as they are;
+            - any other link file is refused and deleted (CODE07 when that fails): a
+              plugin may not write one, which a later job would follow;
+            - objects the registration does not expect are not registered.
+        When files are missing and the walk met names with commas, the objects are
+        renamed (sanitize_obj_names) and walked again at once, which finds them under
+        their new names. Files still missing are looked for again by walks a few seconds
+        apart (listing_tries: a listing of object storage, or of a network filesystem,
+        may lag the writes), for a minute after the first. Files missing after the last
+        walk fail the registration, with CODE14; a listing that fails ends it with
+        CODE15. A run that resumes an earlier one inserts only the
+        files without a row. The size of the files registered is added to the
+        instance's.
         """
         job_id = self.str_job_id
         logger.info('Registering output files with job %s', job_id)
 
-        owner = self.c_plugin_inst.owner
-        outputdir = self.c_plugin_inst.get_output_path()
-        files = []
-        folders = {}
-
         if self.registration_overtaken():  # no renames, folders or rows of its own
-            self.plugin_inst_output_files = set()
             return
 
-        # remove commas from the existing files/folders names and handle the special cases
-        changed_file_paths = self.storage_manager.sanitize_obj_names(outputdir)
+        output = self.c_plugin_inst.get_output_path()
+        owner = self.c_plugin_inst.owner
+        registrar = FileRegistrar(UserFile, owner, FolderIndex(output, owner),
+                                  resume=self._resume,
+                                  should_stop=self.registration_overtaken)
+        try:
+            self._find_expected_files(output, registrar)
+            registrar.close()
+        finally:
+            self._files_registered = registrar.files
+            self.c_plugin_inst.size += registrar.bytes
 
-        for obj_path in self.plugin_inst_output_files:
-            if obj_path in changed_file_paths:
-                obj_path = changed_file_paths[obj_path]
+        if self._expected:
+            err_msg = f'Missing {len(self._expected)} files in storage'
+            logger.error(f'[CODE14,{job_id}]: Inconsistency between received '
+                         f'output and storage, detail: {err_msg}')
+            self.c_plugin_inst.error_code = 'CODE14'
+            raise ValueError(err_msg)
 
-            if obj_path:
-                if obj_path.endswith('.chrislink'):
-                    # Plugins are not authorized to produce ChRIS link files.
-                    # Any link file coming from the remote compute (zip/json
-                    # output) is refused and deleted from storage so subsequent
-                    # jobs cannot follow it. Legit link files created by CUBE for
-                    # 'unextpath' parameters or 'ts' plugins are registered
-                    # directly as ChrisLinkFile objects and never reach this set.
-                    logger.warning(f'Refusing to register link file '
-                                   f'-->{obj_path}<-- produced by job {job_id}; '
-                                   f'deleting it from storage')
-                    try:
-                        self.storage_manager.delete_obj(obj_path)
-                    except SoftTimeLimitExceeded:
-                        raise
-                    except Exception as e:
-                        # a non-deletable attacker-controlled link left in an
-                        # output dir is a security-relevant state: fail the job
-                        logger.error(f'[CODE07,{job_id}]: Error while deleting '
-                                     f'unauthorized link file {obj_path} from '
-                                     f'storage, detail: {str(e)}')
-                        self.c_plugin_inst.error_code = 'CODE07'
-                        raise
-                    continue
-
-                folder_path = os.path.dirname(obj_path)
-                parent_folder = folders.get(folder_path)
-
-                if parent_folder is None:
-                    (parent_folder, _) = ChrisFolder.objects.get_or_create(
-                        path=folder_path, owner=owner)
-                    folders[folder_path] = parent_folder
-
-                plg_inst_file = UserFile(owner=owner, parent_folder=parent_folder)
-                plg_inst_file.fname.name = obj_path
-                files.append(plg_inst_file)
-
-        if self.registration_overtaken():
-            # since the check above: a cancel's cleanup may be deleting the output
-            self.plugin_inst_output_files = set()
-            return
-
-        self.plugin_inst_output_files = {f.fname.name for f in files}
-        db_files = self._insert_files(files)
-        self._files_registered = len(db_files)
-
-        total_size = 0
-        for plg_inst_file in db_files:
-            total_size += plg_inst_file.fname.size
-        self.c_plugin_inst.size += total_size
-
-    @staticmethod
-    def _insert_files(files):
+    def _find_expected_files(self, output, registrar):
         """
-        Insert the rows of ``files`` and return them. A file that an earlier run of the
-        registration registered is left as it is: the INSERT fails at once on it and is
-        made again skipping the rows already there. The plain INSERT comes first because
-        one that skips conflicting rows checks every row before writing it, which makes
-        the insert of a large output about three-quarters longer.
+        Walk the output folder until it has found every file expected, or listing_tries
+        has no try left, or another run has taken the registration over
+        (_register_output_files says what a walk does, and when the objects are renamed
+        and walked again: on each try that met names to rename, since a later listing
+        may show more of them).
+        """
+        links = set(ChrisLinkFile.objects.filter(fname__startswith=output + '/')
+                    .order_by().values_list('fname', flat=True))
+
+        for attempt, _ in enumerate(self.listing_tries()):
+            if attempt and self.registration_overtaken():
+                raise Stopped()  # no more walks of an output another run registers
+            unsanitized = self._walk_output(output, registrar, links)
+
+            if unsanitized and self._expected:
+                if self.registration_overtaken():
+                    raise Stopped()
+                self.storage_manager.sanitize_obj_names(output)
+                self._walk_output(output, registrar, links)
+            if not self._expected:
+                return
+
+    def _walk_output(self, output, registrar, links):
+        """
+        One walk of the output folder: each expected file it finds goes to ``registrar``
+        and out of the files expected, a link file that is not CUBE's (``links``) is
+        refused. Returns whether it met names that renaming would change.
+        """
+        start, unsanitized = len(output) + 1, False
+
+        for obj in self._listed(output):
+            path = obj.path[start:]
+
+            if obj.path in links:
+                continue
+            if path.endswith('.chrislink'):
+                self._refuse_link_file(obj.path)
+            elif sanitized_path(path) != path:
+                unsanitized = True
+            elif path in self._expected:
+                self._expected.remove(path)
+                registrar.add(obj.path, obj.size)
+        return unsanitized
+
+    def _listed(self, folder):
+        """
+        The objects a walk of ``folder`` lists; a listing that fails is logged and
+        raised, with CODE15. An error in the caller's handling of an object is the
+        caller's: it never reaches this generator.
         """
         try:
-            with transaction.atomic():
-                return UserFile.objects.bulk_create(files)
-        except IntegrityError:
-            return UserFile.objects.bulk_create(files, ignore_conflicts=True)
+            yield from self.storage_manager.walk(folder)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as e:
+            logger.error(f'[CODE15,{self.str_job_id}]: Error while listing storage '
+                         f'files in {folder}, detail: {str(e)}')
+            self.c_plugin_inst.error_code = 'CODE15'
+            raise
+
+    def _refuse_link_file(self, path):
+        """
+        Delete the link file at ``path`` in the output folder, which the plugin wrote:
+        plugins are not authorized to produce link files, and one left in storage would
+        be followed by a later job. A link file that cannot be deleted is a security
+        relevant state: the registration fails, with CODE07.
+        """
+        job_id = self.str_job_id
+        logger.warning(f'Refusing to register link file -->{path}<-- produced by job '
+                       f'{job_id}; deleting it from storage')
+        try:
+            self.storage_manager.delete_obj(path)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as e:
+            if self.storage_manager.is_missing(e):
+                return  # another run of the registration deleted it
+            logger.error(f'[CODE07,{job_id}]: Error while deleting unauthorized link '
+                         f'file {path} from storage, detail: {str(e)}')
+            self.c_plugin_inst.error_code = 'CODE07'
+            raise

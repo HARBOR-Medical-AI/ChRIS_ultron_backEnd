@@ -18,14 +18,15 @@ from pfconclient.exceptions import PfconRequestException
 
 from core.models import ChrisInstance, ChrisFolder, ChrisLinkFile
 from userfiles.models import UserFile
-from core.storage import connect_storage
+from core.storage import StorageObject, connect_storage
 from plugins.models import PluginMeta, Plugin
 from plugins.models import PluginParameter
 from plugininstances.models import (BoolParameter, ComputeResource, PathParameter,
                                     PluginInstance, StrParameter)
-from plugininstances.services import pluginjobs, copyjobs
+from plugininstances.services import abstractjobs, pluginjobs, copyjobs
 from plugininstances.services.abstractjobs import PluginInstanceJob
 from plugininstances.services.uploadjobs import PluginInstanceUploadJob
+from plugininstances.tests.test_abstractjobs import Clock
 from plugininstances.tests.test_transitions import PluginInstanceFixture
 
 
@@ -133,8 +134,9 @@ class PluginInstanceAppJobTests(TestCase):
 
     def _files_check_job(self, *listings):
         """
-        An app job whose output in a mocked storage lists ``listings`` one after another
-        (the last one from then on), and a job JSON listing 'a.txt' and 'sub/b.txt' in it.
+        An app job registering files whose walks of its output in a mocked storage find
+        ``listings`` one after another (the last one from then on), of 1 byte each, and
+        whose job JSON lists 'a.txt' and 'sub/b.txt' in it.
         """
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
@@ -142,47 +144,75 @@ class PluginInstanceAppJobTests(TestCase):
             plugin=plugin, owner=user, compute_resource=plugin.compute_resources.all()[0])
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
         output = pl_inst.get_output_path()
-        listings = [[f'{output}/{name}' for name in names] for names in listings]
+        left = [[StorageObject(f'{output}/{name}', 1) for name in names]
+                for names in listings]
         job.storage_manager = mock.Mock()
-        job.storage_manager.ls.side_effect = lambda path: (
-            listings.pop(0) if len(listings) > 1 else listings[0])
-        content = {'job_output_path': output, 'rel_file_paths': ['a.txt', 'sub/b.txt']}
-        return job, content
+        job.storage_manager.walk.side_effect = lambda path: iter(
+            left.pop(0) if len(left) > 1 else left[0])
+        job.expect_json_files({'job_output_path': output,
+                               'rel_file_paths': ['a.txt', 'sub/b.txt']})
+        return job, output
 
-    def test_the_files_check_lists_the_output_once_when_every_file_is_there(self):
-        job, content = self._files_check_job(['a.txt', 'sub/b.txt', 'c.txt'])
+    def test_the_files_are_registered_from_one_walk_when_every_file_is_there(self):
+        job, output = self._files_check_job(['a.txt', 'sub/b.txt', 'c.txt'])
+        clock = Clock()
 
-        with mock.patch.object(pluginjobs.time, 'sleep') as sleep:
-            job.check_files_from_json_exist(content)
+        with mock.patch.object(abstractjobs, 'time', clock):
+            job._register_output_files()
 
-        job.storage_manager.ls.assert_called_once_with(content['job_output_path'])
-        sleep.assert_not_called()
-        self.assertEqual(job.plugin_inst_output_files,
-                         {f"{content['job_output_path']}/a.txt",
-                          f"{content['job_output_path']}/sub/b.txt"})
+        job.storage_manager.walk.assert_called_once_with(output)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(sorted(UserFile.objects.filter(
+            fname__startswith=output + '/').values_list('fname', flat=True)),
+            [f'{output}/a.txt', f'{output}/sub/b.txt'])  # c.txt is not the job's
+        self.assertEqual((job._files_registered, job.c_plugin_inst.size), (2, 2))
 
-    def test_the_files_check_lists_again_a_second_later_until_every_file_is_there(self):
-        job, content = self._files_check_job(['a.txt'], ['a.txt'], ['a.txt', 'sub/b.txt'])
+    def test_files_not_found_are_looked_for_again_after_a_wait(self):
+        job, output = self._files_check_job(['a.txt'], ['a.txt'], ['a.txt', 'sub/b.txt'])
+        clock = Clock()
 
-        with mock.patch.object(pluginjobs.time, 'sleep') as sleep:
-            job.check_files_from_json_exist(content)
+        with mock.patch.object(abstractjobs, 'time', clock):
+            job._register_output_files()
 
-        self.assertEqual(job.storage_manager.ls.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(1)] * 2)
-        self.assertEqual(len(job.plugin_inst_output_files), 2)
+        self.assertEqual(job.storage_manager.walk.call_count, 3)
+        self.assertEqual(clock.sleeps, [1, 2])
+        self.assertEqual(UserFile.objects.filter(fname__startswith=output + '/').count(),
+                         2)
 
-    def test_the_files_check_fails_with_code14_after_60_listings_a_file_missed(self):
-        job, content = self._files_check_job(['a.txt'])
+    def test_files_still_missing_after_the_last_walk_fail_with_code14(self):
+        job, output = self._files_check_job(['a.txt'])
+        clock = Clock()
 
-        with mock.patch.object(pluginjobs.time, 'sleep') as sleep, \
+        with mock.patch.object(abstractjobs, 'time', clock), \
                 self.assertLogs('plugininstances', 'ERROR') as logs, \
                 self.assertRaisesRegex(ValueError, 'Missing 1 files in storage'):
-            job.check_files_from_json_exist(content)
+            job._register_output_files()
 
         self.assertIn('[CODE14,', logs.output[0])
-        self.assertEqual(job.storage_manager.ls.call_count, 60)
-        self.assertEqual(sleep.call_count, 59)
+        self.assertEqual(sum(clock.sleeps), 55)  # the walks within 60 s
         self.assertEqual(job.c_plugin_inst.error_code, 'CODE14')
+        # what was found is registered
+        self.assertTrue(UserFile.objects.filter(fname=f'{output}/a.txt').exists())
+
+    def test_a_walk_that_fails_ends_the_registration_with_code15(self):
+        job, _ = self._files_check_job(['a.txt'])
+        job.storage_manager.walk.side_effect = RuntimeError('503 Service Unavailable')
+
+        with self.assertLogs('plugininstances', 'ERROR') as logs, \
+                self.assertRaises(RuntimeError):
+            job._register_output_files()
+
+        self.assertIn('[CODE15,', logs.output[0])
+        self.assertEqual(job.c_plugin_inst.error_code, 'CODE15')
+
+    def test_a_job_json_about_another_output_fails_with_code16(self):
+        job, output = self._files_check_job([])
+
+        with self.assertLogs('plugininstances', 'ERROR') as logs, \
+                self.assertRaises(ValueError):
+            job.expect_json_files({'job_output_path': output + '_2', 'rel_file_paths': []})
+
+        self.assertIn('[CODE16,', logs.output[0])
 
     def test_plugin_job_can_run_registered_plugin_app(self):
         """
@@ -347,9 +377,9 @@ class PluginInstanceAppJobTests(TestCase):
                                             f.read(), content_type='text/plain')
 
         plg_inst_app_job = pluginjobs.PluginInstanceAppJob(pl_inst)
-        plg_inst_app_job.plugin_inst_output_files = {
-            outputdir + '/, ,/SAG,T1,MPRAGE/tes,t1.txt',
-            outputdir + '/, ,/SAG,T1,MPRAGE/test2.txt'}
+        plg_inst_app_job.expect_json_files({
+            'job_output_path': outputdir,
+            'rel_file_paths': [', ,/SAG,T1,MPRAGE/tes,t1.txt', ', ,/SAG,T1,MPRAGE/test2.txt']})
 
         plg_inst_app_job._register_output_files()
 
@@ -365,11 +395,9 @@ class PluginInstanceAppJobTests(TestCase):
         self.assertIn(outputdir + '/SAGT1MPRAGE/test1.txt', fnames)
         self.assertIn(outputdir + '/SAGT1MPRAGE/test2.txt', fnames)
 
-        self.assertEqual(len(plg_inst_app_job.plugin_inst_output_files), 2)
-        self.assertIn(outputdir + '/SAGT1MPRAGE/test1.txt',
-                      plg_inst_app_job.plugin_inst_output_files)
-        self.assertIn(outputdir + '/SAGT1MPRAGE/test2.txt',
-                      plg_inst_app_job.plugin_inst_output_files)
+        self.assertEqual(plg_inst_app_job._files_registered, 2)
+        self.assertTrue(self.storage_manager.obj_exists(outputdir +
+                                                        '/SAGT1MPRAGE/test1.txt'))
 
         # delete files from storage
         self.storage_manager.delete_path(outputdir)
@@ -392,7 +420,7 @@ class PluginInstanceAppJobTests(TestCase):
         job._get_job_zip_data = mock.Mock(return_value=b'')
         job._get_job_json_data = mock.Mock(return_value={})
         job.unpack_zip_file = mock.Mock()
-        job.check_files_from_json_exist = mock.Mock()
+        job.expect_json_files = mock.Mock()
         job.enqueue_run = mock.Mock()
         job._register_output_files = mock.Mock(
             side_effect=lambda: setattr(pl_inst, 'size', pl_inst.size + size))
@@ -475,12 +503,12 @@ class PluginInstanceAppJobTests(TestCase):
         job.enqueue_run = mock.Mock()
 
         def listed_then_cancelled(content):
-            job.plugin_inst_output_files = {name}
+            job._expect('a.txt')
             # the API cancels it and its cleanup may already be deleting the output
             PluginInstance.objects.get(pk=pl_inst.pk).transition('cancelled',
                                                                  'registeringFiles')
 
-        job.check_files_from_json_exist = mock.Mock(side_effect=listed_then_cancelled)
+        job.expect_json_files = mock.Mock(side_effect=listed_then_cancelled)
 
         job.register_output()
 
@@ -645,10 +673,8 @@ class PluginInstanceAppJobTests(TestCase):
             job = pluginjobs.PluginInstanceAppJob(PluginInstance.objects.get(pk=pl_inst.pk))
             job._get_status = mock.Mock(
                 return_value={'compute': {'status': 'finishedSuccessfully'}})
-            job._get_job_json_data = mock.Mock(return_value={})
-            job.check_files_from_json_exist = mock.Mock(
-                side_effect=lambda content, job=job: setattr(
-                    job, 'plugin_inst_output_files', set(names)))
+            job._get_job_json_data = mock.Mock(return_value={
+                'job_output_path': output, 'rel_file_paths': ['a.txt', 'sub/b.txt']})
             job.enqueue_run = mock.Mock()
 
             with CaptureQueriesContext(connection) as queries:
@@ -659,8 +685,8 @@ class PluginInstanceAppJobTests(TestCase):
         self.assertEqual(UserFile.objects.filter(fname__in=names).count(), 2)
         db_inst = PluginInstance.objects.get(pk=pl_inst.id)
         self.assertEqual((db_inst.status, db_inst.size), ('finishedSuccessfully', 10))
-        # only the second run, whose INSERT fails on the first run's rows, skips rows
-        self.assertEqual(inserts, [[False], [False, True]])
+        # the second run resumes the first: it finds the rows there and inserts none
+        self.assertEqual(inserts, [[False], []])
 
     def test_a_link_file_written_again_keeps_its_row(self):
         pl_inst = self._create_plugin_inst()
@@ -880,8 +906,8 @@ class PluginInstanceAppJobTests(TestCase):
                                             f.read(), content_type='text/plain')
 
         job = pluginjobs.PluginInstanceAppJob(pl_inst)
-        job.plugin_inst_output_files = {outputdir + '/data.txt',
-                                        outputdir + '/evil.chrislink'}
+        job.expect_json_files({'job_output_path': outputdir,
+                               'rel_file_paths': ['data.txt', 'evil.chrislink']})
         job._register_output_files()
 
         fnames = [f.fname.name for f in pl_inst.output_folder.chris_files.all()]
@@ -893,9 +919,7 @@ class PluginInstanceAppJobTests(TestCase):
         self.assertTrue(
             self.storage_manager.obj_exists(outputdir + '/data.txt'))
 
-        self.assertIn(outputdir + '/data.txt', job.plugin_inst_output_files)
-        self.assertNotIn(outputdir + '/evil.chrislink',
-                         job.plugin_inst_output_files)
+        self.assertEqual(job._files_registered, 1)
 
         # delete files from storage
         self.storage_manager.delete_path(outputdir)
@@ -911,10 +935,13 @@ class PluginInstanceAppJobTests(TestCase):
         outputdir = pl_inst.get_output_path()
 
         job.storage_manager = mock.Mock()
-        job.storage_manager.sanitize_obj_names = mock.Mock(return_value={})
+        job.storage_manager.walk.return_value = iter(
+            [StorageObject(outputdir + '/evil.chrislink', 18)])
         job.storage_manager.delete_obj = mock.Mock(
             side_effect=Exception('boom'))
-        job.plugin_inst_output_files = {outputdir + '/evil.chrislink'}
+        job.storage_manager.is_missing = mock.Mock(return_value=False)  # still there
+        job.expect_json_files({'job_output_path': outputdir,
+                               'rel_file_paths': ['evil.chrislink']})
 
         # the failed deletion logs at ERROR (CODE07) before re-raising; capture/
         # suppress with assertLogs and verify the expected message fired
@@ -931,7 +958,7 @@ class PluginInstanceAppJobTests(TestCase):
         """
         Test whether _register_output_files preserves legit ChRIS link files
         created by CUBE (via _create_chris_link_file) for 'unextpath'/'ts' flows,
-        i.e. they are not in plugin_inst_output_files and are not scrubbed.
+        i.e. the registration neither registers nor deletes them.
         """
         user = User.objects.get(username=self.username)
         plugin = Plugin.objects.get(meta__name=self.plugin_fs_name)
@@ -961,11 +988,11 @@ class PluginInstanceAppJobTests(TestCase):
         link_path = (outputdir + '/' +
                      target_folder.path.replace('/', '_') + '.chrislink')
 
-        # CUBE-generated link is a ChrisLinkFile and NOT in the remote-output set
+        # CUBE-generated link is a ChrisLinkFile, which the registration leaves as it is
         self.assertTrue(ChrisLinkFile.objects.filter(fname=link_path).exists())
-        self.assertNotIn(link_path, job.plugin_inst_output_files)
 
-        job.plugin_inst_output_files = {outputdir + '/data.txt'}
+        job.expect_json_files({'job_output_path': outputdir,
+                               'rel_file_paths': ['data.txt']})
         job._register_output_files()
 
         # the link file survived the scrub (storage + DB)
@@ -1087,7 +1114,7 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
 
         self.assertEqual(PluginInstance.objects.get(pk=job.c_plugin_inst.pk).status,
                          'finishedSuccessfully')
-        return len(job.plugin_inst_output_files) + len(job._links_written)
+        return job._files_registered + len(job._links_written)
 
     def _ts_plugin(self):
         (meta, _) = PluginMeta.objects.get_or_create(name='pl-topologicalcopy', type='ts')

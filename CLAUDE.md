@@ -150,6 +150,9 @@ Python tools are dev dependencies for `just lint`. `[tool.mypy]` in `pyproject.t
   `post_delete` receivers delete the storage object, so deleting a model row deletes bytes.
 - Storage backends are behind `core.storage.StorageManager` (Swift, S3, filesystem) chosen by
   `STORAGE_ENV`; get one with `connect_storage(settings)`. Files are immutable (WORM).
+  `walk(folder)` streams a folder's objects with their sizes (unlike `ls`, which on Swift
+  and S3 matches a raw prefix), and `core.registration` inserts a tree's folders and files
+  in batches, as a plugin instance's output registration does.
 
 ### Shared cache (`core/cache.py`)
 - `CACHES['default']` is Django's `RedisCache` on a Dragonfly of its own, `chris-cache`,
