@@ -1,15 +1,17 @@
 """
 Unit tests for what every storage manager shares: the paths ChRIS gives objects whose
-names have commas (``sanitized_path``), and the renames of ``sanitize_obj_names`` for a
-storage without folders (Swift, S3), on a storage kept in memory.
+names have commas (``sanitized_path``), and, on an object store kept in memory, what
+Swift and S3 share: the renames of ``sanitize_obj_names`` and the operations on paths.
 """
 
-from typing import Iterator
+from itertools import islice
+from typing import AnyStr, Iterator, Optional
 
 from django.test import SimpleTestCase
 
-from core.storage import StorageManager, StorageObject, sanitized_path
-from core.storage.storagemanager import sanitized_name
+from core.storage import StorageObject, in_tree, sanitized_path
+from core.storage.storagemanager import ObjectStorageManager, sanitized_name
+from core.tests.path_contract import PathContractTests
 
 
 class SanitizedPathTests(SimpleTestCase):
@@ -45,9 +47,10 @@ class SanitizedPathTests(SimpleTestCase):
                 self.assertEqual(sanitized_path(once), once)
 
 
-class MemoryStorage(StorageManager):
+class MemoryStorage(ObjectStorageManager):
     """
-    Objects in a dict, enough of a StorageManager for the default sanitize_obj_names.
+    Objects in a dict: an object store as Swift and S3 are, whose listing of a prefix
+    holds the names that start with it, in their order.
     """
 
     def __init__(self, *paths):
@@ -56,11 +59,24 @@ class MemoryStorage(StorageManager):
     def create_container(self) -> None:
         pass
 
-    def walk(self, folder: str) -> Iterator[StorageObject]:
-        prefix = folder.rstrip('/') + '/'
-        for path in sorted(self.objects):
-            if path.startswith(prefix):
-                yield StorageObject(path, len(self.objects[path]))
+    def _objects(self, prefix: str,
+                 limit: Optional[int] = None) -> Iterator[StorageObject]:
+        names = (name for name in sorted(self.objects) if name.startswith(prefix))
+        for name in islice(names, limit):
+            yield StorageObject(name, len(self.objects[name]))
+
+    def obj_exists(self, file_path: str) -> bool:
+        return file_path in self.objects
+
+    def upload_obj(self, file_path: str, contents: AnyStr,
+                   content_type: Optional[str] = None):
+        data = contents.encode() if isinstance(contents, str) else contents
+        self.objects[file_path] = data
+
+    def download_obj(self, file_path: str) -> bytes:
+        if file_path not in self.objects:
+            raise FileNotFoundError(file_path)
+        return self.objects[file_path]
 
     def copy_obj(self, src: str, dst: str) -> None:
         if src not in self.objects:
@@ -68,7 +84,47 @@ class MemoryStorage(StorageManager):
         self.objects[dst] = self.objects[src]
 
     def delete_obj(self, file_path: str) -> None:
-        del self.objects[file_path]
+        self.objects.pop(file_path, None)
+
+
+class InTreeTests(SimpleTestCase):
+
+    def test_a_path_is_in_the_tree_of_its_folders_not_of_a_sibling_that_starts_alike(self):
+        for path, folder, expected in (('a/data', 'a/data', True),
+                                       ('a/data/', 'a/data', True),
+                                       ('a/data/x', 'a/data/', True),
+                                       ('a/data_2', 'a/data', False),
+                                       ('a/data-x/y', 'a/data', False),
+                                       ('a', 'a/data', False)):
+            with self.subTest(path=path, folder=folder):
+                self.assertEqual(in_tree(path, folder), expected)
+
+
+class ObjectStoragePathTests(PathContractTests, SimpleTestCase):
+    """
+    The path contract, and the cases only an object store has, on the code that Swift and
+    S3 share.
+    """
+
+    def setUp(self):
+        self.manager = MemoryStorage()
+
+    def test_an_object_and_a_folder_of_one_name_are_one_path_a_slash_the_folder(self):
+        self.upload('test/a', 'test/a/x', 'test/a-b')
+
+        self.assertEqual(self.manager.ls('test/a'), ['test/a', 'test/a/x'])
+        self.assertEqual(self.manager.ls('test/a', limit=1), ['test/a'])
+        self.assertEqual(self.manager.ls('test/a/'), ['test/a/x'])
+        self.manager.delete_path('test/a/')
+        self.assertEqual(sorted(self.manager.objects), ['test/a', 'test/a-b'])
+
+    def test_a_folder_moves_into_a_folder_of_its_own(self):
+        self.upload('test/a/x', 'test/a/sub/y')
+
+        self.manager.move_path('test/a', 'test/a/sub/moved')
+
+        self.assertEqual(sorted(self.manager.objects),
+                         ['test/a/sub/moved/sub/y', 'test/a/sub/moved/x'])
 
 
 class SanitizeObjNamesTests(SimpleTestCase):

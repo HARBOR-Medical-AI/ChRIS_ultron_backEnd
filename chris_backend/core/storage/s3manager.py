@@ -12,13 +12,14 @@ MD5 hashes. We disable this via botocore.config.Config below.
 
 import logging
 import time
+from itertools import batched
 from typing import AnyStr, Iterator, List, Optional
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from core.storage.storagemanager import StorageManager, StorageObject
+from core.storage.storagemanager import ObjectStorageManager, StorageObject
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,12 @@ _S3_CLIENT_CONFIG = Config(
 )
 
 
-class S3Manager(StorageManager):
+class S3Manager(ObjectStorageManager):
 
     #: the most keys S3 returns in one listing request
     PAGE_SIZE = 1000
+    #: the most keys one DeleteObjects request takes
+    DELETE_BATCH = 1000
 
     def __init__(self, bucket_name: str, conn_params: dict):
         self.bucket_name = bucket_name
@@ -87,20 +90,10 @@ class S3Manager(StorageManager):
                 logger.error(str(e))
                 raise
 
-    def ls(self, path: str, limit: Optional[int] = None) -> List[str]:
-        """
-        Return a list of object keys in the bucket with the given path as prefix, of
-        ``limit`` keys at most when given: a request per 1,000 of them.
-        """
-        if not path:
-            return []
-        return [obj['Key'] for page in self._pages(path, limit) for obj in page]
-
-    def walk(self, folder: str) -> Iterator[StorageObject]:
-        for page in self._pages(folder.rstrip('/') + '/'):
+    def _objects(self, prefix: str, limit: Optional[int] = None) -> Iterator[StorageObject]:
+        for page in self._pages(prefix, limit):
             for obj in page:
-                if not obj['Key'].endswith('/'):  # not the marker of a folder
-                    yield StorageObject(obj['Key'], obj['Size'])
+                yield StorageObject(obj['Key'], obj['Size'])
 
     def _pages(self, prefix: str, limit: Optional[int] = None) -> Iterator[List[dict]]:
         """
@@ -143,12 +136,6 @@ class S3Manager(StorageManager):
                     raise
                 attempt += 1
                 time.sleep(0.4)
-
-    def path_exists(self, path: str) -> bool:
-        """
-        Return True if any objects exist under the given path prefix.
-        """
-        return any(True for _ in self._pages(path, limit=1))
 
     def obj_exists(self, file_path: str) -> bool:
         """
@@ -232,13 +219,16 @@ class S3Manager(StorageManager):
 
     def delete_obj(self, file_path: str) -> None:
         """
-        Delete an object from S3.
+        Delete an object from S3: one that is not there counts as deleted (S3 itself
+        answers so; some S3-compatible services answer 404).
         """
         client = self.__get_client()
         for i in range(5):
             try:
                 client.delete_object(Bucket=self.bucket_name, Key=file_path)
             except ClientError as e:
+                if self.is_missing(e):
+                    return
                 logger.error(str(e))
                 if i == 4:
                     raise
@@ -250,38 +240,21 @@ class S3Manager(StorageManager):
         return (isinstance(error, ClientError)
                 and error.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'))
 
-    def copy_path(self, src: str, dst: str) -> None:
-        """
-        Copy all objects under src prefix to dst prefix.
-        """
-        l_ls = self.ls(src)
-        for obj_key in l_ls:
-            new_key = obj_key.replace(src, dst, 1)
-            self.copy_obj(obj_key, new_key)
-
-    def move_path(self, src: str, dst: str) -> None:
-        """
-        Move all objects under src prefix to dst prefix (copy + delete).
-        """
-        l_ls = self.ls(src)
-        for obj_key in l_ls:
-            new_key = obj_key.replace(src, dst, 1)
-            self.copy_obj(obj_key, new_key)
-            self.delete_obj(obj_key)
-
     def delete_path(self, path: str) -> None:
         """
-        Delete all objects under a given prefix.
-
-        Uses batch delete for efficiency (up to 1000 objects per request).
+        Delete the object at ``path`` and every object under the folder ``path``, 1,000
+        keys per DeleteObjects request (its limit), sent as the listing goes. A key that
+        S3 reports it could not delete (the request itself succeeding) raises once the
+        others are deleted.
         """
         client = self.__get_client()
+        failed = []
 
-        for contents in self._pages(path):
-            delete_keys = [{'Key': obj['Key']} for obj in contents]
+        for objs in batched(self._tree(path), self.DELETE_BATCH):
+            delete_keys = [{'Key': obj.path} for obj in objs]
             for i in range(5):
                 try:
-                    client.delete_objects(
+                    resp = client.delete_objects(
                         Bucket=self.bucket_name,
                         Delete={'Objects': delete_keys, 'Quiet': True},
                     )
@@ -291,4 +264,9 @@ class S3Manager(StorageManager):
                         raise
                     time.sleep(0.4)
                 else:
+                    failed += [e for e in resp.get('Errors', [])
+                               if e.get('Code') != 'NoSuchKey']
                     break
+        if failed:
+            keys = ', '.join(f"{e.get('Key')} ({e.get('Code')})" for e in failed[:5])
+            raise OSError(f'S3 did not delete {len(failed)} objects of {path}: {keys}')

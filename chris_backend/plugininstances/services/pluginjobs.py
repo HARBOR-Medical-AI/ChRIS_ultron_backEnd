@@ -28,7 +28,7 @@ from core.utils import json_zip2str
 from core.models import (ChrisFolder, ChrisLinkFile, PathAccessError,
                          validate_path_access)
 from core.registration import FileRegistrar, FolderIndex, Stopped
-from core.storage import sanitized_path
+from core.storage import in_tree, sanitized_path
 from plugininstances.models import PluginInstance, PluginInstanceLock
 from userfiles.models import UserFile
 from .abstractjobs import ARM_REMOTE_CLEANUP, PluginInstanceJob
@@ -405,12 +405,13 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
     def find_all_storage_object_paths(self, storage_path, obj_paths, visited_paths):
         """
-        Find all object storage paths from the passed storage path (prefix) by
-        recursively following ChRIS links. The resulting set of object paths is given
-        by the obj_paths set argument.
+        Find all object storage paths from the passed storage path (a file or a folder)
+        by recursively following ChRIS links. The resulting set of object paths is given
+        by the obj_paths set argument. A path in the tree of one listed already is not
+        listed again, which ends a loop of links.
         """
-        if not storage_path.startswith(tuple(visited_paths)):  # avoid infinite loops
-            visited_paths.add(storage_path)
+        if not any(in_tree(storage_path, visited) for visited in visited_paths):
+            visited_paths.add(storage_path.rstrip('/'))
             job_id = self.str_job_id
             output_dir = self.c_plugin_inst.get_output_path()
 
@@ -852,12 +853,13 @@ class PluginInstanceAppJob(PluginInstanceJob):
             'output_folder')
 
         count = 0
-        prefixes = [(self.c_plugin_inst.get_output_path(), False)]
+        # an output is a folder: its path with a slash names nothing else
+        prefixes = [(self.c_plugin_inst.get_output_path() + '/', False)]
         if self.copies_unextpath_objects():
             prefixes += [(path, False) for path in unextpaths]
         else:
             count += len(unextpaths)
-        prefixes += [(inst.get_output_path(), True) for inst in inputs]
+        prefixes += [(inst.get_output_path() + '/', True) for inst in inputs]
 
         for prefix, is_input in prefixes:
             if count > max_files:
@@ -1286,7 +1288,8 @@ class PluginInstanceAppJob(PluginInstanceJob):
         Delete the link file at ``path`` in the output folder, which the plugin wrote:
         plugins are not authorized to produce link files, and one left in storage would
         be followed by a later job. A link file that cannot be deleted is a security
-        relevant state: the registration fails, with CODE07.
+        relevant state: the registration fails, with CODE07. One that another run of the
+        registration deleted is no failure (``delete_obj``).
         """
         job_id = self.str_job_id
         logger.warning(f'Refusing to register link file -->{path}<-- produced by job '
@@ -1296,8 +1299,6 @@ class PluginInstanceAppJob(PluginInstanceJob):
         except SoftTimeLimitExceeded:
             raise
         except Exception as e:
-            if self.storage_manager.is_missing(e):
-                return  # another run of the registration deleted it
             logger.error(f'[CODE07,{job_id}]: Error while deleting unauthorized link '
                          f'file {path} from storage, detail: {str(e)}')
             self.c_plugin_inst.error_code = 'CODE07'

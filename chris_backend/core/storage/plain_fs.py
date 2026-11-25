@@ -9,6 +9,15 @@ from core.storage.storagemanager import (StorageManager, StorageObject, sanitize
                                          sanitized_path)
 
 
+def _raise_unless_missing(function, path, error):
+    """
+    The ``onexc`` handler of ``shutil.rmtree``: an error that says that what it deletes
+    is gone already (another task deleted it) is ignored, any other is raised.
+    """
+    if not isinstance(error, FileNotFoundError):
+        raise error
+
+
 class FilesystemManager(StorageManager):
     """
     The simplest manager, something everyone has, the one you can trust...
@@ -26,12 +35,16 @@ class FilesystemManager(StorageManager):
     def create_container(self) -> None:
         self.__base.mkdir(exist_ok=True, parents=True)
 
-    def ls(self, path_prefix: str, limit: Optional[int] = None) -> List[str]:
-        if self.obj_exists(path_prefix):
-            return [path_prefix]
+    def ls(self, path: str, limit: Optional[int] = None) -> List[str]:
+        named = self.__named(path)
+        if named is None:
+            return []
+        if named.is_file():
+            return [path.strip('/')]
         # the files that rglob finds: symbolic links to files, but not the trees of links
         # to directories
-        files = (path for path, entry in self.__entries(path_prefix) if entry.is_file())
+        files = (name for name, entry in self.__entries(path.strip('/'))
+                 if entry.is_file())
         return list(islice(files, limit))
 
     def walk(self, folder: str) -> Iterator[StorageObject]:
@@ -70,8 +83,23 @@ class FilesystemManager(StorageManager):
                     else:
                         yield prefix + entry.path[start:], entry
 
+    def __named(self, path: str) -> Optional[Path]:
+        """
+        What ``path`` names under the base, as the operations on paths take a path (see
+        ``StorageManager``): None, nothing, for the empty path and for a path that ends
+        with a slash but is not a directory.
+        """
+        relative = path.strip('/')
+        if not relative:
+            return None
+        named = self.__base / relative
+        if path.endswith('/') and not named.is_dir():
+            return None
+        return named
+
     def path_exists(self, path: str) -> bool:
-        return (self.__base / path).exists()
+        named = self.__named(path)
+        return named is not None and named.exists()
 
     def obj_exists(self, file_path: str) -> bool:
         return (self.__base / file_path).is_file()
@@ -110,29 +138,25 @@ class FilesystemManager(StorageManager):
                 raise
 
     def delete_obj(self, file_path: str) -> None:
-        (self.__base / file_path).unlink()
+        (self.__base / file_path).unlink(missing_ok=True)
 
     def copy_path(self, src: str, dst: str) -> None:
-        src_path = self.__base / src
-        dst_path = self.__base / dst
-
-        if not src_path.exists():
-            raise FileNotFoundError(
-                f"The source path '{src_path}' does not exist.")
+        src_path = self.__named(src)
+        if src_path is None or not src_path.exists():
+            return
+        dst_path = self.__base / dst.strip('/')
 
         if src_path.is_dir():
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src_path, dst_path)
         else:
-            self.copy_obj(src, dst)
+            self.copy_obj(src.strip('/'), dst.strip('/'))
 
     def move_path(self, src: str, dst: str) -> None:
-        src_path = self.__base / src
-        dst_path = self.__base / dst
-
-        if not src_path.exists():
-            raise FileNotFoundError(
-                f"The source path '{src_path}' does not exist.")
+        src_path = self.__named(src)
+        if src_path is None or not src_path.exists():
+            return
+        dst_path = self.__base / dst.strip('/')
 
         if src_path.is_dir():
             if src_path.parent == dst_path.parent:  # just a renaming
@@ -145,17 +169,14 @@ class FilesystemManager(StorageManager):
             src_path.rename(dst_path)
 
     def delete_path(self, path: str) -> None:
-        p = self.__base / path
+        named = self.__named(path)
+        if named is None:
+            return  # not the whole storage, nor a file named as a folder
 
-        if not p.exists():
-            raise FileNotFoundError(
-                f"The source path '{p}' does not exist.")
-
-        if p.is_dir():
-            shutil.rmtree(p)
+        if named.is_dir():
+            shutil.rmtree(named, onexc=_raise_unless_missing)
         else:
-            self.delete_obj(path)
-
+            named.unlink(missing_ok=True)
 
     def sanitize_obj_names(self, path: str) -> Dict[str, str]:
         """

@@ -883,6 +883,29 @@ class PluginInstanceAppJobTests(TestCase):
         self.assertIn(linked_file, obj_paths)
         self.assertEqual(pl_inst.error_code, '')
 
+    def test_find_all_storage_object_paths_lists_a_sibling_whose_name_starts_alike(self):
+        """
+        Test whether find_all_storage_object_paths lists a linked folder whose name starts
+        with the name of a folder listed already (data_2 after data), but not again a
+        folder in the tree of one listed already.
+        """
+        pl_inst = self._create_plugin_inst('started')
+        job = pluginjobs.PluginInstanceAppJob(pl_inst)
+        base = 'home/%s/uploads' % self.username
+        listings = {f'{base}/data': [f'{base}/data/x'],
+                    f'{base}/data_2': [f'{base}/data_2/y'],
+                    f'{base}/data/sub': [f'{base}/data/sub/z']}
+        job.storage_manager = mock.Mock()
+        job.storage_manager.ls = mock.Mock(side_effect=lambda path: listings[path])
+
+        obj_paths = set()
+        visited_paths = set()
+        for path in ('data', 'data_2', 'data/sub', 'data/'):
+            job.find_all_storage_object_paths(f'{base}/{path}', obj_paths, visited_paths)
+
+        self.assertEqual(obj_paths, {f'{base}/data/x', f'{base}/data_2/y'})
+        self.assertEqual(job.storage_manager.ls.call_count, 2)
+
     @tag('integration')
     def test_integration_register_output_files_refuses_remote_link_file(self):
         """
@@ -939,7 +962,6 @@ class PluginInstanceAppJobTests(TestCase):
             [StorageObject(outputdir + '/evil.chrislink', 18)])
         job.storage_manager.delete_obj = mock.Mock(
             side_effect=Exception('boom'))
-        job.storage_manager.is_missing = mock.Mock(return_value=False)  # still there
         job.expect_json_files({'job_output_path': outputdir,
                                'rel_file_paths': ['evil.chrislink']})
 
@@ -1013,14 +1035,15 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
 
     def job(self, inst, listings, unextpaths=(), inputs=()):
         """
-        An app job of ``inst`` whose storage lists ``listings[prefix]`` (as much of it as
-        the limit asked lets), whose 'unextpath' parameter names ``unextpaths`` and, as a
-        'ts' plugin's, whose input instances are ``inputs``.
+        An app job of ``inst`` whose storage lists ``listings[path]`` (as much of it as
+        the limit asked lets; an output's path is asked with a slash, as a folder), whose
+        'unextpath' parameter names ``unextpaths`` and, as a 'ts' plugin's, whose input
+        instances are ``inputs``.
         """
         job = pluginjobs.PluginInstanceAppJob(inst)
         job.storage_manager = mock.Mock()
         job.storage_manager.ls.side_effect = (
-            lambda prefix, limit=None: listings.get(prefix, [])[:limit])
+            lambda path, limit=None: listings.get(path.rstrip('/'), [])[:limit])
         job.get_plugin_instance_path_parameters = mock.Mock(
             return_value=({'--dir': ','.join(unextpaths)} if unextpaths else {}, {}))
         job.get_ts_plugin_instance_parameters = mock.Mock(
@@ -1035,7 +1058,8 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
         self.assertTrue(job.registers_at_most(3))
         self.assertFalse(job.registers_at_most(2))
         self.assertEqual(job.storage_manager.ls.call_args_list,
-                         [mock.call(output, limit=4), mock.call(output, limit=3)])
+                         [mock.call(f'{output}/', limit=4),
+                          mock.call(f'{output}/', limit=3)])
 
     def test_an_output_an_out_of_network_remote_sends_as_a_zip_is_not_small(self):
         inst = self.instance('registeringFiles')
@@ -1061,7 +1085,7 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
         self.assertTrue(job.registers_at_most(3))
         self.assertFalse(job.registers_at_most(2))
         self.assertEqual({c.args[0] for c in job.storage_manager.ls.call_args_list},
-                         {output})
+                         {output + '/'})
 
     def test_a_ts_instance_adds_its_inputs_objects_and_one_with_a_link_is_large(self):
         inst = self.instance('registeringFiles')
@@ -1082,9 +1106,7 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
 
     @staticmethod
     def _delete(path):
-        storage = connect_storage(settings)
-        if storage.path_exists(path):
-            storage.delete_path(path)
+        connect_storage(settings).delete_path(path)
 
     def _upload(self, path, names):
         """
@@ -1198,7 +1220,7 @@ class RegistrationSizeTests(PluginInstanceFixture, TestCase):
 
         job = self.job(inst, {output: ['o/1', 'o/2', 'o/3']}, inputs=(parent,))
         self.assertFalse(job.registers_at_most(2))
-        job.storage_manager.ls.assert_called_once_with(output, limit=3)
+        job.storage_manager.ls.assert_called_once_with(f'{output}/', limit=3)
 
         job = self.job(inst, {}, unextpaths=('a', 'b', 'c'))
         job.storage_env = 'fslink'  # three link files: past two before any listing

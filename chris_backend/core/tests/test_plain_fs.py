@@ -16,6 +16,7 @@ from unittest import mock
 from django.test import TestCase
 
 from core.storage.plain_fs import FilesystemManager
+from core.tests.path_contract import PathContractTests
 
 
 class FilesystemManagerConnectionTests(TestCase):
@@ -101,7 +102,7 @@ class FilesystemManagerCRUDTests(TestCase):
         self.assertTrue(self.manager.obj_exists('test/src.txt'))
 
 
-class FilesystemManagerPathOpsTests(TestCase):
+class FilesystemManagerPathOpsTests(PathContractTests, TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -147,11 +148,6 @@ class FilesystemManagerPathOpsTests(TestCase):
         self.manager.upload_obj('test/delpath/sub/c.txt', b'c')
         self.manager.delete_path('test/delpath')
         self.assertFalse(self.manager.path_exists('test/delpath'))
-
-    def test_delete_path_nonexistent_raises(self):
-        """delete_path raises FileNotFoundError for non-existent paths."""
-        with self.assertRaises(FileNotFoundError):
-            self.manager.delete_path('test/no_such_path')
 
     def test_sanitize_obj_names(self):
         self.manager.upload_obj('test/san/fi,le.txt', b'data')
@@ -306,7 +302,7 @@ class FilesystemManagerLargeOpsTests(TestCase):
 
     def test_is_missing_says_a_file_is_not_there(self):
         with self.assertRaises(FileNotFoundError) as missing:
-            self.manager.delete_obj('test/none')
+            self.manager.download_obj('test/none')
 
         self.assertTrue(self.manager.is_missing(missing.exception))
         self.assertFalse(self.manager.is_missing(PermissionError('x')))

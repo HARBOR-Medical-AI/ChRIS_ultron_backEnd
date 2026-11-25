@@ -448,10 +448,9 @@ class RunAgainTests(OutputRegistrationFixture, TestCase):
         link = ChrisLinkFile(path='home/foo/uploads', owner=self.user,
                              parent_folder=self.inst.output_folder)
         link.save(name='l')
-        self.storage.delete_obj(link.fname.name)  # gone, as after pfcon's listing
 
         with mock.patch('core.models.connect_storage', return_value=self.storage), \
-                mock.patch.object(self.storage, 'obj_exists',
+                mock.patch.object(self.storage, 'delete_obj',
                                   side_effect=SoftTimeLimitExceeded()), \
                 self.assertRaises(SoftTimeLimitExceeded):
             link.save(name='l')
@@ -464,7 +463,7 @@ class RunAgainTests(OutputRegistrationFixture, TestCase):
 
         def deleted_first_by_another_task(path):
             delete(path)
-            delete(path)  # FileNotFoundError: this task's delete comes second
+            delete(path)  # nothing left: this task's delete comes second
 
         with mock.patch('core.models.connect_storage', return_value=storage), \
                 mock.patch.object(storage, 'delete_obj', deleted_first_by_another_task):

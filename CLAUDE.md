@@ -150,8 +150,11 @@ Python tools are dev dependencies for `just lint`. `[tool.mypy]` in `pyproject.t
   `post_delete` receivers delete the storage object, so deleting a model row deletes bytes.
 - Storage backends are behind `core.storage.StorageManager` (Swift, S3, filesystem) chosen by
   `STORAGE_ENV`; get one with `connect_storage(settings)`. Files are immutable (WORM).
-  `walk(folder)` streams a folder's objects with their sizes (unlike `ls`, which on Swift
-  and S3 matches a raw prefix), and `core.registration` inserts a tree's folders and files
+  A path names an object or a folder on every backend, the folder only when it ends with
+  a slash: Swift and S3 list by raw prefix, and `ObjectStorageManager._tree` keeps their
+  path operations from reaching `feed_10` for `feed_1` (`in_tree` is the rule for other
+  code). Deleting what is not there is no error. `walk(folder)` streams a folder's
+  objects with their sizes, and `core.registration` inserts a tree's folders and files
   in batches, as a plugin instance's output registration does.
 
 ### Shared cache (`core/cache.py`)

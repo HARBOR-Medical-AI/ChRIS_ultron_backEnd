@@ -10,12 +10,12 @@ from typing import Iterator, List, Optional
 from swiftclient import Connection
 from swiftclient.exceptions import ClientException
 
-from core.storage.storagemanager import StorageManager, StorageObject
+from core.storage.storagemanager import ObjectStorageManager, StorageObject
 
 logger = logging.getLogger(__name__)
 
 
-class SwiftManager(StorageManager):
+class SwiftManager(ObjectStorageManager):
 
     #: Swift's default listing limit: the most objects a listing request may ask for
     PAGE_SIZE = 10000
@@ -55,21 +55,10 @@ class SwiftManager(StorageManager):
             logger.error(str(e))
             raise
 
-    def ls(self, path, limit=None):
-        """
-        Return a list of objects in the swift storage with the provided path
-        as a prefix, of ``limit`` objects at most when given: in one request when
-        ``limit`` is at most 10,000 (Swift's default listing limit).
-        """
-        if not path:
-            return []
-        return [obj['name'] for page in self._pages(path, limit) for obj in page]
-
-    def walk(self, folder: str) -> Iterator[StorageObject]:
-        for page in self._pages(folder.rstrip('/') + '/'):
+    def _objects(self, prefix: str, limit: Optional[int] = None) -> Iterator[StorageObject]:
+        for page in self._pages(prefix, limit):
             for obj in page:
-                if not obj['name'].endswith('/'):  # not the marker of a folder
-                    yield StorageObject(obj['name'], obj['bytes'])
+                yield StorageObject(obj['name'], obj['bytes'])
 
     def _pages(self, prefix: str, limit: Optional[int] = None) -> Iterator[List[dict]]:
         """
@@ -114,12 +103,6 @@ class SwiftManager(StorageManager):
                     raise
                 attempt += 1
                 time.sleep(0.4)
-
-    def path_exists(self, path):
-        """
-        Return True/False if passed path exists in swift storage.
-        """
-        return bool(path) and any(True for _ in self._pages(path, limit=1))
 
     def obj_exists(self, obj_path):
         """
@@ -194,13 +177,16 @@ class SwiftManager(StorageManager):
 
     def delete_obj(self, obj_path):
         """
-        Delete an object from swift storage.
+        Delete an object from swift storage: one that is not there (404) counts as
+        deleted.
         """
         conn = self.__get_connection()
         for i in range(5):
             try:
                 conn.delete_object(self.container_name, obj_path)
             except ClientException as e:
+                if e.http_status == 404:
+                    return
                 logger.error(str(e))
                 if i == 4:
                     raise
@@ -210,21 +196,3 @@ class SwiftManager(StorageManager):
 
     def is_missing(self, error: Exception) -> bool:
         return isinstance(error, ClientException) and error.http_status == 404
-
-    def copy_path(self, src: str, dst: str) -> None:
-        l_ls = self.ls(src)
-        for obj_path in l_ls:
-            new_obj_path = obj_path.replace(src, dst, 1)
-            self.copy_obj(obj_path, new_obj_path)
-
-    def move_path(self, src: str, dst: str) -> None:
-        l_ls = self.ls(src)
-        for obj_path in l_ls:
-            new_obj_path = obj_path.replace(src, dst, 1)
-            self.copy_obj(obj_path, new_obj_path)
-            self.delete_obj(obj_path)
-
-    def delete_path(self, path: str) -> None:
-        l_ls = self.ls(path)
-        for obj_path in l_ls:
-            self.delete_obj(obj_path)

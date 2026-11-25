@@ -1,7 +1,6 @@
 
 import logging
 import uuid
-import io
 import os
 import pathlib
 
@@ -997,17 +996,11 @@ class ChrisLinkFile(models.Model):
         link_file_contents = f'{path}'
 
         storage_manager = connect_storage(settings)
-
-        with io.StringIO(link_file_contents) as f:
-            try:
-                if storage_manager.obj_exists(link_file_path):
-                    storage_manager.delete_obj(link_file_path)
-            except Exception as error:
-                if not storage_manager.is_missing(error):
-                    raise
-                # another task, writing the same link file, deleted it since
-            storage_manager.upload_obj(link_file_path, f.read(),
-                                       content_type='text/plain')
+        # a new object, not one written over: on a filesystem the object there may be a
+        # hard link (a copy) that another path shares
+        storage_manager.delete_obj(link_file_path)
+        storage_manager.upload_obj(link_file_path, link_file_contents,
+                                   content_type='text/plain')
         self.fname.name = link_file_path
         super(ChrisLinkFile, self).save(*args, **kwargs)
 

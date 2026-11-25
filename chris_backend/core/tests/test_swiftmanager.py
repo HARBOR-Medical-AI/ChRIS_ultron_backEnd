@@ -23,6 +23,7 @@ from django.test import SimpleTestCase, TestCase, tag
 from swiftclient.exceptions import ClientException
 
 from core.storage.swiftmanager import SwiftManager
+from core.tests.path_contract import PathContractTests
 
 
 def _get_manager():
@@ -106,12 +107,48 @@ class SwiftManagerListingTests(SimpleTestCase):
         self.assertFalse(self.manager.is_missing(ClientException('x', http_status=503)))
         self.assertFalse(self.manager.is_missing(FileNotFoundError('x')))
 
-    def test_a_path_exists_when_a_listing_of_one_object_finds_it(self):
-        self.pages(['a/1'])
-        self.assertTrue(self.manager.path_exists('a'))
-        self.get_container.assert_called_once_with('container', prefix='a', marker='',
-                                                   limit=1)
+    def answers(self, *pages):
+        """
+        Have the connection answer each request with the next page of names.
+        """
+        self.get_container.side_effect = [
+            ({}, [{'name': name, 'bytes': len(name)} for name in page]) for page in pages]
+
+    def asked(self):
+        return [(c.kwargs['prefix'], c.kwargs['limit'])
+                for c in self.get_container.call_args_list]
+
+    def test_a_path_exists_when_its_object_or_its_folder_does(self):
+        self.answers(['a'])
+        self.assertTrue(self.manager.path_exists('a'))  # the object at a, listed first
+        self.answers(['a-b'], ['a/1'])
+        self.assertTrue(self.manager.path_exists('a'))  # its folder
+        self.answers(['a-b'], [])
+        self.assertFalse(self.manager.path_exists('a'))  # a sibling, not a
+
+        self.assertEqual(self.asked(), [('a', 1), ('a', 1), ('a/', 1), ('a', 1), ('a/', 1)])
         self.assertFalse(self.manager.path_exists(''))
+
+    def test_a_listing_keeps_to_the_object_and_the_folder_its_path_names(self):
+        self.answers(['a/data'], ['a/data/x'], [])
+        self.assertEqual(self.manager.ls('a/data'), ['a/data', 'a/data/x'])
+        self.answers(['a/data_2'], ['a/data/x'], [])
+        self.assertEqual(self.manager.ls('a/data'), ['a/data/x'])
+        self.answers(['a/data'])
+        self.assertEqual(self.manager.ls('a/data', limit=1), ['a/data'])
+
+        self.assertEqual(self.asked(), [('a/data', 1), ('a/data/', None), ('a/data/', None),
+                                        ('a/data', 1), ('a/data/', None), ('a/data/', None),
+                                        ('a/data', 1)])
+
+    def test_deleting_an_object_swift_does_not_have_is_no_error(self):
+        delete = self.manager._conn.delete_object
+        delete.side_effect = ClientException('not found', http_status=404)
+
+        with self.assertNoLogs('core.storage.swiftmanager', 'ERROR'):
+            self.manager.delete_obj('a/1')
+
+        delete.assert_called_once_with('container', 'a/1')  # not made again
 
 
 @tag('integration')
@@ -198,7 +235,7 @@ class SwiftManagerCRUDTests(TestCase):
 @tag('integration')
 @unittest.skipUnless(getattr(settings, 'STORAGE_ENV', '') == 'swift',
                      'Swift storage not configured')
-class SwiftManagerPathOpsTests(TestCase):
+class SwiftManagerPathOpsTests(PathContractTests, TestCase):
 
     @classmethod
     def setUpClass(cls):

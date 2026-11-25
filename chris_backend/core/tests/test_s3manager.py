@@ -21,6 +21,7 @@ from django.conf import settings
 from django.test import SimpleTestCase, TestCase, tag
 
 from core.storage.s3manager import S3Manager
+from core.tests.path_contract import PathContractTests
 
 
 def _get_manager():
@@ -35,6 +36,7 @@ class S3ManagerListingTests(SimpleTestCase):
     def setUp(self):
         self.manager = S3Manager('bucket', {})
         self.manager._client = mock.Mock()
+        self.manager._client.delete_objects.return_value = {}
         self.list = self.manager._client.list_objects_v2
 
     @staticmethod
@@ -103,21 +105,69 @@ class S3ManagerListingTests(SimpleTestCase):
                 error = ClientError({'Error': {'Code': code}}, 'CopyObject')
                 self.assertEqual(self.manager.is_missing(error), missing)
 
-    def test_a_path_is_deleted_a_page_of_keys_at_a_time(self):
-        self.list.side_effect = [self.page(['a/1', 'a/2'], 't'), self.page(['a/3'])]
+    def deleted(self):
+        return [[o['Key'] for o in c.kwargs['Delete']['Objects']]
+                for c in self.manager._client.delete_objects.call_args_list]
 
-        self.manager.delete_path('a/')
+    def asked(self):
+        return [(c.kwargs['Prefix'], c.kwargs['MaxKeys'])
+                for c in self.list.call_args_list]
 
-        deletes = self.manager._client.delete_objects.call_args_list
-        self.assertEqual([[o['Key'] for o in c.kwargs['Delete']['Objects']]
-                          for c in deletes], [['a/1', 'a/2'], ['a/3']])
+    def test_a_path_is_deleted_a_batch_of_keys_per_request_as_the_listing_goes(self):
+        self.manager.DELETE_BATCH = 2
+        self.list.side_effect = [self.page(['a']),
+                                 self.page(['a/1'], 't'), self.page(['a/2', 'a/3'])]
 
-    def test_a_path_exists_when_a_listing_of_one_key_finds_it(self):
-        self.list.side_effect = [self.page(['a/1']), self.page([])]
+        self.manager.delete_path('a')
 
-        self.assertTrue(self.manager.path_exists('a'))
-        self.assertFalse(self.manager.path_exists('b'))
-        self.assertEqual({c.kwargs['MaxKeys'] for c in self.list.call_args_list}, {1})
+        self.assertEqual(self.deleted(), [['a', 'a/1'], ['a/2', 'a/3']])
+        requests = [c[0] for c in self.manager._client.mock_calls
+                    if c[0] in ('list_objects_v2', 'delete_objects')]
+        self.assertEqual(requests, ['list_objects_v2', 'list_objects_v2', 'delete_objects',
+                                    'list_objects_v2', 'delete_objects'])  # as it goes
+
+    def test_keys_s3_did_not_delete_raise_once_the_others_are_deleted(self):
+        self.manager.DELETE_BATCH = 1
+        self.list.side_effect = [self.page(['a/1', 'a/2', 'a/3'])]
+        self.manager._client.delete_objects.side_effect = [
+            {'Errors': [{'Key': 'a/1', 'Code': 'AccessDenied'}]},
+            {'Errors': [{'Key': 'a/2', 'Code': 'NoSuchKey'}]},  # gone: deleted
+            {}]
+
+        failure = r'did not delete 1 objects .*a/1 \(AccessDenied\)'
+        with self.assertRaisesRegex(OSError, failure):
+            self.manager.delete_path('a/')
+
+        self.assertEqual(self.deleted(), [['a/1'], ['a/2'], ['a/3']])
+
+    def test_a_deleted_path_keeps_to_the_object_and_the_folder_it_names(self):
+        self.list.side_effect = [self.page(['a']), self.page(['a/1'])]
+
+        self.manager.delete_path('a')
+
+        self.assertEqual(self.deleted(), [['a', 'a/1']])
+        self.assertEqual(self.asked(), [('a', 1), ('a/', 1000)])
+
+    def test_a_path_exists_when_its_object_or_its_folder_does(self):
+        self.list.side_effect = [self.page(['a']),
+                                 self.page(['a-b']), self.page(['a/1']),
+                                 self.page(['a-b']), self.page([])]
+
+        self.assertTrue(self.manager.path_exists('a'))   # the object at a, listed first
+        self.assertTrue(self.manager.path_exists('a'))   # its folder
+        self.assertFalse(self.manager.path_exists('a'))  # a sibling, not a
+
+        self.assertEqual(self.asked(), [('a', 1), ('a', 1), ('a/', 1), ('a', 1), ('a/', 1)])
+        self.assertFalse(self.manager.path_exists(''))
+
+    def test_deleting_a_key_s3_does_not_have_is_no_error(self):
+        delete = self.manager._client.delete_object
+        delete.side_effect = ClientError({'Error': {'Code': 'NoSuchKey'}}, 'DeleteObject')
+
+        with self.assertNoLogs('core.storage.s3manager', 'ERROR'):
+            self.manager.delete_obj('a/1')
+
+        delete.assert_called_once_with(Bucket='bucket', Key='a/1')  # not made again
 
 
 @tag('integration')
@@ -204,7 +254,7 @@ class S3ManagerCRUDTests(TestCase):
 @tag('integration')
 @unittest.skipUnless(getattr(settings, 'STORAGE_ENV', '') == 's3',
                      'S3 storage not configured')
-class S3ManagerPathOpsTests(TestCase):
+class S3ManagerPathOpsTests(PathContractTests, TestCase):
 
     @classmethod
     def setUpClass(cls):
