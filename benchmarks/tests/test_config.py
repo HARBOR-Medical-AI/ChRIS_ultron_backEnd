@@ -77,6 +77,12 @@ def test_full_linear_feeds_is_the_marquee_and_merges_escalated():
     assert t.topology_axes["fanout_fanin"]["merges"] == 8
 
 
+def test_full_linear_file_count_reaches_the_level_the_baselines_measure():
+    # the 100,000-file level of the registration baselines (HARBOR-planning #155)
+    t = load_tier("full")
+    assert t.topology_axes["linear"]["file_count"] == 100000  # nosec B101 - pytest assertion
+
+
 # -- workload fingerprint --------------------------------------------------------------
 
 def test_tier_fingerprint_is_stable_and_workload_sensitive():

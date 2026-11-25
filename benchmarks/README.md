@@ -96,7 +96,7 @@ api_requests.jsonl   # every measured API call (latency, status, endpoint class)
 status_samples.jsonl # per-instance status timelines (client-observed phase timing): when each status was first seen, the sequence of statuses seen (history), the last read's error code (CUBE's CODEnn), and each instance's feed and parents
 docker_stats.jsonl   # every service + job container read every 1 s: CPU over the time since its previous reading, or since a container born in the scenario started (null without a window: a service's first reading, one under 0.75 s after the previous, as the closing reading can be, whose CPU then goes into the next reading's window, a job's first under 0.25 s after its start, one after a restart), memory with and without the page cache, CPU throttling, cumulative blkio and CPU counters
 queue_depths.jsonl   # Celery queue depths (submit/status/register/register_large/delete/cleanup/pacs/periodic; main1/main2/periodic before HARBOR-planning #152), sampled every 0.5 s, with the wait of the status queue's oldest message (waited_s)
-scenarios/<id>/      # scenario.json with db_counters, the sampler's summary (observer.sampler), the logs' evidence and the lost-update cancels (+ pg_stats.json; failure.json + logs/ on hard failures)
+scenarios/<id>/      # scenario.json with db_counters, the wait events (waits), the sampler's summary (observer.sampler), the logs' evidence and the lost-update cancels (+ pg_stats.json, pg_waits.jsonl; failure.json + logs/ on hard failures)
 ```
 
 The key artifact is the **approach-to-failure curve** (in `report.md` and `levels.csv`):
@@ -104,9 +104,10 @@ per-level makespan, worst p95, 5xx counts and completions, with `report.md` addi
 axis's highest level the peak per-service CPU, the bytes each service wrote, Postgres and how
 the sampling went — so each breaking point comes with a *cause*, not just a pass/fail.
 `levels.jsonl` has every level's peaks: CPU, memory with and without the page cache, CPU
-throttling, bytes written, queue depths, and the sampler's summary.
+throttling, bytes written, queue depths, the database's wait events, and the sampler's
+summary.
 
-Three attribution streams turn resource saturation into named culprits:
+Four attribution streams turn resource saturation into named culprits:
 
 - **Queue depths** — one queue per class of task: a sustained rise on `status` means
   status checks are produced faster than `worker-mains` consumes them, on `submit` that job
@@ -119,12 +120,16 @@ Three attribution streams turn resource saturation into named culprits:
   written, WAL and full-page images), most total execution time first, reset per scenario
   (via `pg_stat_statements`, which `postgres/cube.conf` preloads on `db`). Names the
   queries behind a hot db, and shows whether a statement ran at all (statements that failed
-  with an error are never recorded).
+  with an error are never recorded). The harness's own statements are left out.
 - **Postgres counters** — checkpoints (done, timed and requested), WAL and full-page images,
   temp files, bytes written or extended per process type, autovacuum runs, and the `db`
   container's disk writes, swap and OOM kills, as deltas over each scenario's workload and
   cleanup windows (`scenario.json` and level rows, `db_counters`) and over the whole run
   (`summary.json`, which `bench-compare` shows side by side).
+- **`pg_waits.jsonl`** — what the database's backends that are not idle wait on, sampled
+  every second through each scenario from one long-lived psql session: lock waits (`Lock`)
+  apart from I/O, internal locks, CPU and transactions left open, rolled up per window in
+  `scenario.json` and level rows (`waits`).
   [envelope.md](envelope.md) § "What each run records about Postgres" has the details.
 
 `environment.json`'s `attribution` block records whether each stream was available for the

@@ -62,13 +62,17 @@ UNKNOWN_FLAGS = ("reset", "unreadable")
 STATEMENT_COLUMNS = ("calls", "total_ms", "mean_ms", "rows", "temp_blks_written",
                      "wal_bytes", "wal_fpi", "query")
 
+#: a name in the text of the statements a harness sampler runs (a column alias), which
+#: ``pg_stats.json`` leaves out, as it leaves out the statements that read it
+HARNESS_MARKER = "bench_harness"
+
 STATEMENTS_SQL = (
     "SELECT calls, round(total_exec_time)::bigint AS total_ms, "
     "round(mean_exec_time::numeric, 2) AS mean_ms, rows, temp_blks_written, "
     "wal_bytes, wal_fpi, "
     "left(regexp_replace(query, '\\s+', ' ', 'g'), 300) AS query "
     "FROM pg_stat_statements "
-    "WHERE query NOT ILIKE '%pg_stat_statements%' "
+    "WHERE query NOT ILIKE '%pg_stat_statements%' AND query NOT ILIKE '%bench_harness%' "
     "ORDER BY total_exec_time DESC"
 )
 
@@ -106,17 +110,24 @@ def parse_psql_rows(output: str, columns: tuple[str, ...]) -> list[dict]:
     return rows
 
 
+def psql_role(env: dict) -> tuple[str, str]:
+    """
+    The user and the database psql connects as inside the db container: its own
+    ``POSTGRES_USER`` and ``POSTGRES_DB``, given its environment ``env``.
+    """
+    return env.get("POSTGRES_USER", "chris"), env.get("POSTGRES_DB", "chris_dev")
+
+
 def psql(docker: DockerClient, sql: str, *, service: str = "db",
          env: Optional[dict] = None) -> tuple[int, str]:
     """
     Run one statement with ``psql -At -F<tab>`` inside the db container, as its own
     ``POSTGRES_USER`` on its ``POSTGRES_DB`` (read from ``env``, else the container).
     """
-    env = docker.service_env(service) if env is None else env
+    user, database = psql_role(docker.service_env(service) if env is None else env)
 
     return docker.exec_in_service(
-        service, ["psql", "-U", env.get("POSTGRES_USER", "chris"), "-d",
-                  env.get("POSTGRES_DB", "chris_dev"), "-At", "-F", "\t", "-c", sql])
+        service, ["psql", "-U", user, "-d", database, "-At", "-F", "\t", "-c", sql])
 
 
 def connection_states(docker: DockerClient, service: str = "db") -> list[dict]:

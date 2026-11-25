@@ -271,6 +271,38 @@ class _Sampler:
         return SamplerSummary(interval_s=1.0, queue_interval_s=0.5, ticks=3)
 
 
+class _Waits:
+    """
+    Stands in for WaitSampler, recording when the wait events start and stop being
+    sampled, the Docker client it is given and the windows it rolls up.
+    """
+
+    samples = [{"at": 1.0, "backends": [["client backend", "active", "Lock", "tuple", 1]]}]
+
+    def __init__(self, events):
+        self.events = events
+        self.docker = self.windows = None
+        self.running = False
+
+    def __call__(self, docker, *, interval):
+        self.docker = docker
+        return self
+
+    def start(self):
+        self.events.append("waits start")
+        self.running = True
+        return self
+
+    def stop(self):
+        if self.running:                               # once, as WaitSampler.stop
+            self.events.append("waits stop")
+            self.running = False
+
+    def record(self, windows):
+        self.windows = windows
+        return {"samples": 1}
+
+
 def _scenario_runner(monkeypatch, tmp_path, *, cleanup):
     """
     A runner whose adapters are fakes that record, in order, what ``run_scenario`` does.
@@ -288,7 +320,9 @@ def _scenario_runner(monkeypatch, tmp_path, *, cleanup):
                       no_progress=False, timed_out=False, final_status_counts={})
 
     sampler = _Sampler(events)
+    waits = _Waits(events)
     monkeypatch.setattr(run_bench, "StatsSampler", sampler)
+    monkeypatch.setattr(run_bench, "WaitSampler", waits)
     monkeypatch.setattr(run_bench, "build_feeds", lambda *a, **k: [])
     monkeypatch.setattr(run_bench, "poll_to_completion", lambda *a, **k: poll)
     monkeypatch.setattr(run_bench, "ProgressProbe", lambda docker: None)
@@ -309,6 +343,7 @@ def _scenario_runner(monkeypatch, tmp_path, *, cleanup):
                                               runner._sink.record_resource(AFTER_WINDOW))
     runner._persist_scenario = lambda *a: events.append("persist") or events.append(a)
     runner.fake_sampler = sampler
+    runner.fake_waits = waits
     return runner, events
 
 
@@ -318,12 +353,49 @@ def test_scenario_counter_windows_match_the_resource_samples_and_cleanup(monkeyp
     result = runner.run_scenario(make_scenario_params(runner.tier.baseline, 2.0, "linear",
                                                       "depth", 1, 0))
 
-    expected = ["pg_stats reset", "snapshot", "samples start", "samples stop",
-                "snapshot", "db deltas", "cleanup", "snapshot", "persist"]
+    expected = ["waits start", "pg_stats reset", "snapshot", "samples start",
+                "samples stop", "snapshot", "db deltas", "cleanup", "snapshot", "waits stop",
+                "persist"]
     assert [e for e in events if isinstance(e, str)] == expected  # nosec B101 - pytest assertion
     workload, cleanup = result.db_counters["workload"], result.db_counters["cleanup"]
     assert workload == {"wal_bytes": 100, "seconds": 5.0}  # nosec B101 - pytest assertion
     assert cleanup == {"wal_bytes": 30, "seconds": 3.0}  # nosec B101 - pytest assertion
+
+
+def test_the_wait_events_cover_the_workload_and_the_cleanup(monkeypatch, tmp_path):
+    runner, events = _scenario_runner(monkeypatch, tmp_path, cleanup=True)
+    runner.docker = SimpleNamespace(available=False, name="the runner's client")
+    result = runner.run_scenario(make_scenario_params(runner.tier.baseline, 2.0, "linear",
+                                                      "depth", 1, 0))
+    windows = runner.fake_waits.windows
+
+    assert runner.fake_waits.docker is runner.docker  # nosec B101 - pytest assertion
+    assert windows["workload"][0] == result.started_at  # nosec B101 - pytest assertion
+    assert (windows["workload"][1] == result.ended_at  # nosec B101 - pytest assertion
+            == windows["cleanup"][0])
+    assert windows["cleanup"][1] >= result.ended_at  # nosec B101 - pytest assertion
+    assert result.waits == {"samples": 1}  # nosec B101 - pytest assertion
+    assert events[-1][-1] == _Waits.samples  # nosec B101 - pytest assertion
+
+    runner, _ = _scenario_runner(monkeypatch, tmp_path, cleanup=False)
+    runner.run_scenario(make_scenario_params(runner.tier.baseline, 2.0, "linear", "depth",
+                                             1, 0))
+    assert runner.fake_waits.windows["cleanup"] is None  # nosec B101 - pytest assertion
+
+
+def test_a_scenario_that_raises_still_ends_its_wait_events_session(monkeypatch, tmp_path):
+    runner, events = _scenario_runner(monkeypatch, tmp_path, cleanup=True)
+
+    def unreachable(*args, **kwargs):
+        raise ChrisApiError(HttpResult(False, 502, 1.0, None, error="CUBE answered 502"))
+
+    monkeypatch.setattr(run_bench, "build_feeds", unreachable)
+
+    with pytest.raises(ChrisApiError):
+        runner.run_scenario(make_scenario_params(runner.tier.baseline, 2.0, "linear",
+                                                 "depth", 1, 0))
+
+    assert (events[0], events[-1]) == ("waits start", "waits stop")  # nosec B101 - pytest assertion
 
 
 def test_a_scenario_rolls_up_and_persists_the_samples_of_its_workload_window(monkeypatch,
@@ -331,7 +403,7 @@ def test_a_scenario_rolls_up_and_persists_the_samples_of_its_workload_window(mon
     runner, events = _scenario_runner(monkeypatch, tmp_path, cleanup=True)
     result = runner.run_scenario(make_scenario_params(runner.tier.baseline, 2.0, "linear",
                                                       "depth", 1, 0))
-    _, _, resources, queues = events[-1]
+    _, _, resources, queues, _ = events[-1]
 
     # the cleanup's late sample is in neither the rollup nor the persisted files
     assert set(result.resources) == {"db"}  # nosec B101 - pytest assertion
@@ -385,7 +457,7 @@ def _run_runner(monkeypatch, tmp_path, snapshots, sleeps):
     runner.plugins = {}
     runner.plugin_images = {}
     runner.pins = load_pins()
-    runner.docker = None
+    runner.docker = SimpleNamespace(available=False, unavailable_reason="no engine")
     runner.sampler_docker = SimpleNamespace(available=True)
     runner._db_snapshot = lambda: snapshots.pop(0)
     monkeypatch.setattr(run_bench, "server_counters_error",
@@ -644,6 +716,7 @@ def test_run_records_how_it_samples(monkeypatch, tmp_path):
         run_bench.STATS_INTERVAL_S, run_bench.QUEUE_INTERVAL_S, run_bench.SAMPLER_WORKERS,
         queues=CELERY_QUEUES)
     assert env["attribution"]["resource_sampling"] is True  # nosec B101 - pytest assertion
+    assert env["attribution"]["wait_events"] == "no engine"  # nosec B101 - pytest assertion
 
 
 def test_a_scenario_persists_the_samples_its_rollups_used(tmp_path):
@@ -658,7 +731,9 @@ def test_a_scenario_persists_the_samples_its_rollups_used(tmp_path):
     # a sample recorded after the workload window is not persisted
     runner._sink.record_resource(AFTER_WINDOW)
 
-    runner._persist_scenario(result, 2.0, [sample], [QueueSample(1.0, "main2", 3)])
+    waits = [{"at": 1.0, "backends": [["client backend", "active", "IO", "WALSync", 1]]}]
+    result.waits = {"samples": 1}
+    runner._persist_scenario(result, 2.0, [sample], [QueueSample(1.0, "main2", 3)], waits)
 
     sid = result.params.scenario_id()
     scenario = json.loads((runner.store.run_dir / f"scenarios/{sid}/scenario.json").read_text())
@@ -667,6 +742,9 @@ def test_a_scenario_persists_the_samples_its_rollups_used(tmp_path):
     persisted = [(r["container"], r["cpu_pct"]) for r in rows]
     assert persisted == [("db", None)]  # nosec B101 - pytest assertion
     assert len(runner.store.read_jsonl("queue_depths.jsonl")) == 1  # nosec B101 - pytest assertion
+    assert scenario["waits"] == {"samples": 1}  # nosec B101 - pytest assertion
+    persisted = runner.store.read_jsonl(f"scenarios/{sid}/pg_waits.jsonl")
+    assert persisted == waits  # nosec B101 - pytest assertion
 
 
 def test_run_records_why_the_resources_were_not_sampled(monkeypatch, tmp_path):

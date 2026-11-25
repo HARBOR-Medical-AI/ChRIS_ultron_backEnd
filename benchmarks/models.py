@@ -305,6 +305,8 @@ class ScenarioResult:
     notes: list[str] = field(default_factory=list)
     # Postgres and db-container counter deltas per window (pg_stats.counter_windows)
     db_counters: dict = field(default_factory=dict)
+    # the database's wait events per window (pg_waits.WaitSampler.record)
+    waits: dict = field(default_factory=dict)
     sampler: Optional[SamplerSummary] = None
     # what the services' logs show from the scenario's start to its cleanup's end
     # (run_bench.log_evidence); {} when Docker could not tell

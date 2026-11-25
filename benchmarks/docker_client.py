@@ -12,6 +12,7 @@ import contextlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Iterator
 
 import docker
 from docker.errors import APIError, ImageNotFound, NotFound
@@ -242,6 +243,19 @@ class DockerClient:
         if container is None:
             return -1, f"service {service!r} not running"
         return _exec(container, cmd)
+
+    def exec_stream(self, service: str, cmd: list) -> Iterator[bytes]:
+        """
+        Start a command inside a service container and return its output, stdout and
+        stderr together, in chunks as it comes (a line may span two). The iterator ends
+        when the command does. Raises ``RuntimeError`` when the service is not running,
+        and the engine's error when it refuses.
+        """
+        container = self.find_service(service)
+
+        if container is None:
+            raise RuntimeError(f"service {service!r} not running")
+        return container.exec_run(cmd, stream=True).output
 
     def cgroup_counters(self, service: str) -> dict:
         """

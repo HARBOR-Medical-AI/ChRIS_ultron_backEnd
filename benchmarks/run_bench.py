@@ -27,6 +27,7 @@ from .config import PluginPins, Tier, load_pins, load_tier, step_for, tier_finge
 from .docker_client import DockerClient, service_name
 from .pg_stats import (SERVER_START_KEY, PgStatStatements, counter_delta, counter_windows,
                        max_deltas, server_counters, server_counters_error)
+from .pg_waits import WaitSampler, merge_rollups
 from .executor import build_feeds
 from .metrics import MetricSink
 from .models import (BreakingPoint, Classification, LevelResult, PluginRole, SamplerSummary,
@@ -52,6 +53,8 @@ SAMPLER_WORKERS = 8
 #: the sampler's own Docker client gives up a call after this rather than docker-py's 60 s:
 #: a tick waits for its reads only 0.8 of a tick, but a hung listing holds it
 SAMPLER_DOCKER_TIMEOUT_S = 10.0
+#: how often the database's wait events are sampled (pg_waits)
+WAITS_INTERVAL_S = 1.0
 
 #: idle Postgres backends publish their statistics within ~10 s, so the run's last counter
 #: snapshot waits this long to include them
@@ -141,6 +144,15 @@ class BenchmarkRunner:
                                     topology, axis, level, repeat_index)
 
     def run_scenario(self, params: ScenarioParams) -> ScenarioResult:
+        # the database's wait events, sampled from before the workload to the end of its
+        # cleanup in a psql session that must end however the scenario does
+        waits = WaitSampler(self.docker, interval=WAITS_INTERVAL_S).start()
+        try:
+            return self._run_scenario(params, waits)
+        finally:
+            waits.stop()
+
+    def _run_scenario(self, params: ScenarioParams, waits: WaitSampler) -> ScenarioResult:
         self._sink = MetricSink()                      # isolate this scenario's events
         topo = topologies.build(params.topology, params)
         before_counts = self._global_counts()
@@ -185,24 +197,29 @@ class BenchmarkRunner:
             db_deltas=db_deltas, started_at=started, ended_at=ended, queues=queues,
             notes=build_errors, sampler=sampler.summary(), cancels=cancels)
 
-        db_cleanup_end = None
+        db_cleanup_end = cleanup_window = None
         if self.cleanup:
             self._cleanup_and_quiesce(feeds, before_counts, result.notes)
             db_cleanup_end = self._db_snapshot()
+            cleanup_window = (ended, time.time())
 
+        # the wait events of both windows, sampled until the cleanup's end
+        waits.stop()
+        result.waits = waits.record({"workload": (started, ended),
+                                     "cleanup": cleanup_window})
         result.db_counters = counter_windows(db_start, db_workload_end, db_cleanup_end)
         # after cleanup, so that the deletion's log lines count too
         result.logs = log_evidence(self.docker, started)
 
         # persist after cleanup so delete/quiesce traffic reaches api_requests.jsonl
         # and cleanup anomalies land in the scenario's notes
-        self._persist_scenario(result, poll_every, *samples)
+        self._persist_scenario(result, poll_every, *samples, waits.samples)
         return result
 
     # -- persistence -----------------------------------------------------------------
 
     def _persist_scenario(self, result: ScenarioResult, poll_every: float,
-                          resources: list, queues: list) -> None:
+                          resources: list, queues: list, waits: list) -> None:
         sid = result.params.scenario_id()
         phases = metrics.timelines_rollup(result.timelines)
         requests = self._sink.requests()
@@ -216,7 +233,7 @@ class BenchmarkRunner:
             "db_deltas": result.db_deltas,
             "feeds": [f.feed_id for f in result.feeds], "notes": result.notes,
             "queues": result.queues, "status_queue_bound": status_queue_bound(result.params),
-            "db_counters": result.db_counters, "logs": result.logs,
+            "db_counters": result.db_counters, "waits": result.waits, "logs": result.logs,
             "cancels": result.cancels,
             "observer": {            # the harness's own measurement traffic, made visible
                 "poll_requests": sum(1 for r in requests if r.endpoint_class == "poll"),
@@ -228,6 +245,9 @@ class BenchmarkRunner:
         pg_top = self.pg_stats.snapshot()
         if pg_top:
             self.store.write_json(f"scenarios/{sid}/pg_stats.json", pg_top)
+
+        if waits:
+            self.store.append_jsonl(f"scenarios/{sid}/pg_waits.jsonl", waits)
         
         self.store.append_jsonl("api_requests.jsonl",
                                 ({"scenario": sid, **r.__dict__} for r in requests))
@@ -377,6 +397,9 @@ class BenchmarkRunner:
             else self.broker.unavailable_reason,
             "pg_stat_statements": True if self.pg_stats.available
             else self.pg_stats.unavailable_reason,
+            # each scenario's own record says when its sampling failed (waits.error)
+            "wait_events": True if self.docker.available
+            else self.docker.unavailable_reason,
         }
 
         # the workload plugins the run used, the images they resolved to, and the pin they
@@ -643,6 +666,7 @@ def _level_row(level: LevelResult) -> dict:
         "registered_output_bytes": max(
             (r.db_deltas.get("registered_output_bytes", 0) for r in reps), default=0),
         "db_counters": _db_counters_rollup(reps),
+        "waits": _waits_rollup(reps),
         "sampler": _sampler_rollup(reps),
     }
 
@@ -682,6 +706,21 @@ def _db_counters_rollup(reps) -> dict:
 
         if deltas:
             out[window] = max_deltas(deltas)
+    return out
+
+
+def _waits_rollup(reps) -> dict:
+    """
+    Per window (workload, cleanup), the wait events of the level's repeats as one
+    (``pg_waits.merge_rollups``): the backend-samples added up, the peaks the largest.
+    """
+    out = {}
+
+    for window in ("workload", "cleanup"):
+        rollups = [r.waits[window] for r in reps if r.waits.get(window)]
+
+        if rollups:
+            out[window] = merge_rollups(rollups)
     return out
 
 

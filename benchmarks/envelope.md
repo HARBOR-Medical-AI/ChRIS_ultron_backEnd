@@ -311,6 +311,33 @@ The harness reads these from the running server and the `db` container.
   runs' totals side by side under "Postgres over the whole run". It trends any level-row value
   through a dotted `--metric`, e.g. `--metric db_counters.workload.num_requested` or
   `--metric peak_write_bytes.db`. Given explicitly, the trend renders for two runs as well.
+- **Wait events** — once a second through each scenario, workload and cleanup, the backends
+  of `pg_stat_activity` that are not idle (client backends in any state but `idle`, and
+  background processes not in their idle `Activity` wait), counted by process type, state and
+  wait event. A backend waiting on nothing is on CPU (`CPU`). This tells lock waits (`Lock`)
+  apart from I/O (`IO`), internal locks (`LWLock`) and CPU.
+  - `scenarios/<id>/pg_waits.jsonl` holds every sample: the server clock (`at`) and
+    `backends`, rows of `[backend_type, state, wait_event_type, wait_event, count]`.
+  - `scenario.json` → `waits` rolls them up per window (`workload`, `cleanup`, the
+    `db_counters` windows): `samples`; `by_event`, the backends summed over the samples
+    (about backend-seconds) per `<wait_event_type>:<wait_event>`, most first, with a backend
+    idle in a transaction counted under its state (`idle in transaction`: it holds the
+    transaction's locks while its client works); `lock_waiters_peak` and `backends_peak`,
+    the most in one sample. `error` says why there are no samples (no Docker access, a `db`
+    that refused the session), or that the session ended before the scenario did (a crash
+    restart of Postgres, a restart of `db`), and when: the windows then cover less than
+    their length.
+  - Each `levels.jsonl` row gets the same per window (`waits`), its repeats' samples and
+    backends added up and their peaks the largest.
+
+  The samples come from one psql session inside `db` that runs its query under `\watch` for
+  the whole scenario, named `cube-bench-waits` (`application_name`) and left out of its own
+  samples: a psql per sample would add a session a second to the counters above. It still
+  shows in them: its query is a transaction a second (`xact_commit`), and its session can
+  count in the `workload` window's `sessions`. Its statements are left out of
+  `pg_stats.json`. Before its first sample it ends any other session of that name, one that
+  a harness that died left running; the harness ends it with `pg_terminate_backend` when the
+  scenario ends, however it ends. Runs before 2026-11-24 have no wait events.
 
 ## Pinned compute resource (per plugin job)
 

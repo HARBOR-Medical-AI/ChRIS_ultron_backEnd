@@ -302,7 +302,8 @@ def test_a_scenario_measures_the_logs_since_it_started_after_its_cleanup(monkeyp
     order = [e[0] if isinstance(e, tuple) and e[0] == "logs" else e for e in events
              if isinstance(e, str) or e[0] == "logs"]
 
-    assert order[-4:] == ["cleanup", "snapshot", "logs", "persist"]  # nosec B101 - pytest assertion
+    assert order[-5:] == [  # nosec B101 - pytest assertion
+        "cleanup", "snapshot", "waits stop", "logs", "persist"]
     assert ("logs", 42.0) in events and result.logs == {"x": 1}  # nosec B101 - pytest assertion
 
 
@@ -340,6 +341,26 @@ def test_the_level_row_adds_up_the_evidence_of_its_repeats():
     # the services of the repeat that logged the most, and their total
     assert row["worker_log_bytes"] == {"worker-mains": 30}  # nosec B101 - pytest assertion
     assert row["worker_log_bytes_total"] == 30  # nosec B101 - pytest assertion
+
+
+def test_the_level_row_merges_the_wait_events_of_its_repeats_per_window():
+    lock = {"samples": 2, "by_event": {"Lock:tuple": 3}, "lock_waiters_peak": 2,
+            "backends_peak": 4}
+    io = {"samples": 3, "by_event": {"IO:DataFileRead": 5, "Lock:tuple": 1},
+          "lock_waiters_peak": 1, "backends_peak": 6}
+    reps = [_result(), _result(), _result()]
+    reps[0].waits = {"workload": lock, "cleanup": None}
+    reps[1].waits = {"workload": io, "cleanup": io}
+    # the third repeat could not sample: no windows
+
+    row = _level_row(LevelResult("linear", "feeds", 1, Verdict.PASS, (), reps))
+
+    assert row["waits"]["workload"] == {  # nosec B101 - pytest assertion
+        "samples": 5, "by_event": {"IO:DataFileRead": 5, "Lock:tuple": 4},
+        "lock_waiters_peak": 2, "backends_peak": 6}
+    assert row["waits"]["cleanup"] == io  # nosec B101 - pytest assertion
+    unsampled = _level_row(LevelResult("linear", "feeds", 1, Verdict.PASS, (), [_result()]))
+    assert unsampled["waits"] == {}  # nosec B101 - pytest assertion
 
 
 def test_a_level_with_a_repeat_whose_logs_were_not_read_counts_no_conflicts():

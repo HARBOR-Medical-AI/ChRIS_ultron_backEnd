@@ -91,7 +91,7 @@ tiers:
       scenario_timeout_s: 3600
       quiesce_timeout_s: 900
     topologies:
-      linear:        {axes: {depth: 64, file_count: 10000, feeds: 128}}
+      linear:        {axes: {depth: 64, file_count: 100000, feeds: 128}}
       fanout_fanin:  {axes: {branches: 64, feeds: 64, file_count: 10000, merges: 8}}
       diamond:       {axes: {branches: 32, layers: 16, feeds: 32}}
 

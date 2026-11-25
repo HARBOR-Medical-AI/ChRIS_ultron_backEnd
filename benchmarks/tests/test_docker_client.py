@@ -31,6 +31,25 @@ def _raise(error):
     return get
 
 
+def test_exec_stream_returns_the_output_of_a_command_in_a_service_as_it_comes():
+    calls = []
+
+    def exec_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(exit_code=None, output=iter([b"a\n", b"b"]))
+
+    client = _client(None)
+    client.find_service = lambda service: SimpleNamespace(exec_run=exec_run)
+
+    output = list(client.exec_stream("db", ["psql"]))
+    assert output == [b"a\n", b"b"]  # nosec B101 - pytest assertion
+    assert calls == [(["psql"], {"stream": True})]  # nosec B101 - pytest assertion
+
+    client.find_service = lambda service: None
+    with pytest.raises(RuntimeError, match="service 'db' not running"):
+        client.exec_stream("db", ["psql"])
+
+
 def test_image_record_sorts_the_digests_and_keeps_the_architecture():
     image = SimpleNamespace(id="sha256:1c45", attrs={
         "RepoDigests": ["localhost/x@sha256:bb", "fnndsc/x@sha256:aa"],
