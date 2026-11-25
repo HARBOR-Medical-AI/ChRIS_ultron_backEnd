@@ -11,7 +11,8 @@ from collectionjson.fields import ItemLinkField
 from core.models import (ChrisFolder, ChrisFile, ChrisLinkFile, FolderGroupPermission,
                          FolderUserPermission, FileGroupPermission, FileUserPermission,
                          LinkFileGroupPermission, LinkFileUserPermission)
-from core.serializers import ChrisFileSerializer
+from core.serializers import (ChrisFileSerializer, public_link_follows,
+                              validate_path_not_in_use)
 
 
 class FileBrowserFolderSerializer(serializers.HyperlinkedModelSerializer):
@@ -94,15 +95,11 @@ class FileBrowserFolderSerializer(serializers.HyperlinkedModelSerializer):
         new_path = validated_data.get('path')
 
         if new_path:
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.remove_public_link()
-
+            stays_public = public and validated_data.get('public', True)
             # folder will be stored at: SWIFT_CONTAINER_NAME/<new_path>
             # where <new_path> must start with home/
-            instance.move(new_path)
-
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.create_public_link()  # recreate public link
+            with public_link_follows(instance, stays_public):
+                instance.move(new_path)
 
         if not public and 'public' in validated_data and validated_data['public']:
             instance.grant_public_access()
@@ -137,6 +134,7 @@ class FileBrowserFolderSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError([f"Invalid path. User do not have write "
                                                f"permission under the folder "
                                                f"'{ancestor.path}'."])
+        validate_path_not_in_use(path)  # a file's or a link file's
         return path
 
     def validate_public(self, public):
@@ -359,15 +357,11 @@ class FileBrowserFileSerializer(ChrisFileSerializer):
         new_file_path = validated_data.pop('new_file_path', None)
 
         if new_file_path:
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.remove_public_link()
-
+            stays_public = public and validated_data.get('public', True)
             # user file will be stored at: SWIFT_CONTAINER_NAME/<new_file_path>
             # where <new_file_path> must start with home/
-            instance.move(new_file_path)
-
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.create_public_link()  # recreate public link
+            with public_link_follows(instance, stays_public):
+                instance.move(new_file_path)
 
         if not public and 'public' in validated_data and validated_data['public']:
             instance.grant_public_access()
@@ -404,6 +398,7 @@ class FileBrowserFileSerializer(ChrisFileSerializer):
             raise serializers.ValidationError([f"Invalid path. User do not have write "
                                                f"permission under the folder "
                                                f"'{folder_path}'."])
+        validate_path_not_in_use(new_file_path, self.instance)
         return new_file_path
 
     def validate_public(self, public):
@@ -619,15 +614,11 @@ class FileBrowserLinkFileSerializer(ChrisFileSerializer):
         new_link_file_path = validated_data.pop('new_link_file_path', None)
 
         if new_link_file_path:
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.remove_public_link()
-
+            stays_public = public and validated_data.get('public', True)
             # link file will be stored at: SWIFT_CONTAINER_NAME/<new_link_file_path>
             # where <new_link_file_path> must start with home/
-            instance.move(new_link_file_path)
-
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.create_public_link()  # recreate public link
+            with public_link_follows(instance, stays_public):
+                instance.move(new_link_file_path)
 
         if not public and 'public' in validated_data and validated_data['public']:
             instance.grant_public_access()
@@ -703,6 +694,7 @@ class FileBrowserLinkFileSerializer(ChrisFileSerializer):
             raise serializers.ValidationError([f"Invalid path. User do not have write "
                                                f"permission under the folder "
                                                f"'{folder_path}'."])
+        validate_path_not_in_use(new_link_file_path, self.instance)
         return new_link_file_path
 
     def validate_public(self, public):

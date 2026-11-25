@@ -151,6 +151,23 @@ class FileBrowserFolderListViewTests(FileBrowserViewTests):
         self.assertEqual(response.data["path"], f"home/{self.username}/uploads/folder1/folder3")
         self.assertFalse(response.data["public"])
 
+    def test_filebrowserfolder_create_failure_path_of_a_file(self):
+        self.client.login(username=self.username, password=self.password)
+        user = User.objects.get(username=self.username)
+        (uploads, _) = ChrisFolder.objects.get_or_create(
+            path=f'home/{self.username}/uploads', defaults={'owner': user})
+        file_path = f'{uploads.path}/afile.txt'
+        f = UserFile(owner=user, parent_folder=uploads)
+        f.fname.name = file_path
+        f.save()
+
+        for path in (file_path, f'{file_path}/sub'):  # a folder where a file is
+            post = json.dumps({"template": {"data": [{"name": "path", "value": path}]}})
+            response = self.client.post(self.create_read_url, data=post,
+                                        content_type=self.content_type)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ChrisFolder.objects.filter(path=file_path).exists())
+
     def test_filebrowserfolder_create_failure_unauthenticated(self):
         response = self.client.post(self.create_read_url, data=self.post,
                                     content_type=self.content_type)
@@ -403,6 +420,8 @@ class FileBrowserFolderDetailViewTests(FileBrowserTasksViewTests):
         self.assertEqual(response.data["path"], new_path)
         folder.refresh_from_db()
 
+        self.assertEqual(folder.parent.path,
+                         f'home/{self.username}/uploads/test_update_folder')
         inner_folder.refresh_from_db()
         self.assertEqual(inner_folder.path, new_path + '/inner')
         self.assertEqual(inner_folder.parent, folder)
@@ -420,6 +439,23 @@ class FileBrowserFolderDetailViewTests(FileBrowserTasksViewTests):
         folder.remove_public_link()
         folder.remove_public_access()
         folder.delete()
+
+    def test_filebrowserfolder_update_failure_path_of_a_file(self):
+        owner = User.objects.get(username=self.username)
+        (folder, _) = ChrisFolder.objects.get_or_create(
+            path=f'home/{self.username}/uploads/test_update', owner=owner)
+        f = UserFile(owner=owner, parent_folder=folder)
+        f.fname.name = f'home/{self.username}/uploads/test_update/afile.txt'
+        f.save()
+        put = json.dumps({"template": {"data": [{"name": "path", "value": f.fname.name}]}})
+        url = reverse("chrisfolder-detail", kwargs={"pk": folder.id})
+
+        self.client.login(username=self.username, password=self.password)
+        response = self.client.put(url, data=put, content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        folder.refresh_from_db()
+        self.assertEqual(folder.path, f'home/{self.username}/uploads/test_update')
 
     def test_filebrowserfolder_update_failure_unauthenticated(self):
         response = self.client.put(self.read_update_delete_url, data=self.put,
@@ -1737,6 +1773,28 @@ class FileBrowserFileDetailViewTests(FileBrowserViewTests):
         self.file.remove_public_link()
         self.file.remove_public_access()
 
+    def test_filebrowserfile_update_failure_path_in_use(self):
+        self.client.login(username=self.username, password=self.password)
+        taken_path = f'home/{self.username}/uploads/taken.txt'
+        self.storage_manager.upload_obj(taken_path, b'taken')
+        taken = UserFile(owner=User.objects.get(username=self.username),
+                         parent_folder=self.file.parent_folder)
+        taken.fname.name = taken_path
+        taken.save()
+        self.addCleanup(taken.delete)
+        put = json.dumps({
+            "template": {"data": [{"name": "new_file_path", "value": taken_path}]}})
+
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('already has path', str(response.data))
+        self.file.refresh_from_db()
+        self.assertEqual(self.file.fname.name, self.upload_path)
+        self.assertEqual(self.storage_manager.download_obj(self.upload_path), b'test file')
+        self.assertEqual(self.storage_manager.download_obj(taken_path), b'taken')
+
     def test_filebrowserfile_update_failure_unauthenticated(self):
         response = self.client.put(self.read_update_delete_url, data=self.put,
                                    content_type=self.content_type)
@@ -2737,6 +2795,24 @@ class FileBrowserLinkFileDetailViewTests(FileBrowserViewTests):
         self.link_file.refresh_from_db()
         self.link_file.remove_public_link()
         self.link_file.remove_public_access()
+
+    def test_filebrowserlinkfile_update_failure_path_in_use(self):
+        self.client.login(username=self.username, password=self.password)
+        taken = ChrisLinkFile(path='home', owner=User.objects.get(username=self.username),
+                              parent_folder=self.pl_inst.output_folder)
+        taken.save(name='taken')
+        self.addCleanup(taken.delete)
+        put = json.dumps({
+            "template": {"data": [{"name": "new_link_file_path",
+                                   "value": taken.fname.name}]}})
+
+        response = self.client.put(self.read_update_delete_url, data=put,
+                                   content_type=self.content_type)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.storage_manager.download_obj(self.link_path),
+                         b'SERVICES/PACS')
+        self.assertEqual(self.storage_manager.download_obj(taken.fname.name), b'home')
 
     def test_filebrowserlinkfile_update_failure_unauthenticated(self):
         response = self.client.put(self.read_update_delete_url, data=self.put,

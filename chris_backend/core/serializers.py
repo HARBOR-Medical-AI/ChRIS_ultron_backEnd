@@ -1,12 +1,43 @@
 
+from contextlib import contextmanager
+
 from rest_framework import serializers
 from rest_framework.utils import model_meta
 
 from drf_spectacular.utils import OpenApiTypes, extend_schema_field
 
 from collectionjson.fields import ItemLinkField
-from .models import ChrisInstance, FileDownloadToken, ChrisFile, ChrisLinkFile
+from .models import ChrisInstance, FileDownloadToken, ChrisFile, ChrisLinkFile, path_in_use
 from .utils import get_file_resource_link
+
+
+def validate_path_not_in_use(path, instance=None):
+    """
+    Raise a ValidationError when ``path``, where a file or link file is to be uploaded
+    or moved (``instance``, when it is there already) or a folder made, is in use
+    (``path_in_use``): a file, a link file or a folder has it, or a file or a link file
+    has a path above it. ``instance``'s own path is allowed, as a move to it does
+    nothing.
+    """
+    if (instance is None or path != instance.fname.name) and path_in_use(path):
+        raise serializers.ValidationError(
+            [f"Invalid path. A file, link file or folder already has path '{path}'."])
+
+
+@contextmanager
+def public_link_follows(instance, public):
+    """
+    Around a move of ``instance`` (a folder, a file or a link file), when ``public``:
+    take its public link away, and make it again for the path it has after the move,
+    the old one when the move failed.
+    """
+    if public:
+        instance.remove_public_link()
+    try:
+        yield
+    finally:
+        if public:
+            instance.create_public_link()
 
 
 def save_validated_fields(instance, validated_data):

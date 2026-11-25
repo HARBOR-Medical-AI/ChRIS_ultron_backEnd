@@ -9,7 +9,7 @@ from django.core.files.base import ContentFile
 from django.conf import settings
 from rest_framework import serializers
 
-from core.models import ChrisFolder
+from core.models import ChrisFile, ChrisFolder
 from userfiles.models import UserFile
 from userfiles.serializers import UserFileSerializer
 
@@ -143,6 +143,32 @@ class UserFileSerializerTests(TestCase):
                              {'request': request}, clear=True):
             with self.assertRaises(serializers.ValidationError):
                 userfiles_serializer.validate_upload_path('SERVICES/PACS/random/file1.txt')
+
+    def test_validate_upload_path_failure_path_in_use(self):
+        """
+        Test whether overriden validate_upload_path method refuses a path that a file
+        already has, but for that file itself.
+        """
+        user = User.objects.get(username=self.username)
+        (folder, _) = ChrisFolder.objects.get_or_create(
+            path=f'home/{self.username}/uploads', owner=user)
+        taken = ChrisFile(owner=user, parent_folder=folder)
+        taken.fname.name = f'home/{self.username}/uploads/taken.txt'
+        taken.save()
+        request = mock.Mock()
+        request.user = user
+
+        for serializer, refused in ((UserFileSerializer(), True),
+                                    (UserFileSerializer(instance=taken), False)):
+            with self.subTest(update=not refused), \
+                    mock.patch.dict(serializer.context, {'request': request}, clear=True):
+                if refused:
+                    with self.assertRaisesRegex(serializers.ValidationError,
+                                                'already has path'):
+                        serializer.validate_upload_path(taken.fname.name)
+                else:
+                    self.assertEqual(serializer.validate_upload_path(taken.fname.name),
+                                     taken.fname.name)
 
     def test_validate_upload_path_success(self):
         """

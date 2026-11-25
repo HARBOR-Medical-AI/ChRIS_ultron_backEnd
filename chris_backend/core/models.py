@@ -7,11 +7,12 @@ from contextlib import contextmanager
 
 from celery.exceptions import SoftTimeLimitExceeded
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models, router
+from django.db import IntegrityError, models, router, transaction
 from django.db.models.deletion import Collector
 from django.db.models.functions import Length
 from django.db.models.signals import post_delete
 from django.utils import timezone
+from psycopg.errors import UniqueViolation
 from django.dispatch import receiver
 from django.conf import settings
 from django.contrib.auth.models import User, Group
@@ -231,14 +232,35 @@ class ChrisFolder(AsyncDeletableModel):
 
     def move(self, new_path):
         """
-        Custom method to move the folder's tree to a new path.
+        Move the folder's tree to ``new_path``: its objects in storage, then the rows of
+        the folders, files and link files in it, in one transaction; when that fails the
+        objects move back (best effort) and the folder keeps its path. A path in use
+        (``path_in_use``) is refused, and the folder's own path is nothing to do.
         """
         new_path = new_path.strip('/')
         path = str(self.path)
 
-        storage_manager = connect_storage(settings)
-        storage_manager.move_path(path, new_path)
+        if new_path == path:
+            return
+        if path_in_use(new_path):
+            raise ValueError(f"Path '{new_path}' is in use.")
 
+        storage_manager = connect_storage(settings)
+        storage_manager.move_path(path + '/', new_path + '/')  # the folder's tree, only
+        try:
+            with transaction.atomic(durable=True):
+                self._move_rows(path, new_path)
+        except Exception:
+            self.path = path
+            with _storage_errors_logged(f'moving folder {new_path} back to {path}'):
+                storage_manager.move_path(new_path + '/', path + '/')
+            raise
+
+    def _move_rows(self, path, new_path):
+        """
+        Give this folder and the folders, files and link files in it the paths they have
+        under ``new_path`` instead of ``path``, and the folder its new parent.
+        """
         prefix = path + '/'  # avoid sibling folders with paths that start with path
 
         folders = [self] + list(ChrisFolder.objects.filter(path__startswith=prefix))
@@ -256,17 +278,8 @@ class ChrisFolder(AsyncDeletableModel):
             lf.fname.name = lf.fname.name.replace(path, new_path, 1)
         ChrisLinkFile.objects.bulk_update(link_files, ['fname'])
 
-        new_parent_path = os.path.dirname(new_path)
-
-        if new_parent_path != os.path.dirname(path):
-            # parent folder has changed
-            try:
-                parent_folder = ChrisFolder.objects.get(path=new_parent_path)
-            except ChrisFolder.DoesNotExist:
-                parent_folder = ChrisFolder.objects.create(path=new_parent_path,
-                                                           owner=self.owner)
-            self.parent_folder = parent_folder
-            self.save()
+        if os.path.dirname(new_path) != os.path.dirname(path):
+            self.save(update_fields=['parent'])  # save finds the parent, or creates it
 
     def delete_contents(self):
         """
@@ -576,6 +589,59 @@ def delete_related(instance, *names, origin=None):
         related.delete()
 
 
+def path_in_use(path):
+    """
+    Whether a file, a link file or a folder has ``path``, or a file or a link file has a
+    path above it, where a folder would have to be: a file moved or uploaded there, or a
+    folder made there, would take an object's place or make a folder of a file's path.
+    """
+    parts = path.split('/')
+    paths = ['/'.join(parts[:i]) for i in range(1, len(parts) + 1)]  # path and above
+    return (ChrisFile.objects.filter(fname__in=paths).exists()
+            or ChrisLinkFile.objects.filter(fname__in=paths).exists()
+            or ChrisFolder.objects.filter(path=path).exists())
+
+
+def _stored(field_file):
+    """
+    Whether the contents of a file field are in storage: a FieldFile given new contents
+    is not ``_committed`` until the model's save uploads them (read through getattr, as
+    django-stubs does not declare it).
+    """
+    return getattr(field_file, '_committed', True)
+
+
+def _folder_for(path, owner, folder):
+    """
+    The folder of ``path``: ``folder`` when it is that, else the folder at the path's
+    parent, created (with its missing ancestors) for ``owner`` when there is none.
+    """
+    folder_path = os.path.dirname(path)
+    if folder.path == folder_path:
+        return folder
+    return ChrisFolder.objects.get_or_create(path=folder_path,
+                                             defaults={'owner': owner})[0]
+
+
+def _name_taken(error):
+    """
+    Whether ``error`` is the database refusing a row for a unique value that another
+    row has (for a file, its name): what is stored under that name is that row's.
+    """
+    return (isinstance(error, IntegrityError)
+            and isinstance(error.__cause__, UniqueViolation))
+
+
+def _discard(path, after):
+    """
+    Delete the object at ``path``, which is no row's after ``after`` (a failed save, a
+    move). A storage error is logged (``_storage_errors_logged``): what ran before is
+    done, or its own error is the one to raise.
+    """
+    with _storage_errors_logged(f'deleting {path} after {after}'):
+        connect_storage(settings).delete_obj(path)
+
+
 class ChrisFolderFilter(FilterSet):
     path = django_filters.CharFilter(field_name='path')
 
@@ -769,47 +835,59 @@ class ChrisFile(models.Model):
 
     def save(self, *args, **kwargs):
         """
-        Overriden to ensure file paths never start or end with slashes. Also, to delete
-        a leftover file in storage if any error happens when saving the file.
+        Overriden to ensure file paths never start or end with slashes. Also, when the
+        save stores the file's contents (an upload) and then its row fails, to delete
+        what it stored, under the name the storage gave it: a name no object had, as no
+        storage of CUBE's lets an upload replace an object it finds. Nothing else: a row
+        saved again, or one for an object already in storage, leaves storage alone, and
+        so does a row refused because another row took its name meanwhile (a unique
+        violation, ``_name_taken``), as what is under that name is the other row's.
         """
         path = self.fname.name
         if path.startswith('/') or path.endswith('/'):
             raise ValueError('Paths starting or ending with slashes are not allowed.')
+        uploads = not _stored(self.fname)
         try:
             super(ChrisFile, self).save(*args, **kwargs)
-        except Exception:
-            storage_manager = connect_storage(settings)
-            if storage_manager.obj_exists(path):
-                storage_manager.delete_obj(path)
+        except Exception as e:
+            if uploads and _stored(self.fname) and not _name_taken(e):
+                _discard(self.fname.name, 'a failed save')  # stored, then the row failed
             raise
 
     def move(self, new_path):
         """
-        Custom method to move the file to a new path.
+        Move the file to ``new_path``: in one transaction, which must be the outermost
+        (``durable``), its row, which takes the path (the unique index settles a race
+        with another file for it before storage is touched), then a copy of its object
+        there; then the old object deleted, best effort. A failure leaves the file whole
+        at one path or the other. A path in use (``path_in_use``) is refused, and the
+        file's own path is nothing to do.
         """
         new_path = new_path.strip('/')
+        old_path, old_folder = str(self.fname), self.parent_folder
+
+        if new_path == old_path:
+            return
+        if path_in_use(new_path):
+            raise ValueError(f"Path '{new_path}' is in use.")
 
         storage_manager = connect_storage(settings)
-        if storage_manager.obj_exists(new_path):
-            storage_manager.delete_obj(new_path)
-
-        old_path = self.fname.name
-        storage_manager.copy_obj(old_path, new_path)
-        storage_manager.delete_obj(old_path)
-
-        old_folder_path = os.path.dirname(old_path)
-        new_folder_path = os.path.dirname(new_path)
-
-        if new_folder_path != old_folder_path:  # parent folder has changed
-            try:
-                parent_folder = ChrisFolder.objects.get(path=new_folder_path)
-            except ChrisFolder.DoesNotExist:
-                parent_folder = ChrisFolder.objects.create(path=new_folder_path,
-                                                           owner=self.owner)
-            self.parent_folder = parent_folder
-
-        self.fname.name = new_path
-        self.save()
+        copied = False
+        try:
+            with transaction.atomic(durable=True):
+                self.parent_folder = _folder_for(new_path, self.owner, old_folder)
+                self.fname.name = new_path
+                self.save(update_fields=['fname', 'parent_folder'])
+                # no row's object: one a failed upload or a deletion left
+                storage_manager.delete_obj(new_path)
+                storage_manager.copy_obj(old_path, new_path)
+                copied = True
+        except Exception:
+            self.fname.name, self.parent_folder = old_path, old_folder
+            if copied:  # the commit failed
+                _discard(new_path, 'a failed move')
+            raise
+        _discard(old_path, 'a move')
 
     def has_group_permission(self, group, permission=''):
         """
@@ -1053,51 +1131,53 @@ class ChrisLinkFile(models.Model):
         Overriden to create and save the associated link file when the link is
         saved.
         """
-        path = self.path  # pointed path
         name = kwargs.pop('name')  # must provide a name for the link
         link_file_path = os.path.join(self.parent_folder.path, f'{name}.chrislink')
-        link_file_contents = f'{path}'
-
-        storage_manager = connect_storage(settings)
-        # a new object, not one written over: on a filesystem the object there may be a
-        # hard link (a copy) that another path shares
-        storage_manager.delete_obj(link_file_path)
-        storage_manager.upload_obj(link_file_path, link_file_contents,
-                                   content_type='text/plain')
+        self._write_object(link_file_path)
         self.fname.name = link_file_path
         super(ChrisLinkFile, self).save(*args, **kwargs)
 
+    def _write_object(self, link_file_path):
+        """
+        Write the link file's object, the path it links, at ``link_file_path``: a new
+        object, not one written over, as on a filesystem the object there may be a hard
+        link (a copy) that another path shares.
+        """
+        storage_manager = connect_storage(settings)
+        storage_manager.delete_obj(link_file_path)
+        storage_manager.upload_obj(link_file_path, f'{self.path}',
+                                   content_type='text/plain')
+
     def move(self, new_path):
         """
-        Custom method to move the link file to a new path.
+        Move the link file to ``new_path``, as ``ChrisFile.move`` moves a file: its row,
+        then its object written there, in one transaction (the unique index settles a
+        race with another link file), then the old object deleted.
         """
         new_path = new_path.strip('/')
         if not new_path.endswith('.chrislink'):
             raise ValueError("The new path must end with '.chrislink' sufix.")
+        old_path, old_folder = str(self.fname), self.parent_folder
 
-        storage_manager = connect_storage(settings)
-        if storage_manager.obj_exists(new_path):
-            storage_manager.delete_obj(new_path)
+        if new_path == old_path:
+            return
+        if path_in_use(new_path):
+            raise ValueError(f"Path '{new_path}' is in use.")
 
-        old_path = self.fname.name
-        storage_manager.copy_obj(old_path, new_path)
-        storage_manager.delete_obj(old_path)
-
-        old_folder_path = os.path.dirname(old_path)
-        new_folder_path = os.path.dirname(new_path)
-
-        if new_folder_path != old_folder_path:  # parent folder has changed
-            try:
-                parent_folder = ChrisFolder.objects.get(path=new_folder_path)
-            except ChrisFolder.DoesNotExist:
-                parent_folder = ChrisFolder.objects.create(path=new_folder_path,
-                                                           owner=self.owner)
-            self.parent_folder = parent_folder
-
-        self.fname.name = new_path
-
-        link_name = os.path.basename(new_path).rsplit('.chrislink', 1)[0]
-        self.save(name=link_name)
+        written = False
+        try:
+            with transaction.atomic(durable=True):
+                self.parent_folder = _folder_for(new_path, self.owner, old_folder)
+                self.fname.name = new_path
+                super(ChrisLinkFile, self).save(update_fields=['fname', 'parent_folder'])
+                self._write_object(new_path)
+                written = True
+        except Exception:
+            self.fname.name, self.parent_folder = old_path, old_folder
+            if written:  # the commit failed
+                _discard(new_path, 'a failed move')
+            raise
+        _discard(old_path, 'a move')
 
     def has_group_permission(self, group, permission=''):
         """

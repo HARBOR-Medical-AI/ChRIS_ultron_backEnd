@@ -4,7 +4,8 @@ import os
 from rest_framework import serializers
 
 from core.models import ChrisFolder
-from core.serializers import ChrisFileSerializer
+from core.serializers import (ChrisFileSerializer, public_link_follows,
+                              validate_path_not_in_use)
 from .models import UserFile
 
 
@@ -90,15 +91,11 @@ class UserFileSerializer(ChrisFileSerializer):
         upload_path = validated_data.pop('upload_path', None)
 
         if upload_path:
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.remove_public_link()
-
+            stays_public = public and validated_data.get('public', True)
             # user file will be stored at: SWIFT_CONTAINER_NAME/<upload_path>
             # where <upload_path> must start with home/
-            instance.move(upload_path)
-
-            if public and ('public' not in validated_data or validated_data['public']):
-                instance.create_public_link()  # recreate public link
+            with public_link_follows(instance, stays_public):
+                instance.move(upload_path)
 
         if not public and 'public' in validated_data and validated_data['public']:
             instance.grant_public_access()
@@ -133,6 +130,7 @@ class UserFileSerializer(ChrisFileSerializer):
             raise serializers.ValidationError([f"Invalid path. User does not have write "
                                                f"permission under the folder "
                                                f"'{ancestor_folder.path}'."])
+        validate_path_not_in_use(upload_path, self.instance)
         return upload_path
 
     def validate(self, data):
