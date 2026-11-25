@@ -49,7 +49,7 @@ just format [--base REF]  # Ruff's default style on the lines changed since the 
 just typecheck [--strict] [--tests] [--all] [--base REF]  # mypy errors the branch adds:
                           #   the whole project, working tree vs merge-base, settings in
                           #   [tool.mypy] (scripts/typecheck.py); exit 1 on any, 2 on failure
-just lint-test            # scripts/test_*.py, in the dev image (no stack)
+just scripts-test         # scripts/test_*.py, in the dev image (no stack)
 
 just lock                 # re-resolve both uv.lock files after editing a pyproject.toml
 just lock-upgrade <pkg>   # bump one dependency

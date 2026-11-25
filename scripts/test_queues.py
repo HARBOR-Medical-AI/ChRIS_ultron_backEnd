@@ -4,7 +4,7 @@ The Celery queues are named in several places that must agree, which no Django t
 routing table), the worker services of the compose stacks, which must consume every queue
 and never the tests' own, oxidicom's queue, and the queues the benchmark harness samples
 (benchmarks/broker.py). A queue renamed in one place alone strands its tasks silently.
-Run in the dev image by ``just lint-test``.
+Run in the dev image by ``just scripts-test``.
 """
 
 import ast

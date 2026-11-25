@@ -1,5 +1,5 @@
 """
-Tests for scripts/typecheck.py, run in the dev image by ``just lint-test``. mypy runs for
+Tests for scripts/typecheck.py, run in the dev image by ``just scripts-test``. mypy runs for
 real, on repositories of their own, except in the tests that feed the script mypy's output.
 """
 
@@ -415,7 +415,7 @@ class CheckTests(TypecheckTestCase):
         self.assertIn("src/tests/test_a.py", out)
         self.assertIn("scripts/test_b.py", out)
 
-    def test_strict_mode_lists_only_what_it_adds_as_advice(self):
+    def test_strict_mode_lists_only_what_it_adds_as_advisory(self):
         self.branch({"src/old.py": UNTYPED})
         self.write({"src/old.py": UNTYPED + "\n", "src/new.py": UNTYPED})
 
@@ -427,8 +427,8 @@ class CheckTests(TypecheckTestCase):
         self.assertIn("src/new.py", out)
         self.assertIn("no-untyped-def", out)
         self.assertNotIn("src/old.py", out)
-        self.assertIn("Strict mode: advice; `just typecheck` without --strict is the check",
-                      out)
+        self.assertIn("Strict mode is advisory: it exits 1 on new errors too, but "
+                      "`just typecheck` without --strict is the check", out)
 
         self.write({"src/new.py": "x = 1\n"})
         status, out, err = self.main("--strict")

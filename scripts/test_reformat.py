@@ -1,5 +1,5 @@
 """
-Tests for scripts/reformat.py, run in the dev image by ``just lint-test``.
+Tests for scripts/reformat.py, run in the dev image by ``just scripts-test``.
 """
 
 import io

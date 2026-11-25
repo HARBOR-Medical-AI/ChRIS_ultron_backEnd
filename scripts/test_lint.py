@@ -1,5 +1,5 @@
 """
-Tests for scripts/lint.py, run in the dev image by ``just lint-test``.
+Tests for scripts/lint.py, run in the dev image by ``just scripts-test``.
 
 A test that needs a repository makes one of its own (test_repo.RepositoryTestCase).
 """

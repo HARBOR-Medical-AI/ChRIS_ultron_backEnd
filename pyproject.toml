@@ -56,8 +56,7 @@ dev = [
     "ruff>=0.17.3",  # used by `just lint-fix` and `just format`
     "daphne>=4.2.3",  # required by (django) channels.testing
     "mypy>=2.4.1",  # used by `just typecheck`
-    # Django's and DRF's type stubs and their mypy plugins (Django's reads the models); the
-    # extra keeps mypy at a version the plugins support
+    # Django's and DRF's type stubs and their mypy plugins
     "django-stubs[compatible-mypy]>=6.1.2",
     "djangorestframework-stubs[compatible-mypy]>=3.18.2",
 ]
@@ -80,7 +79,7 @@ environments = [
 # mypy's settings for `just typecheck` (scripts/typecheck.py) which lists the errors a
 # branch adds. Most of CUBE is not annotated, so the bodies of unannotated functions are
 # checked too; `--strict` adds mypy's strict checks. `just typecheck --tests` drops the
-# last two exclusions. The Django plugin imports the settings module, so it names one
+# last two exclusions. The Django plugin imports the settings module. It names one
 # that imports without any service running.
 [tool.mypy]
 files = ["chris_backend", "scripts"]

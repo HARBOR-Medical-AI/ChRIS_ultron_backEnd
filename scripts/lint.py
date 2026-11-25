@@ -86,7 +86,6 @@ def dodgy(tree, files):
     except ImportError:
         raise ToolError("dodgy is not installed: the dev image predates it, `just build` "
                         "makes a new one") from None
-
     return [
         tree.issue(path, number, f"dodgy {key}", message)
         for path in files
@@ -102,6 +101,7 @@ def pylint(tree, files):
         "--disable=all", f"--enable={','.join(PYLINT_RULES)}", *files,
     ]
     out = run(cmd, tree.root, ok=range(32))  # 32 is a usage error, the rest flag findings
+
     return [
         tree.issue(m["path"], m["line"], f"Pylint {m['messageId']}", m["message"])
         for m in json.loads(out)["messages"]
@@ -122,7 +122,8 @@ def advisories(tree, lockfiles):
         try:
             vulns = json.loads(run(cmd, tree.root))["vulnerabilities"]
         except (ToolError, ValueError, KeyError) as e:
-            raise ToolError(f"{lockfile} could not be audited in {tree.root}: {e}") from None
+            raise ToolError(
+                f"{lockfile} could not be audited in {tree.root}: {e}") from None
 
         upgrade = (
             "just lock-upgrade {}" if project == "."
@@ -196,9 +197,9 @@ def report(branch, issues, new, show_all):
                 unsure=unsure)
 
     if unsure:
-        print(f"{len(unsure)} advisories (? above) predate the branch here, but Codacy may "
-              "call them new: its analysis of master can predate them. Upgrading clears "
-              "them")
+        print(f"{len(unsure)} advisories (? above) predate the branch here, but Codacy "
+              "may call them new: its analysis of master can predate them. Upgrading "
+              "clears them")
 
 
 def ruff_fixes(files, unsafe):

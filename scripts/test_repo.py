@@ -1,5 +1,5 @@
 """
-Tests for scripts/repo.py, run in the dev image by ``just lint-test``, and the repository
+Tests for scripts/repo.py, run in the dev image by ``just scripts-test``, and the repository
 the tests of every script that reads a branch make their own.
 """
 

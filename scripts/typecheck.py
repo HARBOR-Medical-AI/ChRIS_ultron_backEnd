@@ -23,11 +23,11 @@ lacks cannot be checked.
     just typecheck [--strict] [--tests] [--all] [--base REF]
 
 ``--strict`` adds mypy's strict checks (``mypy --strict``), which report every function
-without annotations, and more: its new errors are advice, and ``just typecheck`` without
-it is the check. ``--tests`` checks the test modules too. ``--all`` also lists the older
-errors of the changed files, the new ones marked ``*``. Exit status: 0 none new, 1 new
-errors, 2 failure. A git worktree cannot be checked this way: its ``.git`` file names a
-path the container does not see.
+without annotations, and more. Its new errors are advisory: the run exits 1 on them too,
+but ``just typecheck`` without it is the check. ``--tests`` checks the test modules too.
+``--all`` also lists the older errors of the changed files, the new ones marked ``*``.
+Exit status: 0 none new, 1 new errors, 2 failure. A git worktree cannot be checked this
+way: its ``.git`` file names a path the container does not see.
 """
 
 import argparse
@@ -63,7 +63,8 @@ BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 LINE_NUMBER = re.compile(r"\bline \d+\b")
 
 GATE = "Fix them, or silence a false one with `# type: ignore[<code>]` on its line"
-STRICT_GATE = "Strict mode: advice; `just typecheck` without --strict is the check"
+STRICT_GATE = ("Strict mode is advisory: it exits 1 on new errors too, but"
+               " `just typecheck` without --strict is the check")
 
 
 def settings(pyproject, strict=False, tests=False):
@@ -116,7 +117,8 @@ def toml_value(value):
         return (isinstance(item, (str, bool, int))
                 or isinstance(item, float) and math.isfinite(item))
 
-    if not all(writable(item) for item in (value if isinstance(value, list) else [value])):
+    if not all(writable(item) for item in (value if isinstance(value, list)
+                                           else [value])):
         raise ToolError(f"cannot write {value!r} to mypy's settings file")
 
     return toml_string(value)
@@ -125,8 +127,8 @@ def toml_value(value):
 def toml(tables):
     """
     ``tables`` as the ``[tool.<name>]`` tables of a TOML file. A table's values are those
-    toml_value writes, or lists of tables of such values (mypy's ``overrides``), written as
-    arrays of tables.
+    toml_value writes, or lists of tables of such values (mypy's ``overrides``), written
+    as arrays of tables.
     """
     lines = []
 
@@ -193,8 +195,8 @@ def mypy(tree, paths, config_file, cache_dir, label):
     # import the working tree's instead
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     proc = execute(["mypy", "--config-file", str(config_file), "--output", "json",
-                    "--no-error-summary", "--show-traceback", "--cache-dir", str(cache_dir),
-                    *paths], root, env=env)
+                    "--no-error-summary", "--show-traceback", "--cache-dir",
+                    str(cache_dir), *paths], root, env=env)
     issues, other = [], []
 
     for row in filter(None, proc.stdout.splitlines()):
@@ -211,8 +213,10 @@ def mypy(tree, paths, config_file, cache_dir, label):
             continue
 
         message = " ".join(part.strip() for part in d["message"].splitlines())
-        issues.append(tree.issue(name, max(d.get("line") or 0, 0), d.get("code") or "error",
-                                 message, d.get("hint") or ""))
+
+        issues.append(
+            tree.issue(name, max(d.get("line") or 0, 0), d.get("code") or "error",
+                       message, d.get("hint") or ""))
 
     # mypy exits 0 without errors, 1 with them, and 2 on a syntax error, which it lists;
     # any other end is a failure, a run cut short too: it would list only some errors
@@ -299,7 +303,7 @@ def main(argv=None):
     parser.add_argument("--all", action="store_true",
                         help="list the older errors of the changed files too")
     parser.add_argument("--strict", action="store_true",
-                        help="add mypy's strict checks (advice)")
+                        help="add mypy's strict checks (advisory; exits 1 on new errors)")
     parser.add_argument("--tests", action="store_true",
                         help="check the test modules too")
     args = parser.parse_args(argv)
