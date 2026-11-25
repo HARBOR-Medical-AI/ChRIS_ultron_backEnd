@@ -25,8 +25,8 @@ from django.db import IntegrityError, transaction
 from rest_framework.authtoken.models import Token
 
 from core.utils import json_zip2str
-from core.models import (ChrisFolder, ChrisFile, ChrisLinkFile, PathAccessError,
-                          validate_path_access)
+from core.models import (ChrisFolder, ChrisLinkFile, PathAccessError,
+                         validate_path_access)
 from plugininstances.models import PluginInstance, PluginInstanceLock
 from userfiles.models import UserFile
 from .abstractjobs import ARM_REMOTE_CLEANUP, PluginInstanceJob
@@ -72,7 +72,9 @@ class PluginInstanceAppJob(PluginInstanceJob):
 
         try:
             if plugin_type == 'ds':
-                inputdirs.append(self.get_previous_output_path())
+                # checked by the copy job when there was one
+                inputdirs.append(self.previous_output_path(
+                    check=not self.pfcon_client.requires_copy_job))
             elif not inputdirs and not self.pfcon_client.requires_copy_job:
                 inputdirs.append(self.manage_empty_inputdir())
         except Exception as e:
@@ -251,35 +253,6 @@ class PluginInstanceAppJob(PluginInstanceJob):
             if self.c_plugin_inst.error_code == 'CODE12':
                 self.c_plugin_inst.error_code = ''
         
-    def get_previous_output_path(self):
-        """
-        Get the previous plugin instance output directory. Make sure to deal with
-        the eventual consistency.
-        """
-        job_id = self.str_job_id
-        output_path = self.c_plugin_inst.previous.get_output_path()
-        prefix = output_path + '/'  # avoid sibling folders with paths that start with path
-
-        set_fnames = {f.fname.name for f in ChrisFile.objects.filter(
-            fname__startswith=prefix)}
-
-        for i in range(20):  # loop to deal with eventual consistency
-            try:
-                l_ls = self.storage_manager.ls(output_path)
-            except Exception as e:
-                logger.error(f'[CODE06,{job_id}]: Error while listing storage files '
-                             f'in {output_path}, detail: {str(e)}')
-            else:
-                if set_fnames.issubset(set(l_ls)):
-                    return output_path
-            time.sleep(3)
-
-        logger.error(f'[CODE11,{job_id}]: Error while listing storage files in '
-                     f'{output_path}, detail: Presumable eventual consistency problem')
-
-        self.c_plugin_inst.error_code = 'CODE11'
-        raise NameError('Presumable eventual consistency problem.')
-
     def get_cmd_args(self) -> List[str]:
         app_args = []
 

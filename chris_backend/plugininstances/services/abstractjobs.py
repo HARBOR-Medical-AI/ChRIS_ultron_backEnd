@@ -18,9 +18,13 @@ alone moves the instance on from the status a transition wrote goes out through
 import logging
 import io
 import abc
+import itertools
 import json
 import re
+import time
+from typing import Iterator
 
+from celery.exceptions import SoftTimeLimitExceeded
 from pfconclient import client as pfcon
 from pfconclient.client import JobType
 from pfconclient.exceptions import (PfconRequestException,
@@ -29,8 +33,8 @@ from pfconclient.exceptions import (PfconRequestException,
 from django.conf import settings
 from django.utils import timezone
 
-from core.storage import connect_storage
-from core.models import ChrisInstance
+from core.storage import connect_storage, sanitized_path
+from core.models import ChrisFile, ChrisInstance, ChrisLinkFile
 from plugininstances.enums import ARM_REMOTE_CLEANUP, INACTIVE_STATUSES
 
 
@@ -94,8 +98,18 @@ class PluginInstanceJob(abc.ABC):
     #: after the instance's terminal status
     status = None
 
-    def __init__(self, plugin_instance: ChrisInstance):
+    #: how long a job lists a folder in storage again for objects it expects there that
+    #: a listing did not show (listing_tries): seconds after the end of the first listing
+    LISTING_DEADLINE = 60
+    #: the seconds between two of those listings, the last again from then on
+    LISTING_WAITS = (1, 2, 4, 8)
 
+    # not annotated as a PluginInstance yet: mypy would then flag each use of a relation
+    # of it that may be null
+    def __init__(self, plugin_instance):
+        """
+        A job of ``plugin_instance``, a ``PluginInstance``.
+        """
         self.c_plugin_inst = plugin_instance
 
         self.str_job_id_prefix = ChrisInstance.load().job_id_prefix
@@ -182,6 +196,84 @@ class PluginInstanceJob(abc.ABC):
         logger.info(f'Not running {type(self).__name__} {self.str_job_id}: the plugin '
                     f'instance is {self.c_plugin_inst.status}, not {self.status}')
         return False
+
+    def previous_output_path(self, check: bool = True) -> str:
+        """
+        The output folder of the previous plugin instance, the input of a 'ds' plugin's
+        job. With ``check``, on object storage, it first waits until a listing of the
+        folder finds as many objects as the previous instance has files and link files
+        registered there: a listing may miss objects written a moment before (eventual
+        consistency). Each listing stops once it has counted that many; listings are
+        LISTING_WAITS apart, and after LISTING_DEADLINE seconds without one that found
+        them all it raises, with CODE11. On a filesystem a listing finds what is there,
+        so nothing is checked.
+
+        The first job that sends the folder to the remote checks it: the copy job when
+        the remote needs one, and the plugin job after it does not check it again.
+        """
+        output_path = self.c_plugin_inst.previous.get_output_path()
+
+        if check and self.storage_env not in ('fslink', 'filesystem'):
+            self._wait_until_listed(output_path)
+        return output_path
+
+    def _wait_until_listed(self, folder: str) -> None:
+        job_id = self.str_job_id
+        prefix = folder + '/'
+        count = (ChrisFile.objects.filter(fname__startswith=prefix).count()
+                 + ChrisLinkFile.objects.filter(fname__startswith=prefix).count())
+        if not count:
+            return
+
+        for _ in self.listing_tries():
+            try:
+                if self._lists_at_least(folder, count):
+                    return
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as e:
+                logger.error(f'[CODE06,{job_id}]: Error while listing storage files '
+                             f'in {folder}, detail: {str(e)}')
+
+        logger.error(f'[CODE11,{job_id}]: Error while listing storage files in '
+                     f'{folder}, detail: Presumable eventual consistency problem')
+        self.c_plugin_inst.error_code = 'CODE11'
+        raise NameError('Presumable eventual consistency problem.')
+
+    def _lists_at_least(self, folder: str, count: int) -> bool:
+        """
+        Whether a listing of ``folder`` finds ``count`` objects, listing no further. A
+        name with commas is not counted: a listing may still show one that the folder's
+        registration renamed, in place of a new name it does not show yet.
+        """
+        start, listed = len(folder) + 1, 0
+
+        for obj in self.storage_manager.walk(folder):
+            if sanitized_path(obj.path[start:]) == obj.path[start:]:
+                listed += 1
+                if listed == count:
+                    return True
+        return False
+
+    def listing_tries(self) -> Iterator[None]:
+        """
+        When to list a folder in storage that may not show yet all the objects a job
+        expects there: an object store's listings are eventually consistent, and a
+        network filesystem's caches can lag the writes of another node. It yields before
+        each listing, the first at once, the next ones after each of LISTING_WAITS (the
+        last again from then on), as long as a listing can start within LISTING_DEADLINE
+        seconds of the end of the first one. The caller stops once a listing has found
+        them all.
+        """
+        yield
+        deadline = time.monotonic() + self.LISTING_DEADLINE
+
+        for wait in itertools.chain(self.LISTING_WAITS,
+                                    itertools.repeat(self.LISTING_WAITS[-1])):
+            if time.monotonic() + wait > deadline:
+                return
+            time.sleep(wait)
+            yield
 
     def submitted(self, to=None, **fields):
         """
