@@ -3,8 +3,12 @@ import logging
 import uuid
 import os
 import pathlib
+from contextlib import contextmanager
 
-from django.db import models
+from celery.exceptions import SoftTimeLimitExceeded
+from django.core.exceptions import ObjectDoesNotExist
+from django.db import models, router
+from django.db.models.deletion import Collector
 from django.db.models.functions import Length
 from django.db.models.signals import post_delete
 from django.utils import timezone
@@ -264,6 +268,20 @@ class ChrisFolder(AsyncDeletableModel):
             self.parent_folder = parent_folder
             self.save()
 
+    def delete_contents(self):
+        """
+        Delete the folders, files and link files under this folder, their rows and their
+        objects, and keep the folder: one deletion that starts at this folder, so that
+        what it deletes leaves its objects alone, as when the folder is deleted
+        (``_under_deleted_folder``), then the folder's tree in storage at once.
+        """
+        collector = Collector(using=router.db_for_write(ChrisFolder), origin=self)
+        collector.collect(self.children.all())
+        collector.collect(self.chris_files.all())
+        collector.collect(self.chris_link_files.all())
+        collector.delete()
+        connect_storage(settings).delete_path(self.path + '/')  # the folder's, only
+
     def get_descendants(self):
         """
         Custom method to return all the folders that are a descendant of this
@@ -491,15 +509,71 @@ class ChrisFolder(AsyncDeletableModel):
         )
 
 
-@receiver(post_delete, sender=ChrisFolder)
-def auto_delete_folder_from_storage(sender, instance, **kwargs):
-    storage_path = instance.path
-    storage_manager = connect_storage(settings)
+def _under_deleted_folder(path, origin):
+    """
+    Whether ``path`` is under the folder that a deletion started at (``origin``, which
+    Django passes to the signals of a deletion: the object or queryset whose ``delete``
+    was called). The folder's tree is deleted from storage at once, by its receiver or
+    by ``ChrisFolder.delete_contents``, so the files, link files and folders deleted
+    under it skip their own storage calls: a feed of a million files is one
+    ``delete_path`` call, not a million calls, one per receiver (in storage, a request
+    per 1,000 objects on S3, still one per object on Swift).
+    """
+    return isinstance(origin, ChrisFolder) and path.startswith(origin.path + '/')
+
+
+@contextmanager
+def _storage_errors_logged(doing):
+    """
+    Log a storage error that the block raises rather than raise it, for what runs after
+    the rows it is about are gone (``doing`` says what it does): a soft time limit still
+    ends the task. A receiver of a deletion runs inside the deletion's transaction, and
+    other receivers of that deletion may have deleted their objects already: raising
+    would roll back their rows, which would then name objects that are gone.
+    """
     try:
-        if storage_manager.path_exists(storage_path):
-            storage_manager.delete_path(storage_path)
+        yield
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
-        logger.error('Storage error, detail: %s' % str(e))
+        logger.error('Storage error while %s, detail: %s', doing, e)
+
+
+@receiver(post_delete, sender=ChrisFolder)
+def auto_delete_folder_from_storage(sender, instance, origin=None, **kwargs):
+    """
+    Delete a deleted folder's tree from storage (the folder only: never an object that
+    has the folder's path), unless the deletion started at a folder above it
+    (``_under_deleted_folder``). A storage error is logged (``_storage_errors_logged``).
+    """
+    if _under_deleted_folder(instance.path, origin):
+        return
+    with _storage_errors_logged(f'deleting folder {instance.path}'):
+        connect_storage(settings).delete_path(instance.path + '/')
+
+
+def delete_related(instance, *names, origin=None):
+    """
+    Delete the object that ``instance`` reaches through the relations ``names`` (its
+    ``folder``, its ``output_folder``'s ``parent``...), for a receiver of the deletion of
+    ``instance``, which started at ``origin``. One that is not there is nothing to
+    delete: a relation never set, or an object deleted already by the same deletion,
+    which deleted ``instance`` with it. Nor is ``origin`` itself, which its deletion
+    deletes: deleting a feed's folder deletes the feed, whose receiver would delete the
+    folder again. Any other error is raised: within the deletion's transaction, a
+    database error left unraised would only fail the next statement, as an aborted
+    transaction.
+    """
+    related = instance
+    for name in names:
+        try:
+            related = getattr(related, name)
+        except ObjectDoesNotExist:
+            return
+        if related is None:
+            return
+    if related != origin:
+        related.delete()
 
 
 class ChrisFolderFilter(FilterSet):
@@ -918,17 +992,6 @@ class ChrisFile(models.Model):
         return cls.objects.all()
 
 
-@receiver(post_delete, sender=ChrisFile)
-def auto_delete_file_from_storage(sender, instance, **kwargs):
-    storage_path = instance.fname.name
-    storage_manager = connect_storage(settings)
-    try:
-        if storage_manager.obj_exists(storage_path):
-            storage_manager.delete_obj(storage_path)
-    except Exception as e:
-        logger.error('Storage error, detail: %s' % str(e))
-
-
 class FileGroupPermission(models.Model):
     permission = models.CharField(choices=PERMISSION_CHOICES, default='r', max_length=1)
     file = models.ForeignKey(ChrisFile, on_delete=models.CASCADE)
@@ -1214,15 +1277,20 @@ class ChrisLinkFile(models.Model):
             lf.delete()
 
 
-@receiver(post_delete, sender=ChrisLinkFile)
-def auto_delete_file_from_storage(sender, instance, **kwargs):
-    storage_path = instance.fname.name
-    storage_manager = connect_storage(settings)
-    try:
-        if storage_manager.obj_exists(storage_path):
-            storage_manager.delete_obj(storage_path)
-    except Exception as e:
-        logger.error('Storage error, detail: %s' % str(e))
+def auto_delete_file_from_storage(sender, instance, origin=None, **kwargs):
+    """
+    Delete the object of a deleted file or link file, unless the deletion started at a
+    folder above it (``_under_deleted_folder``). A storage error is logged
+    (``_storage_errors_logged``). ``Core.ready`` connects it to the deletions of
+    ChrisFile, ChrisLinkFile and each proxy of theirs, as a signal reaches only the
+    receivers of its exact sender; ChrisFolder has no proxy, so its receiver is
+    connected where it is defined.
+    """
+    path = instance.fname.name
+    if _under_deleted_folder(path, origin):
+        return
+    with _storage_errors_logged(f'deleting {path}'):
+        connect_storage(settings).delete_obj(path)
 
 
 class LinkFileGroupPermission(models.Model):

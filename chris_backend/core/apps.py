@@ -1,6 +1,6 @@
 
 from django.apps import AppConfig
-from django.db.models.signals import post_migrate
+from django.db.models.signals import post_delete, post_migrate
 
 
 def setup_chris(sender, **kwargs):
@@ -51,9 +51,17 @@ class Core(AppConfig):
     name = 'core'
 
     def ready(self):
+        from django.apps import apps
         from .middleware import backport_thread_sensitive_error_responses
+        from .models import ChrisFile, ChrisLinkFile, auto_delete_file_from_storage
 
         post_migrate.connect(setup_chris, sender=self)
+
+        # a signal reaches only the receivers of its exact sender: each proxy of the file
+        # models (UserFile, PACSFile...) needs the receiver as much as they do
+        for model in apps.get_models():
+            if issubclass(model, (ChrisFile, ChrisLinkFile)):
+                post_delete.connect(auto_delete_file_from_storage, sender=model)
 
         # before any ASGI handler builds its middleware chain
         backport_thread_sensitive_error_responses()

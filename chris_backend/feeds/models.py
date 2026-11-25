@@ -11,7 +11,7 @@ from django_filters.rest_framework import FilterSet
 from core.models import (AsyncDeletableModel, ChrisFolder, ChrisFile, ChrisLinkFile,
                          FolderGroupPermission, FolderUserPermission, FileGroupPermission,
                          FileUserPermission, LinkFileGroupPermission,
-                         LinkFileUserPermission)
+                         LinkFileUserPermission, delete_related)
 from userfiles.models import UserFile
 
 
@@ -183,11 +183,8 @@ class Feed(AsyncDeletableModel):
 
 
 @receiver(post_delete, sender=Feed)
-def auto_delete_folder_with_feed(sender, instance, **kwargs):
-    try:
-        instance.folder.delete()
-    except Exception:
-        pass
+def auto_delete_folder_with_feed(sender, instance, origin=None, **kwargs):
+    delete_related(instance, 'folder', origin=origin)
 
 
 class FeedFilter(FilterSet):

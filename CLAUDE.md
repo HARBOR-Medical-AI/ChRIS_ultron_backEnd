@@ -147,7 +147,14 @@ Python tools are dev dependencies for `just lint`. `[tool.mypy]` in `pyproject.t
   `pacs_users` gate access.
 - Subtypes are proxies/subclasses of `ChrisFile`: `UserFile` (`home/...`), `PACSFile`
   (`SERVICES/PACS/...`), `PipelineSourceFile`. The `filebrowser` app exposes the tree generically.
-  `post_delete` receivers delete the storage object, so deleting a model row deletes bytes.
+  `post_delete` receivers delete the storage object, so deleting a model row deletes bytes:
+  one for files, link files and their proxies (`Core.ready` connects it to each), and a
+  folder's, which deletes the folder's tree at once. When a deletion starts at a folder
+  (`origin`), the files and folders under it skip their own storage calls, left to that
+  folder's receiver (`_under_deleted_folder`); `ChrisFolder.delete_contents` empties a
+  folder the same way. These receivers log storage errors rather than raise them. The
+  receivers of feeds, plugin instances, PACS and pipeline source files delete what goes
+  with a deleted row through `delete_related`.
 - Storage backends are behind `core.storage.StorageManager` (Swift, S3, filesystem) chosen by
   `STORAGE_ENV`; get one with `connect_storage(settings)`. Files are immutable (WORM).
   A path names an object or a folder on every backend, the folder only when it ends with

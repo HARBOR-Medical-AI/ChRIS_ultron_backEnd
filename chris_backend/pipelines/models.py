@@ -1,24 +1,18 @@
 
-import logging
 from collections import deque
 
 from django.db import models
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
-from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from core.models import ChrisFile
-from core.storage import connect_storage
+from core.models import ChrisFile, delete_related
 from plugins.models import Plugin, PluginParameter
 from plugins.fields import CPUField, MemoryField
 from plugins.fields import MemoryInt, CPUInt
-
-
-logger = logging.getLogger(__name__)
 
 
 PIPELINE_SOURCE_FILE_TYPE_CHOICES = [('yaml', 'YAML file'), ('json', 'JSON file')]
@@ -271,17 +265,6 @@ class PipelineSourceFile(ChrisFile):
         """
         return cls.objects.filter(fname__startswith='PIPELINES/')
 
-@receiver(post_delete, sender=PipelineSourceFile)
-def auto_delete_file_from_storage(sender, instance, **kwargs):
-    storage_path = instance.fname.name
-    storage_manager = connect_storage(settings)
-
-    try:
-        if storage_manager.obj_exists(storage_path):
-            storage_manager.delete_obj(storage_path)
-    except Exception as e:
-        logger.error('Storage error, detail: %s' % str(e))
-
 
 class PipelineSourceFileFilter(FilterSet):
     min_creation_date = django_filters.IsoDateTimeFilter(field_name='creation_date',
@@ -323,11 +306,8 @@ class PipelineSourceFileMeta(models.Model):
 
 
 @receiver(post_delete, sender=PipelineSourceFileMeta)
-def auto_delete_source_file_with_meta(sender, instance, **kwargs):
-    try:
-        instance.source_file.delete()
-    except Exception:
-        pass
+def auto_delete_source_file_with_meta(sender, instance, origin=None, **kwargs):
+    delete_related(instance, 'source_file', origin=origin)
 
 
 class PluginPiping(models.Model):

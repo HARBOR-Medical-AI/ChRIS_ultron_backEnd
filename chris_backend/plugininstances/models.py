@@ -10,7 +10,7 @@ from django.dispatch import receiver
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from core.models import AsyncDeletableModel, ChrisFolder, ChrisInstance
+from core.models import AsyncDeletableModel, ChrisFolder, ChrisInstance, delete_related
 from feeds.models import Feed
 from plugins.models import ComputeResource, Plugin, PluginParameter
 from plugins.fields import CPUField, MemoryField
@@ -406,11 +406,10 @@ class PluginInstance(AsyncDeletableModel):
 
 
 @receiver(post_delete, sender=PluginInstance)
-def auto_delete_output_folder_with_plugin_instance(sender, instance, **kwargs):
-    try:
-        instance.output_folder.parent.delete()  # delete parent of the output data folder
-    except Exception:
-        pass
+def auto_delete_output_folder_with_plugin_instance(sender, instance, origin=None,
+                                                   **kwargs):
+    # the output folder's parent
+    delete_related(instance, 'output_folder', 'parent', origin=origin)
 
 
 class PluginInstanceFilter(FilterSet):

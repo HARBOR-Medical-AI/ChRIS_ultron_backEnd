@@ -1,22 +1,15 @@
 
-import logging
-
 from django.db import models
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
-from django.conf import settings
 
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from core.models import AsyncDeletableModel, ChrisFolder, ChrisFile
+from core.models import AsyncDeletableModel, ChrisFolder, ChrisFile, delete_related
 from core.utils import filter_files_by_n_slashes, json_zip2str
-from core.storage import connect_storage
 from .services import PfdcmClient
 from .enums import PACS_QUERY_STATUS_CHOICES, PACS_RETRIEVE_STATUS_CHOICES
-
-
-logger = logging.getLogger(__name__)
 
 
 class PACS(models.Model):
@@ -31,11 +24,8 @@ class PACS(models.Model):
 
 
 @receiver(post_delete, sender=PACS)
-def auto_delete_pacs_folder_with_pacs(sender, instance, **kwargs):
-    try:
-        instance.folder.delete()
-    except Exception:
-        pass
+def auto_delete_pacs_folder_with_pacs(sender, instance, origin=None, **kwargs):
+    delete_related(instance, 'folder', origin=origin)
 
 
 class PACSFilter(FilterSet):
@@ -204,11 +194,8 @@ class PACSSeries(AsyncDeletableModel):
 
 
 @receiver(post_delete, sender=PACSSeries)
-def auto_delete_series_folder_with_series(sender, instance, **kwargs):
-    try:
-        instance.folder.delete()
-    except Exception:
-        pass
+def auto_delete_series_folder_with_series(sender, instance, origin=None, **kwargs):
+    delete_related(instance, 'folder', origin=origin)
 
 
 class PACSSeriesFilter(FilterSet):
@@ -255,17 +242,6 @@ class PACSFile(ChrisFile):
         in the pacs space tree.
         """
         return cls.objects.filter(fname__startswith='SERVICES/PACS/')
-
-
-@receiver(post_delete, sender=PACSFile)
-def auto_delete_file_from_storage(sender, instance, **kwargs):
-    storage_path = instance.fname.name
-    storage_manager = connect_storage(settings)
-    try:
-        if storage_manager.obj_exists(storage_path):
-            storage_manager.delete_obj(storage_path)
-    except Exception as e:
-        logger.error('Storage error, detail: %s' % str(e))
 
 
 class PACSFileFilter(FilterSet):

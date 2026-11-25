@@ -439,33 +439,16 @@ class PipelineSourceFileSignalTests(ModelTests):
 
     def test_auto_delete_file_from_storage_when_object_exists(self):
         """
-        Test the post_delete signal on PipelineSourceFile: when the storage
-        backend reports the object exists, delete_obj is called on it.
+        Test the post_delete signal on PipelineSourceFile: delete_obj is called on its
+        object (one that is not there counts as deleted).
         """
         source_file, _ = self._make_source_file()
         storage_path = source_file.fname.name
         storage_manager_mock = mock.Mock()
-        storage_manager_mock.obj_exists = mock.Mock(return_value=True)
-        storage_manager_mock.delete_obj = mock.Mock()
-        with mock.patch('pipelines.models.connect_storage') as connect_storage_mock:
+        with mock.patch('core.models.connect_storage') as connect_storage_mock:
             connect_storage_mock.return_value = storage_manager_mock
             source_file.delete()
-        storage_manager_mock.obj_exists.assert_called_with(storage_path)
-        storage_manager_mock.delete_obj.assert_called_with(storage_path)
-
-    def test_auto_delete_file_from_storage_when_object_missing(self):
-        """
-        Test the post_delete signal on PipelineSourceFile: when the storage
-        backend reports the object does not exist, delete_obj is not called.
-        """
-        source_file, _ = self._make_source_file()
-        storage_manager_mock = mock.Mock()
-        storage_manager_mock.obj_exists = mock.Mock(return_value=False)
-        storage_manager_mock.delete_obj = mock.Mock()
-        with mock.patch('pipelines.models.connect_storage') as connect_storage_mock:
-            connect_storage_mock.return_value = storage_manager_mock
-            source_file.delete()
-        storage_manager_mock.delete_obj.assert_not_called()
+        storage_manager_mock.delete_obj.assert_called_once_with(storage_path)
 
     def test_auto_delete_file_from_storage_swallows_storage_errors(self):
         """
@@ -476,11 +459,11 @@ class PipelineSourceFileSignalTests(ModelTests):
         """
         source_file, _ = self._make_source_file()
         storage_manager_mock = mock.Mock()
-        storage_manager_mock.obj_exists = mock.Mock(side_effect=RuntimeError('boom'))
-        with mock.patch('pipelines.models.connect_storage') as connect_storage_mock:
+        storage_manager_mock.delete_obj = mock.Mock(side_effect=RuntimeError('boom'))
+        with mock.patch('core.models.connect_storage') as connect_storage_mock:
             connect_storage_mock.return_value = storage_manager_mock
             # should not raise; the error must be logged instead
-            with self.assertLogs('pipelines.models', level='ERROR') as cm:
+            with self.assertLogs('core.models', level='ERROR') as cm:
                 source_file.delete()
         self.assertTrue(any('boom' in msg for msg in cm.output))
 
@@ -492,8 +475,7 @@ class PipelineSourceFileSignalTests(ModelTests):
         source_file, meta = self._make_source_file()
         source_file_pk = source_file.pk
         storage_manager_mock = mock.Mock()
-        storage_manager_mock.obj_exists = mock.Mock(return_value=False)
-        with mock.patch('pipelines.models.connect_storage') as connect_storage_mock:
+        with mock.patch('core.models.connect_storage') as connect_storage_mock:
             connect_storage_mock.return_value = storage_manager_mock
             meta.delete()
         self.assertFalse(

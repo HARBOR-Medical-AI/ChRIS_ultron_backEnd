@@ -157,7 +157,7 @@ class UserFileDetailViewTests(UserFileViewTests):
         storage_manager_mock = mock.Mock()
         storage_manager_mock.delete_obj = mock.Mock()
 
-        with mock.patch('userfiles.models.connect_storage') as connect_storage_mock:
+        with mock.patch('core.models.connect_storage') as connect_storage_mock:
             connect_storage_mock.return_value=storage_manager_mock
             response = self.client.delete(self.read_update_delete_url)
             self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)

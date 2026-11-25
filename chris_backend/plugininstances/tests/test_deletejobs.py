@@ -674,15 +674,17 @@ class PluginInstanceDeleteJobTests(TestCase):
         child_folder.save()
 
         delete_job = deletejobs.PluginInstanceDeleteJob(pl_inst)
-        delete_job.storage_manager.delete_path = mock.Mock()
-        delete_job.storage_manager.path_exists = mock.Mock(side_effect=[True, False])
+        storage_manager = mock.Mock()
 
-        delete_job._cleanup_plugin_instance_output_dir()
-        delete_job._cleanup_plugin_instance_output_dir()  # deleted already: nothing to do
+        with mock.patch('core.models.connect_storage', return_value=storage_manager):
+            delete_job._cleanup_plugin_instance_output_dir()
+            delete_job._cleanup_plugin_instance_output_dir()  # deleted already: no error
 
         self.assertFalse(ChrisFolder.objects.filter(pk=child_folder.pk).exists())
-        delete_job.storage_manager.delete_path.assert_called_once_with(
-            pl_inst.output_folder.path)
+        self.assertTrue(ChrisFolder.objects.filter(pk=pl_inst.output_folder.pk).exists())
+        self.assertEqual(storage_manager.delete_path.call_args_list,
+                         [mock.call(pl_inst.output_folder.path + '/')] * 2)
+        storage_manager.delete_obj.assert_not_called()  # its tree at once
 
     @tag('integration')
     def test_integration_cleanup_plugin_instance_output_dir(self):
