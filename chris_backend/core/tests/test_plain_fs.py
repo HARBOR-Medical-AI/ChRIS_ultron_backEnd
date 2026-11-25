@@ -11,6 +11,7 @@ Run via justfile:
 import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from django.test import TestCase
 
@@ -177,6 +178,14 @@ class FilesystemManagerPathOpsTests(TestCase):
         # clean file untouched
         self.assertTrue(self.manager.obj_exists('test/san2/good.txt'))
 
+    def test_sanitize_merges_a_folder_of_commas_into_its_parent(self):
+        self.manager.upload_obj('test/san3/a,b/, ,/c,d.txt', b'data')
+
+        result = self.manager.sanitize_obj_names('test/san3')
+
+        self.assertEqual(result, {'test/san3/a,b/, ,/c,d.txt': 'test/san3/ab/cd.txt'})
+        self.assertEqual(self.manager.ls('test/san3'), ['test/san3/ab/cd.txt'])
+
 
 class FilesystemManagerLargeOpsTests(TestCase):
 
@@ -235,6 +244,83 @@ class FilesystemManagerLargeOpsTests(TestCase):
         self.assertEqual(sorted(self.manager.ls('test/bulk', limit=10)),
                          sorted(everything))
         self.assertEqual(self.manager.ls('test/nothing', limit=10), [])
+
+    def test_walk_lists_the_files_under_a_folder_with_their_sizes(self):
+        base = Path(self._tmp.name)
+        for name, data in (('a.txt', b'1'), ('sub/b.txt', b'22'), ('sub/deeper/c', b'333')):
+            self.manager.upload_obj(f'test/bulk/{name}', data)
+        self.manager.upload_obj('test/bulk_2/d.txt', b'4444')  # a sibling, not under it
+        self.manager.upload_obj('elsewhere/e.txt', b'x')
+        self.addCleanup(self.manager.delete_path, 'elsewhere')
+        os.symlink(base / 'elsewhere', base / 'test/bulk/to_a_dir')
+        os.symlink(base / 'test/bulk/a.txt', base / 'test/bulk/to_a_file')
+        os.symlink(base / 'nowhere', base / 'test/bulk/dangling')
+
+        for folder in ('test/bulk', 'test/bulk/'):
+            self.assertEqual(sorted(self.manager.walk(folder)), [
+                ('test/bulk/a.txt', 1), ('test/bulk/sub/b.txt', 2),
+                ('test/bulk/sub/deeper/c', 3)])  # symbolic links left out
+        self.assertEqual(list(self.manager.walk('test/bulk/a.txt')), [])
+        self.assertEqual(list(self.manager.walk('test/nothing')), [])
+        self.assertEqual(sorted(o.path for o in self.manager.walk('test')), [
+            'test/bulk/a.txt', 'test/bulk/sub/b.txt', 'test/bulk/sub/deeper/c',
+            'test/bulk_2/d.txt'])
+
+    def test_walk_calls_no_stat_but_its_directory_entries(self):
+        for i in range(3):
+            self.manager.upload_obj(f'test/bulk/sub{i}/{i}.dat', b'x')
+
+        with mock.patch('os.stat', wraps=os.stat) as stat, \
+                mock.patch('os.lstat', wraps=os.lstat) as lstat:
+            objects = list(self.manager.walk('test/bulk'))
+
+        self.assertEqual(len(objects), 3)
+        # the directory entries' own stat (DirEntry.stat), not os.stat or os.lstat
+        self.assertEqual((stat.call_count, lstat.call_count), (0, 0))
+
+    def test_walk_skips_a_file_deleted_since_its_folder_was_read(self):
+        for name in ('a.txt', 'b.txt'):
+            self.manager.upload_obj(f'test/bulk/{name}', b'x')
+        objects = self.manager.walk('test/bulk')
+
+        first = next(objects)
+        self.manager.delete_obj('test/bulk/b.txt' if first.path.endswith('a.txt')
+                                else 'test/bulk/a.txt')
+
+        self.assertEqual(list(objects), [])
+
+    def test_listings_skip_a_folder_they_may_not_read(self):
+        for name in ('a.txt', 'locked/b.txt'):
+            self.manager.upload_obj(f'test/bulk/{name}', b'x')
+        scandir = os.scandir
+
+        def refused(path):
+            if path.endswith('locked'):
+                raise PermissionError(13, 'Permission denied', path)
+            return scandir(path)
+
+        with mock.patch('os.scandir', refused):
+            self.assertEqual(self.manager.ls('test/bulk'), ['test/bulk/a.txt'])
+            self.assertEqual([o.path for o in self.manager.walk('test/bulk')],
+                             ['test/bulk/a.txt'])
+
+    def test_is_missing_says_a_file_is_not_there(self):
+        with self.assertRaises(FileNotFoundError) as missing:
+            self.manager.delete_obj('test/none')
+
+        self.assertTrue(self.manager.is_missing(missing.exception))
+        self.assertFalse(self.manager.is_missing(PermissionError('x')))
+
+    def test_copy_obj_takes_a_link_to_the_same_file_as_the_copy(self):
+        self.manager.upload_obj('test/bulk/src.txt', b'data')
+        self.manager.upload_obj('test/bulk/other.txt', b'other')
+
+        self.manager.copy_obj('test/bulk/src.txt', 'test/out/dst.txt')
+        self.manager.copy_obj('test/bulk/src.txt', 'test/out/dst.txt')  # made again
+
+        self.assertEqual(self.manager.download_obj('test/out/dst.txt'), b'data')
+        with self.assertRaises(FileExistsError):
+            self.manager.copy_obj('test/bulk/other.txt', 'test/out/dst.txt')
 
     def test_bulk_delete(self):
         count = 25

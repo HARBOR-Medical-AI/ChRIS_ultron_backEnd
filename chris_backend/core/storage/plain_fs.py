@@ -3,9 +3,10 @@ from itertools import islice
 import os
 from pathlib import Path
 import shutil
-from typing import Union, List, Dict, AnyStr, Optional
+from typing import Union, List, Dict, AnyStr, Iterator, Optional, Tuple
 
-from core.storage.storagemanager import StorageManager
+from core.storage.storagemanager import (StorageManager, StorageObject, sanitized_name,
+                                         sanitized_path)
 
 
 class FilesystemManager(StorageManager):
@@ -28,30 +29,46 @@ class FilesystemManager(StorageManager):
     def ls(self, path_prefix: str, limit: Optional[int] = None) -> List[str]:
         if self.obj_exists(path_prefix):
             return [path_prefix]
-        if limit is not None:
-            return list(islice(self.__files_under(self.__base / path_prefix), limit))
-        all_paths = (self.__base / path_prefix).rglob('*')
-        return [str(p.relative_to(self.__base)) for p in all_paths if p.is_file()]
+        # the files that rglob finds: symbolic links to files, but not the trees of links
+        # to directories
+        files = (path for path, entry in self.__entries(path_prefix) if entry.is_file())
+        return list(islice(files, limit))
 
-    def __files_under(self, top: Path):
+    def walk(self, folder: str) -> Iterator[StorageObject]:
+        for path, entry in self.__entries(folder):
+            if entry.is_file(follow_symlinks=False):
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                except FileNotFoundError:  # deleted since its folder was read
+                    continue
+                yield StorageObject(path, size)
+
+    def __entries(self, folder: str) -> Iterator[Tuple[str, os.DirEntry]]:
         """
-        The files under ``top`` that ``rglob`` finds (symbolic links to files, but not
-        the trees of links to directories), relative to the base, read lazily one
-        directory at a time: unlike ``rglob``, which reads each directory whole, it stops
-        reading once its caller has enough.
+        The directory entries under ``folder`` that are not directories (files, and
+        symbolic links whatever they point to), with their paths relative to the base,
+        read lazily one directory at a time: unlike ``rglob``, which reads each directory
+        whole, it stops reading once its caller has enough. Their types come with the
+        entries, at no cost. Like ``rglob`` it skips a directory it may not read.
         """
-        dirs = [top]
+        top = self.__base / folder
+        # an absolute folder outside the base raises
+        relative = top.relative_to(self.__base).as_posix()
+        prefix = '' if relative == '.' else relative + '/'
+        start = len(str(top)) + 1  # an entry's path is its directory's, a slash, its name
+        dirs = [str(top)]
+
         while dirs:
             try:
                 entries = os.scandir(dirs.pop())
-            except (FileNotFoundError, NotADirectoryError):
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
                 continue
             with entries:
                 for entry in entries:
                     if entry.is_dir(follow_symlinks=False):
                         dirs.append(entry.path)
-                    elif entry.is_file():
-                        yield str(Path(entry.path).relative_to(self.__base))
+                    else:
+                        yield prefix + entry.path[start:], entry
 
     def path_exists(self, path: str) -> bool:
         return (self.__base / path).exists()
@@ -79,10 +96,18 @@ class FilesystemManager(StorageManager):
         return (self.__base / file_path).read_bytes()
 
     def copy_obj(self, src: str, dst: str) -> None:
+        """
+        A hard link at ``dst`` to ``src``; one there already is the copy (another task
+        made it), anything else at ``dst`` raises ``FileExistsError``.
+        """
         src_path = self.__base / src
         dst_path = self.__base / dst
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        dst_path.hardlink_to(src_path)
+        try:
+            dst_path.hardlink_to(src_path)
+        except FileExistsError:
+            if not os.path.samestat(dst_path.lstat(), src_path.stat()):
+                raise
 
     def delete_obj(self, file_path: str) -> None:
         (self.__base / file_path).unlink()
@@ -153,31 +178,26 @@ class FilesystemManager(StorageManager):
             for item in sorted(p.rglob('*'), key=lambda i: len(i.parts), reverse=True):
                 # Sorted by depth (deepest paths first) to handle files and subfolders
                 # before their parent folders
-                new_name = item.name.replace(',', '')
+                new_name = sanitized_name(item.name)
 
                 if item.is_file():
-                    item_rel_path = item.relative_to(self.__base)
+                    item_rel_path = str(item.relative_to(self.__base))
+                    new_rel_path = sanitized_path(str(item.relative_to(p)))
 
-                    if new_name.strip() == '':
+                    if not new_rel_path:
                         item.unlink()  # Delete the file
-                        new_file_paths[str(item_rel_path)] = ''
+                        new_file_paths[item_rel_path] = ''
                     else:
                         if item.name != new_name:
                             new_path = item.with_name(new_name)
                             item.rename(new_path)  # Filesystem op
 
-                        new_parts = []
-                        for part in item.relative_to(p).parts:
-                            new_part = part.replace(',', '')
-                            if new_part.strip() != '':
-                                new_parts.append(new_part)
-
-                        new_item_rel_path = p_rel / Path(*new_parts)
+                        new_item_rel_path = str(p_rel / new_rel_path)
                         if new_item_rel_path != item_rel_path:  # Final file path changes
-                            new_file_paths[str(item_rel_path)] = str(new_item_rel_path)
+                            new_file_paths[item_rel_path] = new_item_rel_path
 
                 elif item.is_dir():
-                    if new_name.strip() == '':
+                    if not new_name:
                         # Move contents to the parent folder
                         parent = item.parent
                         for subitem in item.iterdir():

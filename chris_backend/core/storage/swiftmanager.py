@@ -5,18 +5,20 @@ Swift storage manager module.
 import logging
 import os
 import time
-from pathlib import Path
-from typing import Dict
+from typing import Iterator, List, Optional
 
 from swiftclient import Connection
 from swiftclient.exceptions import ClientException
 
-from core.storage.storagemanager import StorageManager
+from core.storage.storagemanager import StorageManager, StorageObject
 
 logger = logging.getLogger(__name__)
 
 
 class SwiftManager(StorageManager):
+
+    #: Swift's default listing limit: the most objects a listing request may ask for
+    PAGE_SIZE = 10000
 
     def __init__(self, container_name, conn_params):
         self.container_name = container_name
@@ -56,43 +58,68 @@ class SwiftManager(StorageManager):
     def ls(self, path, limit=None):
         """
         Return a list of objects in the swift storage with the provided path
-        as a prefix, of ``limit`` objects at most when given, in one request: Swift
-        refuses a limit above its listing limit (10,000 by default) with a 412.
+        as a prefix, of ``limit`` objects at most when given: in one request when
+        ``limit`` is at most 10,000 (Swift's default listing limit).
         """
-        return self._ls(path, b_full_listing=limit is None, limit=limit)
+        if not path:
+            return []
+        return [obj['name'] for page in self._pages(path, limit) for obj in page]
 
-    def _ls(self, path, b_full_listing: bool, limit=None):
+    def walk(self, folder: str) -> Iterator[StorageObject]:
+        for page in self._pages(folder.rstrip('/') + '/'):
+            for obj in page:
+                if not obj['name'].endswith('/'):  # not the marker of a folder
+                    yield StorageObject(obj['name'], obj['bytes'])
+
+    def _pages(self, prefix: str, limit: Optional[int] = None) -> Iterator[List[dict]]:
         """
-        Note to developers: the body of ``_ls`` was originally the body of ``self.ls``,
-        though it's been renamed to ``_ls`` so that ``self.ls``'s signature could be
-        changed. ``self.ls`` originally accepted ``**kwargs`` but that is no longer the case.
+        The objects whose names start with ``prefix`` (``name``, ``bytes``...), a page of
+        a listing request at a time, each after the last one's last name, ``limit``
+        objects in all at most when given.
+            - Without ``limit`` a request takes a page of Swift's own size (its listing
+              limit), and the listing ends with an empty page.
+            - With ``limit`` a request asks for what is left of it, 10,000 at most
+              (Swift's default listing limit: it refuses more than its own with a 412),
+              and the listing ends with a page shorter than asked.
+        A request that fails is made again on its own, up to 5 tries in all, so nothing
+        is listed twice.
         """
-        l_ls = []  # listing of names to return
-        if path:
-            conn = self.__get_connection()
-            for i in range(5):
-                try:
-                    # the objects in Swift storage with the given prefix: all of them,
-                    # or the first page, of ``limit`` objects at most when given
-                    ld_obj = conn.get_container(self.container_name,
-                                                prefix=path,
-                                                limit=limit,
-                                                full_listing=b_full_listing)[1]
-                except ClientException as e:
-                    logger.error(str(e))
-                    if i == 4:
-                        raise
-                    time.sleep(0.4)
-                else:
-                    l_ls = [d_obj['name'] for d_obj in ld_obj]
-                    break
-        return l_ls
+        conn = self.__get_connection()
+        marker, left = '', limit
+
+        while left is None or left > 0:
+            asked = self.PAGE_SIZE if left is None else min(left, self.PAGE_SIZE)
+            page = self._list(conn, prefix, marker, None if left is None else asked)
+            if not page:
+                return
+            yield page
+            if left is not None:
+                if len(page) < asked:
+                    return
+                left -= len(page)
+            marker = page[-1]['name']
+
+    def _list(self, conn, prefix: str, marker: str, limit: Optional[int]) -> List[dict]:
+        """
+        One page of a listing, the request made again on a failure, up to 5 tries.
+        """
+        attempt = 1
+        while True:
+            try:
+                return conn.get_container(self.container_name, prefix=prefix,
+                                          marker=marker, limit=limit)[1]
+            except ClientException as e:
+                logger.error(str(e))
+                if attempt == 5:
+                    raise
+                attempt += 1
+                time.sleep(0.4)
 
     def path_exists(self, path):
         """
         Return True/False if passed path exists in swift storage.
         """
-        return len(self._ls(path, b_full_listing=False)) > 0
+        return bool(path) and any(True for _ in self._pages(path, limit=1))
 
     def obj_exists(self, obj_path):
         """
@@ -181,6 +208,9 @@ class SwiftManager(StorageManager):
             else:
                 break
 
+    def is_missing(self, error: Exception) -> bool:
+        return isinstance(error, ClientException) and error.http_status == 404
+
     def copy_path(self, src: str, dst: str) -> None:
         l_ls = self.ls(src)
         for obj_path in l_ls:
@@ -198,44 +228,3 @@ class SwiftManager(StorageManager):
         l_ls = self.ls(path)
         for obj_path in l_ls:
             self.delete_obj(obj_path)
-
-    def sanitize_obj_names(self, path: str) -> Dict[str, str]:
-        """
-        Removes commas from the paths of all objects that start with the specified
-        input path/prefix.
-        Handles special cases:
-            - Objects with names that only contain commas and white spaces are deleted.
-            - "Folders" with names that only contain commas and white spaces are removed
-            after moving their contents to the parent folder.
-
-        Returns a dictionary that only contains modified object paths. Keys are the
-        original object paths and values are the new object paths. Deleted objects have
-        the empty string as the value.
-        """
-        new_obj_paths = {}
-        l_ls = self.ls(path)
-
-        if len(l_ls) != 1 or l_ls[0] != path:  # Path is a prefix
-            p = Path(path)
-
-            for obj_path in l_ls:
-                p_obj = Path(obj_path)
-
-                if p_obj.name.replace(',', '').strip() == '':
-                    self.delete_obj(obj_path)
-                    new_obj_paths[obj_path] = ''
-                else:
-                    new_parts = []
-                    for part in p_obj.relative_to(p).parts:
-                        new_part = part.replace(',', '')
-                        if new_part.strip() != '':
-                            new_parts.append(new_part)
-
-                    new_p_obj = p / Path(*new_parts)
-
-                    if new_p_obj != p_obj:  # Final file path is different
-                        new_obj_path = str(new_p_obj)
-                        self.copy_obj(obj_path, new_obj_path)
-                        self.delete_obj(obj_path)
-                        new_obj_paths[obj_path] = new_obj_path
-        return new_obj_paths

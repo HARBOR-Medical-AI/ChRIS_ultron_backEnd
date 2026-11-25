@@ -10,8 +10,8 @@ Run via justfile:
     just set-storage swift
     just test-integration
 
-SwiftManagerListingTests checks what ``ls`` asks a mocked connection, and runs in every
-mode.
+SwiftManagerListingTests checks what ``ls`` and ``walk`` ask a mocked connection, and
+runs in every mode.
 """
 
 import unittest
@@ -19,6 +19,8 @@ from unittest import mock
 
 from django.conf import settings
 from django.test import SimpleTestCase, TestCase, tag
+
+from swiftclient.exceptions import ClientException
 
 from core.storage.swiftmanager import SwiftManager
 
@@ -29,21 +31,87 @@ def _get_manager():
 
 class SwiftManagerListingTests(SimpleTestCase):
     """
-    What ``SwiftManager.ls`` asks its connection, a mock: no Swift service needed.
+    What ``SwiftManager.ls`` and ``walk`` ask their connection, a mock: no Swift service
+    needed.
     """
 
-    def test_a_limit_asks_for_one_page_of_that_many_objects_and_none_for_all(self):
-        manager = SwiftManager('container', {})
-        manager._conn = mock.Mock()
-        manager._conn.get_container.return_value = (
-            {}, [{'name': 'a/1'}, {'name': 'a/2'}])
+    def setUp(self):
+        self.manager = SwiftManager('container', {})
+        self.manager._conn = mock.Mock()
+        self.get_container = self.manager._conn.get_container
 
-        self.assertEqual(manager.ls('a/', limit=2), ['a/1', 'a/2'])
-        manager.ls('a/')
+    def pages(self, *pages):
+        """
+        Have the connection answer with ``pages`` of names, then with an empty one.
+        """
+        self.get_container.side_effect = [
+            ({}, [{'name': name, 'bytes': len(name)} for name in page])
+            for page in (*pages, [])]
 
-        self.assertEqual(manager._conn.get_container.call_args_list, [
-            mock.call('container', prefix='a/', limit=2, full_listing=False),
-            mock.call('container', prefix='a/', limit=None, full_listing=True)])
+    def test_a_limit_asks_for_that_many_objects_and_none_for_all_of_them(self):
+        self.pages(['a/1', 'a/2'])
+        self.assertEqual(self.manager.ls('a/', limit=2), ['a/1', 'a/2'])
+        self.pages(['a/1', 'a/2'], ['a/3'])
+        self.assertEqual(self.manager.ls('a/'), ['a/1', 'a/2', 'a/3'])
+
+        self.assertEqual(self.get_container.call_args_list, [
+            mock.call('container', prefix='a/', marker='', limit=2),
+            mock.call('container', prefix='a/', marker='', limit=None),
+            mock.call('container', prefix='a/', marker='a/2', limit=None),
+            mock.call('container', prefix='a/', marker='a/3', limit=None)])
+
+    def test_a_limit_past_one_page_asks_for_the_rest_after_it(self):
+        self.manager.PAGE_SIZE = 2
+        self.pages(['a/1', 'a/2'], ['a/3'])
+
+        self.assertEqual(self.manager.ls('a/', limit=3), ['a/1', 'a/2', 'a/3'])
+        self.assertEqual([c.kwargs['limit'] for c in self.get_container.call_args_list],
+                         [2, 1])
+
+    def test_a_walk_lists_the_folder_with_sizes_a_page_at_a_time(self):
+        self.pages(['a/data/x', 'a/data/sub/y'], ['a/data/z'])
+
+        objects = list(self.manager.walk('a/data/'))
+
+        self.assertEqual(objects, [('a/data/x', 8), ('a/data/sub/y', 12), ('a/data/z', 8)])
+        self.assertEqual({c.kwargs['prefix'] for c in self.get_container.call_args_list},
+                         {'a/data/'})  # not a/data_2's objects
+
+    def test_a_request_that_fails_is_made_again_on_its_own(self):
+        error = ClientException('busy', http_status=503)
+        self.get_container.side_effect = [({}, [{'name': 'a/1', 'bytes': 1}]), error,
+                                          ({}, [{'name': 'a/2', 'bytes': 1}]), ({}, [])]
+
+        with mock.patch('core.storage.swiftmanager.time.sleep'), \
+                self.assertLogs('core.storage.swiftmanager', 'ERROR'):
+            self.assertEqual(self.manager.ls('a/'), ['a/1', 'a/2'])
+
+        markers = [c.kwargs['marker'] for c in self.get_container.call_args_list]
+        self.assertEqual(markers, ['', 'a/1', 'a/1', 'a/2'])
+
+    def test_a_limit_past_what_there_is_takes_one_request(self):
+        self.pages(['a/1', 'a/2'])
+
+        self.assertEqual(self.manager.ls('a/', limit=101), ['a/1', 'a/2'])
+        self.get_container.assert_called_once_with('container', prefix='a/', marker='',
+                                                   limit=101)
+
+    def test_a_walk_leaves_the_markers_of_folders_out(self):
+        self.pages(['a/data/sub/', 'a/data/sub/x'])
+
+        self.assertEqual(list(self.manager.walk('a/data')), [('a/data/sub/x', 12)])
+
+    def test_is_missing_says_swift_answered_404(self):
+        self.assertTrue(self.manager.is_missing(ClientException('x', http_status=404)))
+        self.assertFalse(self.manager.is_missing(ClientException('x', http_status=503)))
+        self.assertFalse(self.manager.is_missing(FileNotFoundError('x')))
+
+    def test_a_path_exists_when_a_listing_of_one_object_finds_it(self):
+        self.pages(['a/1'])
+        self.assertTrue(self.manager.path_exists('a'))
+        self.get_container.assert_called_once_with('container', prefix='a', marker='',
+                                                   limit=1)
+        self.assertFalse(self.manager.path_exists(''))
 
 
 @tag('integration')
@@ -207,7 +275,7 @@ class SwiftManagerPathOpsTests(TestCase):
 @unittest.skipUnless(getattr(settings, 'STORAGE_ENV', '') == 'swift',
                      'Swift storage not configured')
 class SwiftManagerLargeOpsTests(TestCase):
-    """Test operations at moderate scale to validate full_listing pagination."""
+    """Test operations at moderate scale to validate listings and bulk deletes."""
 
     @classmethod
     def setUpClass(cls):
@@ -236,6 +304,16 @@ class SwiftManagerLargeOpsTests(TestCase):
         self.assertEqual(len(some), 3)
         self.assertLessEqual(set(some), names)
         self.assertEqual(set(self.manager.ls('test/bulk/', limit=10)), names)
+
+    def test_walk_lists_the_folder_with_sizes(self):
+        sizes = {f'test/bulk/{i:04d}.dat': i for i in range(5)}
+        for name, size in sizes.items():
+            self.manager.upload_obj(name, b'x' * size)
+        self.manager.upload_obj('test/bulk_2/sibling.dat', b'x')
+        self.addCleanup(self.manager.delete_path, 'test/bulk_2/')
+
+        # a walk asks for pages of Swift's own size: PAGE_SIZE sizes only limited listings
+        self.assertEqual(dict(self.manager.walk('test/bulk')), sizes)
 
     def test_bulk_delete(self):
         count = 25

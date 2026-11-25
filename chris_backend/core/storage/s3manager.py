@@ -12,14 +12,13 @@ MD5 hashes. We disable this via botocore.config.Config below.
 
 import logging
 import time
-from pathlib import Path
-from typing import Dict, List, AnyStr, Optional
+from typing import AnyStr, Iterator, List, Optional
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from core.storage.storagemanager import StorageManager
+from core.storage.storagemanager import StorageManager, StorageObject
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,9 @@ _S3_CLIENT_CONFIG = Config(
 
 
 class S3Manager(StorageManager):
+
+    #: the most keys S3 returns in one listing request
+    PAGE_SIZE = 1000
 
     def __init__(self, bucket_name: str, conn_params: dict):
         self.bucket_name = bucket_name
@@ -90,45 +92,63 @@ class S3Manager(StorageManager):
         Return a list of object keys in the bucket with the given path as prefix, of
         ``limit`` keys at most when given: a request per 1,000 of them.
         """
-        l_ls = []
         if not path:
-            return l_ls
+            return []
+        return [obj['Key'] for page in self._pages(path, limit) for obj in page]
+
+    def walk(self, folder: str) -> Iterator[StorageObject]:
+        for page in self._pages(folder.rstrip('/') + '/'):
+            for obj in page:
+                if not obj['Key'].endswith('/'):  # not the marker of a folder
+                    yield StorageObject(obj['Key'], obj['Size'])
+
+    def _pages(self, prefix: str, limit: Optional[int] = None) -> Iterator[List[dict]]:
+        """
+        The objects whose keys start with ``prefix`` (``Key``, ``Size``...), a page of a
+        listing request at a time, ``limit`` objects in all at most when given. A request
+        that fails is made again on its own, up to 5 tries in all, so nothing is listed
+        twice.
+        """
         client = self.__get_client()
-        paging = {} if limit is None else {
-            'PaginationConfig': {'MaxItems': limit, 'PageSize': min(limit, 1000)}}
-        for i in range(5):
-            l_ls = []  # a try again lists from the start
+        request: dict = {'Bucket': self.bucket_name, 'Prefix': prefix}
+        left = limit
+
+        while left is None or left > 0:
+            request['MaxKeys'] = self.PAGE_SIZE if left is None else min(left, self.PAGE_SIZE)
+            resp = self._list(client, request)
+            page = resp.get('Contents', [])
+            if left is not None:
+                left -= len(page)
+            if page:
+                yield page
+            if not resp.get('IsTruncated'):
+                return
+            if not resp.get('NextContinuationToken'):
+                raise ValueError(f'The listing of {prefix} in bucket {self.bucket_name} '
+                                 f'is cut short without a continuation token')
+            request['ContinuationToken'] = resp['NextContinuationToken']
+
+    @staticmethod
+    def _list(client, request: dict) -> dict:
+        """
+        The response to one listing request, made again on a failure, up to 5 tries.
+        """
+        attempt = 1
+        while True:
             try:
-                paginator = client.get_paginator('list_objects_v2')
-                pages = paginator.paginate(Bucket=self.bucket_name, Prefix=path, **paging)
-                for page in pages:
-                    for obj in page.get('Contents', []):
-                        l_ls.append(obj['Key'])
+                return client.list_objects_v2(**request)
             except ClientError as e:
                 logger.error(str(e))
-                if i == 4:
+                if attempt == 5:
                     raise
+                attempt += 1
                 time.sleep(0.4)
-            else:
-                break
-        return l_ls
 
     def path_exists(self, path: str) -> bool:
         """
         Return True if any objects exist under the given path prefix.
         """
-        client = self.__get_client()
-        for i in range(5):
-            try:
-                resp = client.list_objects_v2(
-                    Bucket=self.bucket_name, Prefix=path, MaxKeys=1
-                )
-                return resp.get('KeyCount', 0) > 0
-            except ClientError as e:
-                logger.error(str(e))
-                if i == 4:
-                    raise
-                time.sleep(0.4)
+        return any(True for _ in self._pages(path, limit=1))
 
     def obj_exists(self, file_path: str) -> bool:
         """
@@ -226,6 +246,10 @@ class S3Manager(StorageManager):
             else:
                 break
 
+    def is_missing(self, error: Exception) -> bool:
+        return (isinstance(error, ClientError)
+                and error.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'))
+
     def copy_path(self, src: str, dst: str) -> None:
         """
         Copy all objects under src prefix to dst prefix.
@@ -252,13 +276,8 @@ class S3Manager(StorageManager):
         Uses batch delete for efficiency (up to 1000 objects per request).
         """
         client = self.__get_client()
-        paginator = client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=self.bucket_name, Prefix=path)
 
-        for page in pages:
-            contents = page.get('Contents', [])
-            if not contents:
-                continue
+        for contents in self._pages(path):
             delete_keys = [{'Key': obj['Key']} for obj in contents]
             for i in range(5):
                 try:
@@ -273,44 +292,3 @@ class S3Manager(StorageManager):
                     time.sleep(0.4)
                 else:
                     break
-
-    def sanitize_obj_names(self, path: str) -> Dict[str, str]:
-        """
-        Removes commas from the paths of all objects that start with the specified
-        input path/prefix.
-        Handles special cases:
-            - Objects with names that only contain commas and white spaces are deleted.
-            - "Folders" with names that only contain commas and white spaces are removed
-            after moving their contents to the parent folder.
-
-        Returns a dictionary that only contains modified object paths. Keys are the
-        original object paths and values are the new object paths. Deleted objects have
-        the empty string as the value.
-        """
-        new_obj_paths = {}
-        l_ls = self.ls(path)
-
-        if len(l_ls) != 1 or l_ls[0] != path:  # path is a prefix
-            p = Path(path)
-
-            for obj_path in l_ls:
-                p_obj = Path(obj_path)
-
-                if p_obj.name.replace(',', '').strip() == '':
-                    self.delete_obj(obj_path)
-                    new_obj_paths[obj_path] = ''
-                else:
-                    new_parts = []
-                    for part in p_obj.relative_to(p).parts:
-                        new_part = part.replace(',', '')
-                        if new_part.strip() != '':
-                            new_parts.append(new_part)
-
-                    new_p_obj = p / Path(*new_parts)
-
-                    if new_p_obj != p_obj:
-                        new_obj_path = str(new_p_obj)
-                        self.copy_obj(obj_path, new_obj_path)
-                        self.delete_obj(obj_path)
-                        new_obj_paths[obj_path] = new_obj_path
-        return new_obj_paths

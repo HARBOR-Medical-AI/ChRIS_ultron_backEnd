@@ -1,6 +1,37 @@
 
 import abc
-from typing import List, Dict, AnyStr, Optional
+from typing import Dict, AnyStr, Iterator, List, NamedTuple, Optional
+
+
+class StorageObject(NamedTuple):
+    """
+    An object in storage: its path and its size in bytes.
+    """
+    path: str
+    size: int
+
+
+def sanitized_name(name: str) -> str:
+    """
+    A file or folder name as ChRIS names it: without its commas, or the empty string
+    when nothing but white space is left.
+    """
+    name = name.replace(',', '')
+    return name if name.strip() else ''
+
+
+def sanitized_path(path: str) -> str:
+    """
+    ``path`` (relative to the folder whose objects are sanitized) as ChRIS names it: each
+    name sanitized (``sanitized_name``), and the folders whose names come out empty left
+    out. The empty string when the object's own name comes out empty: that object is
+    deleted. ``StorageManager.sanitize_obj_names`` renames objects to these paths.
+    """
+    names = [sanitized_name(name) for name in path.split('/')]
+
+    if not names[-1]:
+        return ''
+    return '/'.join(name for name in names if name)
 
 
 class StorageManager(abc.ABC):
@@ -27,6 +58,20 @@ class StorageManager(abc.ABC):
         :returns: a list of all files under a given path prefix, or of ``limit`` of them
                   at most (1 or more, in no given order): the listing stops there, however
                   many there are.
+        """
+        ...
+
+    @abc.abstractmethod
+    def walk(self, folder: str) -> Iterator[StorageObject]:
+        """
+        Every object under ``folder`` with its size, in no given order, as the listing
+        goes: it holds a page of the listing at a time (on a filesystem, the list of the
+        folders it has still to read), not every object. Unlike ``ls`` on Swift and S3, a
+        folder is a
+        folder: objects of a sibling whose name starts with the folder's (``a/data_2``
+        beside ``a/data``) are not under it, and neither is an object at ``folder``
+        itself. Swift and S3 leave out the markers of empty folders (keys ending in
+        ``/``), and a filesystem leaves out symbolic links.
         """
         ...
 
@@ -72,6 +117,14 @@ class StorageManager(abc.ABC):
         """
         ...
 
+    def is_missing(self, error: Exception) -> bool:
+        """
+        Whether ``error``, raised by a call of this manager on an object, says that the
+        object is not there (a filesystem's ``FileNotFoundError``; Swift and S3 say it
+        their own way).
+        """
+        return isinstance(error, FileNotFoundError)
+
     def copy_path(self, src: str, dst: str) -> None:
         """
         Copy all the data under a src path to a new dst path.
@@ -101,5 +154,28 @@ class StorageManager(abc.ABC):
         Returns a dictionary that only contains the modified file paths. Keys are the
         original file paths and values are the new file paths. Deleted files have
         the empty string as their value.
+
+        Objects have no folders to rename: each object whose path changes
+        (``sanitized_path``) is copied to its new path and deleted. An object that a
+        listing shows but that is not there (``is_missing``: renamed by another task, or
+        deleted a moment before the listing was made) is taken as renamed already.
         """
-        ...
+        folder = path.rstrip('/')
+        changes = {}
+
+        for obj in self.walk(folder):
+            relative = obj.path[len(folder) + 1:]
+            new = sanitized_path(relative)
+
+            if new != relative:
+                changes[obj.path] = f'{folder}/{new}' if new else ''
+
+        for old, new in changes.items():  # once listed: a listing may meet a new path
+            try:
+                if new:
+                    self.copy_obj(old, new)
+                self.delete_obj(old)
+            except Exception as error:
+                if not self.is_missing(error):
+                    raise
+        return changes

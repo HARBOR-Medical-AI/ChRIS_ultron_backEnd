@@ -13,12 +13,12 @@ variable and function names use Swift terminology.
 """
 from typing import Dict
 
-from .storagemanager import StorageManager
+from .storagemanager import StorageManager, StorageObject, sanitized_path
 from .swiftmanager import SwiftManager
 from .s3manager import S3Manager
 from .plain_fs import FilesystemManager
 from .helpers import connect_storage, verify_storage_connection
 
 
-__all__ = ['StorageManager', 'SwiftManager', 'S3Manager', 'FilesystemManager',
-           'connect_storage', 'verify_storage_connection']
+__all__ = ['StorageManager', 'StorageObject', 'sanitized_path', 'SwiftManager',
+           'S3Manager', 'FilesystemManager', 'connect_storage', 'verify_storage_connection']

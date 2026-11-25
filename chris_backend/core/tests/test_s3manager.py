@@ -9,7 +9,8 @@ Run via justfile:
     just set-storage s3
     just test-integration
 
-S3ManagerListingTests checks what ``ls`` asks a mocked client, and runs in every mode.
+S3ManagerListingTests checks what ``ls`` and ``walk`` ask a mocked client, and runs in every
+mode.
 """
 
 import unittest
@@ -28,39 +29,95 @@ def _get_manager():
 
 class S3ManagerListingTests(SimpleTestCase):
     """
-    What ``S3Manager.ls`` asks its client, a mock: no S3 service needed.
+    What ``S3Manager.ls`` and ``walk`` ask their client, a mock: no S3 service needed.
     """
 
     def setUp(self):
         self.manager = S3Manager('bucket', {})
         self.manager._client = mock.Mock()
-        self.paginate = self.manager._client.get_paginator.return_value.paginate
+        self.list = self.manager._client.list_objects_v2
+
+    @staticmethod
+    def page(keys, token=None):
+        """
+        A listing response holding ``keys``, followed by another one when ``token``.
+        """
+        resp = {'Contents': [{'Key': key, 'Size': len(key)} for key in keys],
+                'IsTruncated': token is not None}
+        if token is not None:
+            resp['NextContinuationToken'] = token
+        return resp
 
     def test_a_limit_asks_for_that_many_keys_at_most(self):
-        self.paginate.return_value = [{'Contents': [{'Key': 'a/1'}, {'Key': 'a/2'}]}]
+        self.list.side_effect = [self.page(['a/1', 'a/2']),
+                                 self.page(['a/1'] * 1000, 't'), self.page(['a/2'] * 500),
+                                 self.page(['a/1'])]
 
         self.assertEqual(self.manager.ls('a/', limit=2), ['a/1', 'a/2'])
-        self.manager.ls('a/', limit=1500)
+        self.assertEqual(len(self.manager.ls('a/', limit=1500)), 1500)
         self.manager.ls('a/')
 
-        self.assertEqual(self.paginate.call_args_list, [
-            mock.call(Bucket='bucket', Prefix='a/',
-                      PaginationConfig={'MaxItems': 2, 'PageSize': 2}),
-            mock.call(Bucket='bucket', Prefix='a/',
-                      PaginationConfig={'MaxItems': 1500, 'PageSize': 1000}),
-            mock.call(Bucket='bucket', Prefix='a/')])
+        self.assertEqual(self.list.call_args_list, [
+            mock.call(Bucket='bucket', Prefix='a/', MaxKeys=2),
+            mock.call(Bucket='bucket', Prefix='a/', MaxKeys=1000),
+            mock.call(Bucket='bucket', Prefix='a/', MaxKeys=500, ContinuationToken='t'),
+            mock.call(Bucket='bucket', Prefix='a/', MaxKeys=1000)])
 
-    def test_a_listing_tried_again_lists_each_key_once(self):
-        def first_page_then_an_error():
-            yield {'Contents': [{'Key': 'a/1'}]}
-            raise ClientError({'Error': {'Code': 'SlowDown'}}, 'ListObjectsV2')
-
-        self.paginate.side_effect = [first_page_then_an_error(),
-                                     [{'Contents': [{'Key': 'a/1'}, {'Key': 'a/2'}]}]]
+    def test_a_request_that_fails_is_made_again_on_its_own(self):
+        error = ClientError({'Error': {'Code': 'SlowDown'}}, 'ListObjectsV2')
+        self.list.side_effect = [self.page(['a/1'], 't'), error, self.page(['a/2'])]
 
         with mock.patch('core.storage.s3manager.time.sleep'), \
                 self.assertLogs('core.storage.s3manager', 'ERROR'):
             self.assertEqual(self.manager.ls('a/'), ['a/1', 'a/2'])
+
+        tokens = [c.kwargs.get('ContinuationToken') for c in self.list.call_args_list]
+        self.assertEqual(tokens, [None, 't', 't'])
+
+    def test_a_walk_lists_the_folder_with_sizes_a_page_at_a_time(self):
+        self.list.side_effect = [self.page(['a/data/x', 'a/data/sub/y'], 't'),
+                                 self.page(['a/data/z'])]
+
+        objects = list(self.manager.walk('a/data'))
+
+        self.assertEqual(objects, [('a/data/x', 8), ('a/data/sub/y', 12), ('a/data/z', 8)])
+        self.assertEqual({c.kwargs['Prefix'] for c in self.list.call_args_list},
+                         {'a/data/'})  # not a/data_2's objects
+
+    def test_a_walk_leaves_the_markers_of_folders_out(self):
+        self.list.side_effect = [self.page(['a/data/sub/', 'a/data/sub/x'])]
+
+        self.assertEqual(list(self.manager.walk('a/data')), [('a/data/sub/x', 12)])
+
+    def test_a_listing_cut_short_without_a_token_says_so(self):
+        cut = self.page(['a/1'])
+        cut['IsTruncated'] = True
+        self.list.side_effect = [cut]
+
+        with self.assertRaisesRegex(ValueError, 'without a continuation token'):
+            self.manager.ls('a/')
+
+    def test_is_missing_says_s3_has_no_such_key(self):
+        for code, missing in (('NoSuchKey', True), ('404', True), ('SlowDown', False)):
+            with self.subTest(code=code):
+                error = ClientError({'Error': {'Code': code}}, 'CopyObject')
+                self.assertEqual(self.manager.is_missing(error), missing)
+
+    def test_a_path_is_deleted_a_page_of_keys_at_a_time(self):
+        self.list.side_effect = [self.page(['a/1', 'a/2'], 't'), self.page(['a/3'])]
+
+        self.manager.delete_path('a/')
+
+        deletes = self.manager._client.delete_objects.call_args_list
+        self.assertEqual([[o['Key'] for o in c.kwargs['Delete']['Objects']]
+                          for c in deletes], [['a/1', 'a/2'], ['a/3']])
+
+    def test_a_path_exists_when_a_listing_of_one_key_finds_it(self):
+        self.list.side_effect = [self.page(['a/1']), self.page([])]
+
+        self.assertTrue(self.manager.path_exists('a'))
+        self.assertFalse(self.manager.path_exists('b'))
+        self.assertEqual({c.kwargs['MaxKeys'] for c in self.list.call_args_list}, {1})
 
 
 @tag('integration')
@@ -254,6 +311,16 @@ class S3ManagerLargeOpsTests(TestCase):
         self.assertEqual(len(some), 3)
         self.assertLessEqual(set(some), names)
         self.assertEqual(set(self.manager.ls('test/bulk/', limit=10)), names)
+
+    def test_walk_lists_the_folder_with_sizes(self):
+        sizes = {f'test/bulk/{i:04d}.dat': i for i in range(5)}
+        for name, size in sizes.items():
+            self.manager.upload_obj(name, b'x' * size)
+        self.manager.upload_obj('test/bulk_2/sibling.dat', b'x')
+        self.addCleanup(self.manager.delete_path, 'test/bulk_2/')
+
+        with mock.patch.object(self.manager, 'PAGE_SIZE', 2):  # a request per 2 keys
+            self.assertEqual(dict(self.manager.walk('test/bulk')), sizes)
 
     def test_batch_delete(self):
         """Verify delete_path uses batch delete efficiently."""
