@@ -1,7 +1,7 @@
 
 from itertools import islice
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shutil
 from typing import Union, List, Dict, AnyStr, Iterator, Optional, Tuple
 
@@ -85,12 +85,13 @@ class FilesystemManager(StorageManager):
     def __resolve(self, path: str) -> Path:
         """
         ``path`` under the base. One that would leave the base, absolute or with a '..'
-        name in it, raises ValueError.
+        name in it, raises ValueError. Every operation resolves its paths here (a
+        merge's copy several times for each object), so the check splits the string:
+        parsing it as a ``PurePosixPath`` takes over three times as long.
         """
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or '..' in relative.parts:
+        if path.startswith('/') or '..' in path.split('/'):
             raise ValueError(f"The path '{path}' leaves the storage.")
-        return self.__base / relative
+        return self.__base / path
 
     def __named(self, path: str) -> Optional[Path]:
         """

@@ -165,6 +165,14 @@ class FilesystemManagerPathOpsTests(PathContractTests, TestCase):
                 operation()
         self.assertTrue(self.manager.obj_exists('test/u/a.txt'))
 
+    def test_dots_in_a_name_and_empty_names_keep_a_path_in_the_storage(self):
+        for path in ('test/u/a..b/..c', 'test/u/./d.txt', 'test//u/e.txt', 'test/u/...'):
+            with self.subTest(path=path):
+                self.manager.upload_obj(path, b'x')
+                self.assertTrue(self.manager.obj_exists(path))
+        self.assertEqual(sorted(self.manager.ls('test/u')),
+                         ['test/u/...', 'test/u/a..b/..c', 'test/u/d.txt', 'test/u/e.txt'])
+
     def test_sanitize_obj_names(self):
         self.manager.upload_obj('test/san/fi,le.txt', b'data')
         self.manager.upload_obj('test/san/clean.txt', b'ok')
