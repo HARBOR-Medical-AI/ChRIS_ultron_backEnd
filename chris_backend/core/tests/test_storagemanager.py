@@ -9,7 +9,7 @@ from typing import AnyStr, Iterator, Optional
 
 from django.test import SimpleTestCase
 
-from core.storage import StorageObject, in_tree, sanitized_path
+from core.storage import StorageObject, in_tree, is_plain_path, sanitized_path
 from core.storage.storagemanager import ObjectStorageManager, sanitized_name
 from core.tests.path_contract import PathContractTests
 
@@ -98,6 +98,17 @@ class InTreeTests(SimpleTestCase):
                                        ('a', 'a/data', False)):
             with self.subTest(path=path, folder=folder):
                 self.assertEqual(in_tree(path, folder), expected)
+
+
+class IsPlainPathTests(SimpleTestCase):
+
+    def test_a_path_is_plain_when_no_name_in_it_is_empty_dot_or_dot_dot(self):
+        for path in ('home', 'home/u/a.txt', 'home/u/.hidden', 'home/u/a..b'):
+            with self.subTest(path=path):
+                self.assertTrue(is_plain_path(path))
+        for path in ('', '/home/u', 'home/u/', 'home//u', 'home/./u', 'home/u/..', '..'):
+            with self.subTest(path=path):
+                self.assertFalse(is_plain_path(path))
 
 
 class ObjectStoragePathTests(PathContractTests, SimpleTestCase):

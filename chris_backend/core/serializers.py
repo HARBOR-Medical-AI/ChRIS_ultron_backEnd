@@ -8,7 +8,18 @@ from drf_spectacular.utils import OpenApiTypes, extend_schema_field
 
 from collectionjson.fields import ItemLinkField
 from .models import ChrisInstance, FileDownloadToken, ChrisFile, ChrisLinkFile, path_in_use
+from .storage import is_plain_path
 from .utils import get_file_resource_link
+
+
+def validate_plain_path(path):
+    """
+    Raise a ValidationError when a name in ``path`` is empty, '.' or '..'
+    (``is_plain_path``): a path names one place, the same on every storage.
+    """
+    if not is_plain_path(path):
+        raise serializers.ValidationError(
+            [f"Invalid path '{path}'. A name in it cannot be empty, '.' or '..'."])
 
 
 def validate_path_not_in_use(path, instance=None):

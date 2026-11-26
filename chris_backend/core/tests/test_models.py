@@ -95,6 +95,22 @@ class ChrisFileModelTests(ModelTests):
                 mock.call.delete_obj(self.upload_path)])
 
 
+class PlainPathTests(ModelTests):
+
+    def test_a_folder_or_a_file_whose_path_is_not_plain_is_refused(self):
+        user = User.objects.get(username=self.username)
+        (folder, _) = ChrisFolder.objects.get_or_create(
+            path=f'home/{self.username}/uploads', owner=user)
+
+        for path in (f'home/{self.username}/..', f'home/{self.username}/uploads/./x'):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'not plain'):
+                ChrisFolder(path=path, owner=user).save()
+            f = ChrisFile(owner=user, parent_folder=folder)
+            f.fname.name = path
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'not plain'):
+                f.save()
+
+
 class FileSavesAndMovesTests(TestCase):
     """
     What a failed save of a file deletes from storage, and how files and link files move:
@@ -467,6 +483,18 @@ class ValidatePathAccessTests(ModelTests):
             with self.assertRaises(PathAccessError) as cm:
                 validate_path_access(user, path)
             self.assertEqual(str(cm.exception), expected_msg)
+
+    def test_rejects_a_path_that_is_not_plain(self):
+        user = User.objects.get(username=self.username)
+        ChrisFolder.objects.get_or_create(path=f'home/{self.username}/uploads',
+                                          owner=user)
+
+        for path in (f'home/{self.username}/uploads/..',
+                     f'home/{self.username}/uploads/../../chris/uploads',
+                     f'home/{self.username}//uploads'):
+            with self.subTest(path=path), \
+                    self.assertRaisesRegex(PathAccessError, 'invalid path'):
+                validate_path_access(user, path)
 
     def test_rejects_nonexistent_path_with_exact_message(self):
         """

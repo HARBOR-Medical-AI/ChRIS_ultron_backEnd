@@ -1,7 +1,7 @@
 
 from itertools import islice
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 from typing import Union, List, Dict, AnyStr, Iterator, Optional, Tuple
 
@@ -64,8 +64,7 @@ class FilesystemManager(StorageManager):
         whole, it stops reading once its caller has enough. Their types come with the
         entries, at no cost. Like ``rglob`` it skips a directory it may not read.
         """
-        top = self.__base / folder
-        # an absolute folder outside the base raises
+        top = self.__resolve(folder)
         relative = top.relative_to(self.__base).as_posix()
         prefix = '' if relative == '.' else relative + '/'
         start = len(str(top)) + 1  # an entry's path is its directory's, a slash, its name
@@ -83,6 +82,16 @@ class FilesystemManager(StorageManager):
                     else:
                         yield prefix + entry.path[start:], entry
 
+    def __resolve(self, path: str) -> Path:
+        """
+        ``path`` under the base. One that would leave the base, absolute or with a '..'
+        name in it, raises ValueError.
+        """
+        relative = PurePosixPath(path)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError(f"The path '{path}' leaves the storage.")
+        return self.__base / relative
+
     def __named(self, path: str) -> Optional[Path]:
         """
         What ``path`` names under the base, as the operations on paths take a path (see
@@ -92,7 +101,7 @@ class FilesystemManager(StorageManager):
         relative = path.strip('/')
         if not relative:
             return None
-        named = self.__base / relative
+        named = self.__resolve(relative)
         if path.endswith('/') and not named.is_dir():
             return None
         return named
@@ -102,10 +111,10 @@ class FilesystemManager(StorageManager):
         return named is not None and named.exists()
 
     def obj_exists(self, file_path: str) -> bool:
-        return (self.__base / file_path).is_file()
+        return self.__resolve(file_path).is_file()
 
     def upload_obj(self, file_path: str, contents: AnyStr, content_type: Optional[str] = None):
-        dst = (self.__base / file_path)
+        dst = self.__resolve(file_path)
         dst.parent.mkdir(exist_ok=True, parents=True)
 
         if self.__is_textual(content_type):
@@ -120,16 +129,16 @@ class FilesystemManager(StorageManager):
         """
         return media_type is not None and media_type.split('/', maxsplit=1)[0] == 'text'
 
-    def download_obj(self, file_path: str) -> AnyStr:
-        return (self.__base / file_path).read_bytes()
+    def download_obj(self, file_path: str) -> bytes:
+        return self.__resolve(file_path).read_bytes()
 
     def copy_obj(self, src: str, dst: str) -> None:
         """
         A hard link at ``dst`` to ``src``; one there already is the copy (another task
         made it), anything else at ``dst`` raises ``FileExistsError``.
         """
-        src_path = self.__base / src
-        dst_path = self.__base / dst
+        src_path = self.__resolve(src)
+        dst_path = self.__resolve(dst)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             dst_path.hardlink_to(src_path)
@@ -138,13 +147,13 @@ class FilesystemManager(StorageManager):
                 raise
 
     def delete_obj(self, file_path: str) -> None:
-        (self.__base / file_path).unlink(missing_ok=True)
+        self.__resolve(file_path).unlink(missing_ok=True)
 
     def copy_path(self, src: str, dst: str) -> None:
         src_path = self.__named(src)
         if src_path is None or not src_path.exists():
             return
-        dst_path = self.__base / dst.strip('/')
+        dst_path = self.__resolve(dst.strip('/'))
 
         if src_path.is_dir():
             dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +165,7 @@ class FilesystemManager(StorageManager):
         src_path = self.__named(src)
         if src_path is None or not src_path.exists():
             return
-        dst_path = self.__base / dst.strip('/')
+        dst_path = self.__resolve(dst.strip('/'))
 
         if src_path.is_dir():
             if src_path.parent == dst_path.parent:  # just a renaming
@@ -192,7 +201,7 @@ class FilesystemManager(StorageManager):
         the empty string as the value.
         """
         new_file_paths = {}
-        p = self.__base / path
+        p = self.__resolve(path)
         p_rel = Path(path)
 
         if p.is_dir():

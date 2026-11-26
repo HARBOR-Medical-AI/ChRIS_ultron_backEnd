@@ -20,7 +20,7 @@ from django.contrib.auth.models import User, Group
 import django_filters
 from django_filters.rest_framework import FilterSet
 
-from .storage import connect_storage
+from .storage import connect_storage, is_plain_path
 # from django.core.files.base import ContentFile
 
 
@@ -76,6 +76,8 @@ def validate_path_access(user, path):
     Raises ``PathAccessError`` with a human-readable reason on failure.
     """
     path = path.strip().strip('/')
+    if not is_plain_path(path):
+        raise PathAccessError(f"This field may not reference an invalid path '{path}'.")
     path_parts = pathlib.Path(path).parts
 
     if len(path_parts) < 2:
@@ -211,11 +213,13 @@ class ChrisFolder(AsyncDeletableModel):
     def save(self, *args, **kwargs):
         """
         Overriden to recursively create parent folders when first saving the folder
-        to the DB.
+        to the DB. A path (but the root's, the empty one) must be plain
+        (``is_plain_path``).
         """
         if self.path:
-            if self.path.startswith('/') or self.path.endswith('/'):
-                raise ValueError('Paths starting or ending with slashes are not allowed.')
+            if not is_plain_path(self.path):
+                raise ValueError(f"The path '{self.path}' is not plain: it starts or ends "
+                                 f"with a slash, or a name in it is empty, '.' or '..'.")
 
             parent_path = os.path.dirname(self.path)
             try:
@@ -835,7 +839,7 @@ class ChrisFile(models.Model):
 
     def save(self, *args, **kwargs):
         """
-        Overriden to ensure file paths never start or end with slashes. Also, when the
+        Overriden to ensure file paths are plain (``is_plain_path``). Also, when the
         save stores the file's contents (an upload) and then its row fails, to delete
         what it stored, under the name the storage gave it: a name no object had, as no
         storage of CUBE's lets an upload replace an object it finds. Nothing else: a row
@@ -843,9 +847,10 @@ class ChrisFile(models.Model):
         so does a row refused because another row took its name meanwhile (a unique
         violation, ``_name_taken``), as what is under that name is the other row's.
         """
-        path = self.fname.name
-        if path.startswith('/') or path.endswith('/'):
-            raise ValueError('Paths starting or ending with slashes are not allowed.')
+        path = str(self.fname)
+        if not is_plain_path(path):
+            raise ValueError(f"The path '{path}' is not plain: it starts or ends with a "
+                             f"slash, or a name in it is empty, '.' or '..'.")
         uploads = not _stored(self.fname)
         try:
             super(ChrisFile, self).save(*args, **kwargs)
@@ -1133,6 +1138,8 @@ class ChrisLinkFile(models.Model):
         """
         name = kwargs.pop('name')  # must provide a name for the link
         link_file_path = os.path.join(self.parent_folder.path, f'{name}.chrislink')
+        if not is_plain_path(link_file_path):
+            raise ValueError(f"The path '{link_file_path}' is not plain.")
         self._write_object(link_file_path)
         self.fname.name = link_file_path
         super(ChrisLinkFile, self).save(*args, **kwargs)

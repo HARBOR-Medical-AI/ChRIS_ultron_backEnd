@@ -12,7 +12,7 @@ from core.models import (ChrisFolder, ChrisFile, ChrisLinkFile, FolderGroupPermi
                          FolderUserPermission, FileGroupPermission, FileUserPermission,
                          LinkFileGroupPermission, LinkFileUserPermission)
 from core.serializers import (ChrisFileSerializer, public_link_follows,
-                              validate_path_not_in_use)
+                              validate_path_not_in_use, validate_plain_path)
 
 
 class FileBrowserFolderSerializer(serializers.HyperlinkedModelSerializer):
@@ -117,6 +117,7 @@ class FileBrowserFolderSerializer(serializers.HyperlinkedModelSerializer):
 
         # remove leading and trailing slashes
         path = path.strip().strip('/')
+        validate_plain_path(path)
 
         if not path.startswith('home/'):
             raise serializers.ValidationError(["Invalid path. Path must start with "
@@ -375,6 +376,7 @@ class FileBrowserFileSerializer(ChrisFileSerializer):
         """
         # remove leading and trailing slashes
         new_file_path = new_file_path.strip().strip('/')
+        validate_plain_path(new_file_path)
 
         if new_file_path.endswith('.chrislink'):
             raise serializers.ValidationError(["Invalid path. This is not a ChRIS link "
@@ -671,6 +673,7 @@ class FileBrowserLinkFileSerializer(ChrisFileSerializer):
         """
         # remove leading and trailing slashes
         new_link_file_path = new_link_file_path.strip().strip('/')
+        validate_plain_path(new_link_file_path)
 
         if not new_link_file_path.endswith('.chrislink'):
             raise serializers.ValidationError(["Invalid path. The new path must end with"

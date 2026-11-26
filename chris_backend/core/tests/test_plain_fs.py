@@ -149,6 +149,22 @@ class FilesystemManagerPathOpsTests(PathContractTests, TestCase):
         self.manager.delete_path('test/delpath')
         self.assertFalse(self.manager.path_exists('test/delpath'))
 
+    def test_a_path_that_would_leave_the_storage_is_refused(self):
+        self.manager.upload_obj('test/u/a.txt', b'a')
+        operations = (lambda: self.manager.delete_path('test/u/..'),
+                      lambda: self.manager.delete_path('test/u/../'),
+                      lambda: self.manager.ls('test/u/../..'),
+                      lambda: self.manager.upload_obj('test/../../x', b'x'),
+                      lambda: self.manager.download_obj('/etc/hostname'),
+                      lambda: self.manager.copy_obj('test/u/a.txt', 'test/../../x'),
+                      lambda: self.manager.delete_obj('test/u/../u/a.txt'),
+                      lambda: self.manager.move_path('test/u', 'test/../../moved'))
+
+        for i, operation in enumerate(operations):
+            with self.subTest(operation=i), self.assertRaisesRegex(ValueError, 'leaves'):
+                operation()
+        self.assertTrue(self.manager.obj_exists('test/u/a.txt'))
+
     def test_sanitize_obj_names(self):
         self.manager.upload_obj('test/san/fi,le.txt', b'data')
         self.manager.upload_obj('test/san/clean.txt', b'ok')

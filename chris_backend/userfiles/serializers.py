@@ -5,7 +5,7 @@ from rest_framework import serializers
 
 from core.models import ChrisFolder
 from core.serializers import (ChrisFileSerializer, public_link_follows,
-                              validate_path_not_in_use)
+                              validate_path_not_in_use, validate_plain_path)
 from .models import UserFile
 
 
@@ -111,6 +111,7 @@ class UserFileSerializer(ChrisFileSerializer):
             raise serializers.ValidationError([f"Invalid path. Cannot contain commas."])
 
         upload_path = upload_path.strip().strip('/')
+        validate_plain_path(upload_path)
 
         if upload_path.endswith('.chrislink'):
             raise serializers.ValidationError(["Invalid path. Uploading ChRIS link "

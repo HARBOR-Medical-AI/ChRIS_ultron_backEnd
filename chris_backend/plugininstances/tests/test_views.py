@@ -639,8 +639,7 @@ class PluginInstanceListViewTests(TasksViewTests):
         folder_path = os.path.dirname(path)
         (file_parent_folder, _) = ChrisFolder.objects.get_or_create(path=folder_path,
                                                                     owner=user)
-        (fs_plg_inst_file, tf) = UserFile.objects.get_or_create(owner=user,
-                                                                parent_folder=file_parent_folder)
+        fs_plg_inst_file = UserFile(owner=user, parent_folder=file_parent_folder)
         fs_plg_inst_file.fname.name = path
         fs_plg_inst_file.save()
         fs_plg_inst.status = 'finishedSuccessfully'

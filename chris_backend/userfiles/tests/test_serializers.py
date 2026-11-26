@@ -144,6 +144,23 @@ class UserFileSerializerTests(TestCase):
             with self.assertRaises(serializers.ValidationError):
                 userfiles_serializer.validate_upload_path('SERVICES/PACS/random/file1.txt')
 
+    def test_validate_upload_path_failure_path_not_plain(self):
+        """
+        Test whether overriden validate_upload_path method refuses a path with an empty,
+        '.' or '..' name in it.
+        """
+        userfiles_serializer = UserFileSerializer()
+        request = mock.Mock()
+        request.user = User.objects.get(username=self.username)
+
+        with mock.patch.dict(userfiles_serializer.context, {'request': request},
+                             clear=True):
+            for path in (f'home/{self.username}/uploads/../../chris/uploads/x.txt',
+                         f'home/{self.username}/uploads/./x.txt'):
+                with self.subTest(path=path), \
+                        self.assertRaisesRegex(serializers.ValidationError, 'cannot be'):
+                    userfiles_serializer.validate_upload_path(path)
+
     def test_validate_upload_path_failure_path_in_use(self):
         """
         Test whether overriden validate_upload_path method refuses a path that a file

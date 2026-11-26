@@ -20,6 +20,15 @@ def sanitized_name(name: str) -> str:
     return name if name.strip() else ''
 
 
+def is_plain_path(path: str) -> bool:
+    """
+    Whether no name in ``path`` is empty, '.' or '..' (so neither does it start nor end
+    with a slash): a plain path names one place, the same on every storage, where on a
+    filesystem '..' would name the folder above.
+    """
+    return all(name not in ('', '.', '..') for name in path.split('/'))
+
+
 def in_tree(path: str, folder: str) -> bool:
     """
     Whether ``path`` is the folder ``folder`` or under it: ``a/data/x`` is in the tree of
@@ -110,7 +119,8 @@ class StorageManager(abc.ABC):
         """
         ...
 
-    def download_obj(self, file_path: str) -> AnyStr:
+    @abc.abstractmethod
+    def download_obj(self, file_path: str) -> bytes:
         """
         Download file data from the storage service.
         """
