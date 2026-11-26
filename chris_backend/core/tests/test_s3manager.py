@@ -169,6 +169,18 @@ class S3ManagerListingTests(SimpleTestCase):
 
         delete.assert_called_once_with(Bucket='bucket', Key='a/1')  # not made again
 
+    def test_copying_a_key_s3_does_not_have_raises_at_once(self):
+        copy = self.manager._client.copy_object
+        copy.side_effect = ClientError({'Error': {'Code': 'NoSuchKey'}}, 'CopyObject')
+
+        with self.assertNoLogs('core.storage.s3manager', 'ERROR'), \
+                self.assertRaises(ClientError) as raised:
+            self.manager.copy_obj('a/1', 'b/1')
+
+        self.assertTrue(self.manager.is_missing(raised.exception))
+        copy.assert_called_once_with(Bucket='bucket', Key='b/1',  # not made again
+                                     CopySource={'Bucket': 'bucket', 'Key': 'a/1'})
+
 
 @tag('integration')
 @unittest.skipUnless(getattr(settings, 'STORAGE_ENV', '') == 's3',

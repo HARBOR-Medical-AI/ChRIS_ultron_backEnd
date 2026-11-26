@@ -393,6 +393,47 @@ class RunAgainTests(OutputRegistrationFixture, TestCase):
         self.assertFalse(self.storage.obj_exists(copy))
         self.assertEqual(job._expected, {'home_foo_uploads/ab.txt'})
 
+    def test_a_copy_that_fails_fails_with_code09(self):
+        source = 'home/foo/uploads/a.txt'
+        self.storage.upload_obj(source, b'123')
+        job = self.job()
+
+        with mock.patch.object(job.storage_manager, 'copy_obj',
+                               side_effect=OSError('refused')), \
+                self.assertLogs('plugininstances.services', 'ERROR') as logs, \
+                self.assertRaisesRegex(OSError, 'refused'):
+            job._copy_to_output(source, f'{self.output}/home_foo_uploads/a.txt')
+
+        self.assertIn('[CODE09,', logs.output[0])
+        self.assertEqual((job.c_plugin_inst.error_code, job._expected), ('CODE09', set()))
+
+    def test_a_link_file_that_cannot_be_written_fails_with_code09(self):
+        ChrisFolder.objects.get_or_create(path='home/foo/uploads',
+                                          defaults={'owner': self.user})
+        job = self.job()
+
+        with mock.patch('core.models.connect_storage', return_value=self.storage), \
+                mock.patch.object(self.storage, 'upload_obj',
+                                  side_effect=OSError('refused')), \
+                self.assertLogs('plugininstances.services', 'ERROR') as logs, \
+                self.assertRaisesRegex(OSError, 'refused'):
+            job._create_chris_link_file('home/foo/uploads', self.inst.output_folder)
+
+        self.assertIn('[CODE09,', logs.output[0])
+        self.assertEqual(job.c_plugin_inst.error_code, 'CODE09')
+        self.assertFalse(ChrisLinkFile.objects.filter(
+            parent_folder=self.inst.output_folder).exists())
+
+    def test_a_path_that_is_not_plain_is_not_expected(self):
+        job = self.job()
+
+        for path in ('a/./b.txt', 'a/../b.txt', '../b.txt', 'a.chrislink', ', ,'):
+            job._expect(path)
+        job._expect('a//b.txt')  # its empty name dropped
+
+        # the rows are inserted in bulk, without the check of ChrisFile.save
+        self.assertEqual(job._expected, {'a/b.txt'})
+
     def test_a_plugin_link_file_another_run_deleted_is_no_failure(self):
         job = self.job()
         missing = f'{self.output}/evil.chrislink'

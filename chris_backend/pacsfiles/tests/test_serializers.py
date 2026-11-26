@@ -317,6 +317,19 @@ class PACSSeriesSerializerTests(SerializerTests):
             pacs_series_serializer.validate_path(path)
 
 
+    def test_validate_path_failure_path_not_plain(self):
+        """
+        Test whether overriden validate_path method validates that no name in the
+        submitted path is empty, '.' or '..'.
+        """
+        pacs_series_serializer = PACSSeriesSerializer()
+
+        for path in ('SERVICES/PACS/MyPACS/123456-crazy//SAG_T1_MPRAGE',
+                     'SERVICES/PACS/MyPACS/./SAG_T1_MPRAGE',
+                     'SERVICES/PACS/MyPACS/../../home/cube'):
+            with self.subTest(path=path), self.assertRaises(serializers.ValidationError):
+                pacs_series_serializer.validate_path(path)
+
     def test_validate_path_success(self):
         """
         Test whether overriden validate_path method validates submitted path.

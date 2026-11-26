@@ -245,8 +245,10 @@ class FileSavesAndMovesTests(TestCase):
     @staticmethod
     def commit_failing():
         """
-        Have the transactions of core.models fail where their commit would, once their
-        block ran.
+        Have the moves' own transactions (``durable``) fail where their commit would, once
+        their block ran. ``core.models.transaction`` is Django's module, so the patch
+        reaches every block: any other (``get_or_create``'s, when a move creates the
+        folder it moves into) must end as usual, or the move fails before its commit.
         """
         atomic = transaction.atomic
 
@@ -254,7 +256,8 @@ class FileSavesAndMovesTests(TestCase):
         def failing(*args, **kwargs):
             with atomic(*args, **kwargs):
                 yield
-                raise DatabaseError('commit')
+                if kwargs.get('durable'):
+                    raise DatabaseError('commit')
         return mock.patch('core.models.transaction.atomic', failing)
 
     def test_a_move_whose_commit_fails_leaves_the_file_whole(self):

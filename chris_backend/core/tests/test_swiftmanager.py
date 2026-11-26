@@ -150,6 +150,17 @@ class SwiftManagerListingTests(SimpleTestCase):
 
         delete.assert_called_once_with('container', 'a/1')  # not made again
 
+    def test_copying_an_object_swift_does_not_have_raises_at_once(self):
+        copy = self.manager._conn.copy_object
+        copy.side_effect = ClientException('not found', http_status=404)
+
+        with self.assertNoLogs('core.storage.swiftmanager', 'ERROR'), \
+                self.assertRaises(ClientException) as raised:
+            self.manager.copy_obj('a/1', 'b/1')
+
+        self.assertTrue(self.manager.is_missing(raised.exception))
+        copy.assert_called_once_with('container', 'a/1', '/container/b/1')  # not made again
+
 
 @tag('integration')
 @unittest.skipUnless(getattr(settings, 'STORAGE_ENV', '') == 'swift',

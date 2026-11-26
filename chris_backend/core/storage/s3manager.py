@@ -198,7 +198,8 @@ class S3Manager(ObjectStorageManager):
 
     def copy_obj(self, src: str, dst: str) -> None:
         """
-        Copy an object within the same bucket.
+        Copy an object within the same bucket. One that is not there raises at once
+        (``is_missing``): no request made again for it.
         """
         client = self.__get_client()
         copy_source = {'Bucket': self.bucket_name, 'Key': src}
@@ -210,6 +211,8 @@ class S3Manager(ObjectStorageManager):
                     CopySource=copy_source,
                 )
             except ClientError as e:
+                if self.is_missing(e):
+                    raise
                 logger.error(str(e))
                 if i == 4:
                     raise

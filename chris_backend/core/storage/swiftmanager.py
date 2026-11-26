@@ -160,7 +160,8 @@ class SwiftManager(ObjectStorageManager):
 
     def copy_obj(self, obj_path, dest_path):
         """
-        Copy an object to a new destination in swift storage.
+        Copy an object to a new destination in swift storage. One that is not there
+        (404) raises at once (``is_missing``): no request made again for it.
         """
         conn = self.__get_connection()
         dest = os.path.join('/' + self.container_name, dest_path.lstrip('/'))
@@ -168,6 +169,8 @@ class SwiftManager(ObjectStorageManager):
             try:
                 conn.copy_object(self.container_name, obj_path, dest)
             except ClientException as e:
+                if self.is_missing(e):
+                    raise
                 logger.error(str(e))
                 if i == 4:
                     raise

@@ -11,7 +11,7 @@ from rest_framework import serializers
 
 from core.models import ChrisFolder
 from core.storage import connect_storage
-from core.serializers import ChrisFileSerializer
+from core.serializers import ChrisFileSerializer, validate_plain_path
 from .models import PACS, PACSQuery, PACSRetrieve, PACSSeries, PACSFile
 from dicomweb.models import PACSStudy
 
@@ -273,13 +273,14 @@ class PACSSeriesSerializer(serializers.HyperlinkedModelSerializer):
 
     def validate_path(self, path):
         """
-        Overriden to check whether the provided path does not contain commas and
-        is under SERVICES/PACS/ path.
+        Overriden to check whether the provided path does not contain commas, is plain
+        (``validate_plain_path``) and is under SERVICES/PACS/ path.
         """
         if ',' in path:
             raise serializers.ValidationError([f"Invalid path '{path}'. "
                                                f"Cannot contain commas."])
         path = path.strip().strip('/')
+        validate_plain_path(path)
 
         if not path.startswith('SERVICES/PACS/'):
             raise serializers.ValidationError(

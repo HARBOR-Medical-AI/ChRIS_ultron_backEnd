@@ -28,7 +28,7 @@ from core.utils import json_zip2str
 from core.models import (ChrisFolder, ChrisLinkFile, PathAccessError,
                          validate_path_access)
 from core.registration import FileRegistrar, FolderIndex, Stopped
-from core.storage import in_tree, sanitized_path
+from core.storage import in_tree, is_plain_path, sanitized_path
 from plugininstances.models import PluginInstance, PluginInstanceLock
 from userfiles.models import UserFile
 from .abstractjobs import ARM_REMOTE_CLEANUP, PluginInstanceJob
@@ -547,10 +547,12 @@ class PluginInstanceAppJob(PluginInstanceJob):
         Have the registration register the file at ``path`` in the output folder, under
         the path ``sanitize_obj_names`` gives it. Not a file whose name has nothing but
         commas and white space (that renaming deletes it), nor a link file (a plugin may
-        not write one: the registration deletes it).
+        not write one: the registration deletes it), nor a path with a '.' or '..' name
+        in it (``is_plain_path``), which no row may have: the rows are inserted in bulk,
+        without the check of ``ChrisFile.save``.
         """
         path = sanitized_path(path)
-        if path and not path.endswith('.chrislink'):
+        if path and is_plain_path(path) and not path.endswith('.chrislink'):
             self._expected.add(path)
 
     def _handle_unextpath_parameters(self, unextpath_parameters_dict):
