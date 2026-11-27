@@ -112,7 +112,7 @@ elif STORAGE_ENV == 's3':
     AWS_S3_ADDRESSING_STYLE = 'path'
     AWS_S3_SIGNATURE_VERSION = 's3v4'
     # an upload does not replace an object it finds (it takes another name, as on the
-    # filesystem and Swift): ChrisFile.save deletes what a failed save stored
+    # filesystem and Swift)
     AWS_S3_FILE_OVERWRITE = False
     verify_storage = lambda: verify_storage_connection(
         STORAGES=STORAGES,

@@ -1,6 +1,7 @@
 """
-Registration of a tree of storage objects as rows: its folders (``ChrisFolder``) and its
-files (``ChrisFile`` or a proxy of it), inserted in batches whatever the size of the tree.
+Registration of a tree of storage objects as DB rows: its folders (``ChrisFolder``) and
+its files (``ChrisFile`` or a proxy model of it), inserted in batches whatever the size
+of the tree.
 
 ``FolderIndex`` maps the folders of one tree to their ids and creates the missing ones
 level by level; ``FileRegistrar`` takes the files one at a time, as a storage walk yields
@@ -28,11 +29,12 @@ class BatchSizer:
     time of a smaller insert (a batch's few new folders) is mostly round trips to the
     database, which says little about the rate of a large one.
 
-    Why by time: PostgreSQL logs every statement slower than ``log_min_duration_statement``
-    (1 s in ``postgres/cube.conf``), and Django binds a bulk insert's values in the client,
-    so a slow insert lands in the log with every path in it. Inserts run at very different
-    rates (37 µs a row into a small table, 200 µs into a large one under load), so a
-    fixed number of rows is either too many for one or too few for the other.
+    Why by time: PostgreSQL logs every statement slower than
+    ``log_min_duration_statement`` (1 s in ``postgres/cube.conf``), and Django binds a
+    bulk insert's values in the client, so a slow insert lands in the log with every path
+    in it. Inserts run at very different rates (37 µs a row into a small table, 200 µs
+    into a large one under load), so a fixed number of rows is either too many for one or
+    too few for the other.
     """
 
     def __init__(self, first: int = 1000, *, target: float = 0.25, least: int = 250,
@@ -47,7 +49,9 @@ class BatchSizer:
         if rows < self.least:
             return
         rate = rows / max(seconds, 1e-6)
-        self.size = int(max(self.least, min(self.most, 2 * self.size, rate * self.target)))
+        self.size = int(
+            max(self.least, min(self.most, 2 * self.size, rate * self.target))
+        )
 
 
 def insert_rows(model, rows: list, sizer: BatchSizer) -> None:
@@ -87,6 +91,7 @@ class FolderIndex:
         self.root, self.owner = root, owner
         self.sizer = sizer if sizer is not None else BatchSizer()
         self._prefix = root + '/'
+
         self._ids = dict(ChrisFolder.objects.filter(
             Q(path=root) | Q(path__startswith=self._prefix)).order_by().values_list(
             'path', 'id'))
@@ -117,6 +122,7 @@ class FolderIndex:
             while path not in self._ids and path not in missing:
                 if not path.startswith(self._prefix):
                     raise ValueError(f'{path} is not under {self.root}')
+
                 missing.add(path)
                 path = parent_path(path)
 
@@ -127,6 +133,7 @@ class FolderIndex:
         for depth in sorted(levels):
             level = sorted(levels[depth])
             start = 0
+
             while start < len(level):  # the sizer sizes each statement after the last
                 end = start + self.sizer.size
                 self._create(level[start:end])

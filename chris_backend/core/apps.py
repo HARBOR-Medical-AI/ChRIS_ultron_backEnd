@@ -57,8 +57,8 @@ class Core(AppConfig):
 
         post_migrate.connect(setup_chris, sender=self)
 
-        # a signal reaches only the receivers of its exact sender: each proxy of the file
-        # models (UserFile, PACSFile...) needs the receiver as much as they do
+        # a signal reaches only the receivers of its exact sender class, so each proxy
+        # of the file models (UserFile, PACSFile...) needs the receiver too
         for model in apps.get_models():
             if issubclass(model, (ChrisFile, ChrisLinkFile)):
                 post_delete.connect(auto_delete_file_from_storage, sender=model)

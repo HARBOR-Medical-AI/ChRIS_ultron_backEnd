@@ -234,12 +234,15 @@ class ObjectStorageManager(StorageManager):
         folder = path.rstrip('/')
         if not folder:
             return
+
         if path == folder:
             first = next(self._objects(folder, 1), None)
+
             if first is not None and first.path == folder:
                 yield first
                 if limit is not None:
                     limit -= 1
+
         if limit is None or limit > 0:
             yield from self._objects(folder + '/', limit)
 

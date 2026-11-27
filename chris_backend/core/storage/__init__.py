@@ -1,9 +1,10 @@
 """
 A module for interfacing with file storage backends.
 
-File storage backends are "services" which store arbitrary data identified by path-like strings.
-Examples include OpenStack Swift object storage, AWS S3, Azure Blob Storage (via S3-compatible
-endpoint), MinIO, Ceph RGW, or of course, a literal UNIX-y filesystem.
+File storage backends are "services" which store arbitrary data identified by path-like
+strings. Examples include OpenStack Swift object storage, AWS S3, Azure Blob Storage
+(through an S3-compatible gateway), MinIO, Ceph RGW, or of course, a literal UNIX-y
+filesystem.
 
 ChRIS files are immutable, so file storage services can be optimized for WORM
 (write-once, read-many) workloads.
@@ -21,6 +22,6 @@ from .plain_fs import FilesystemManager
 from .helpers import connect_storage, verify_storage_connection
 
 
-__all__ = ['StorageManager', 'StorageObject', 'in_tree', 'is_plain_path', 'sanitized_path',
-           'SwiftManager',
-           'S3Manager', 'FilesystemManager', 'connect_storage', 'verify_storage_connection']
+__all__ = ['StorageManager', 'StorageObject', 'in_tree', 'is_plain_path',
+           'sanitized_path', 'SwiftManager', 'S3Manager', 'FilesystemManager',
+           'connect_storage', 'verify_storage_connection']

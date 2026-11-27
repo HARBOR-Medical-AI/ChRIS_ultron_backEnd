@@ -851,6 +851,7 @@ class ChrisFile(models.Model):
         if not is_plain_path(path):
             raise ValueError(f"The path '{path}' is not plain: it starts or ends with a "
                              f"slash, or a name in it is empty, '.' or '..'.")
+
         uploads = not _stored(self.fname)
         try:
             super(ChrisFile, self).save(*args, **kwargs)
